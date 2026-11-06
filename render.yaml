@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: anashwar-fleet
+    env: python
+    buildCommand: ""
+    startCommand: "python3 web_portal.py"
+    envVars:
+      - key: PORT
+        value: 8080
