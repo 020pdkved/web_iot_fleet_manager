@@ -9,6 +9,7 @@
 #include <WiFiManager.h>
 #include <mbedtls/sha256.h>
 #include <nvs_flash.h>
+#include <Preferences.h>
 
 // =============================================================================
 // GLOBAL STATE & SYSTEM VARIABLES
@@ -185,9 +186,10 @@ void initHardware() {
 }
 
 void updateHardwareStateMachine() {
-  // If master service is turned OFF (Standby), force LED OFF and keep broker
-  // alive
-  if (!systemServiceActive) {
+  bool networkAvailable = (WiFi.status() == WL_CONNECTED);
+  // If master service is turned OFF (Standby), or network is disconnected and
+  // autonomous "Serve while offline" mode is disabled, suspend service (force LED OFF)
+  if (!systemServiceActive || (!networkAvailable && !autonomousOfflineMode)) {
     digitalWrite(ONBOARD_LED_PIN, LED_STATE_OFF);
     return;
   }
@@ -401,6 +403,17 @@ void initMQTT() {
     nodeProject = "Auto-Discovered";
   }
 
+  // Load NVS persisted custom name overrides (from portal bidirectional renaming)
+  Preferences p;
+  p.begin("fleet", true);
+  String sN = p.getString("node_name", "");
+  String sC = p.getString("client_name", "");
+  String sP = p.getString("proj_name", "");
+  p.end();
+  if (sN.length() > 0) nodeName = sN;
+  if (sC.length() > 0) nodeClient = sC;
+  if (sP.length() > 0) nodeProject = sP;
+
   mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(768);
@@ -613,9 +626,51 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     }
   }
 
-  // 4. Force Telemetry Report Directive
-  else if (cmd.equalsIgnoreCase("REPORT") || cmd.equalsIgnoreCase("STATUS")) {
+  // 4. Force Telemetry Report Directive & Presence Ping ACK
+  else if (cmd.equalsIgnoreCase("REPORT") || cmd.equalsIgnoreCase("STATUS") || cmd.equalsIgnoreCase("PING")) {
+    Serial.printf("[SYSTEM] %s: Presence Ping ACK triggered.\n", nodeName.c_str());
     publishStatusTelemetry();
+  }
+
+  // 4b. Bidirectional Renaming Directives (Persisted into NVS Flash)
+  else if (cmd.startsWith("RENAME:") || cmd.startsWith("RENAME=")) {
+    String val = cmd.substring(7);
+    val.trim();
+    if (val.length() > 0) {
+      Serial.printf("[SYSTEM] Renaming node from '%s' to '%s' (persisted in NVS)\n", nodeName.c_str(), val.c_str());
+      nodeName = val;
+      Preferences p;
+      p.begin("fleet", false);
+      p.putString("node_name", nodeName);
+      p.end();
+      publishStatusTelemetry();
+    }
+  }
+  else if (cmd.startsWith("SETCLIENT:") || cmd.startsWith("SETCLIENT=")) {
+    String val = cmd.substring(10);
+    val.trim();
+    if (val.length() > 0) {
+      Serial.printf("[SYSTEM] Updating client to '%s' (persisted in NVS)\n", val.c_str());
+      nodeClient = val;
+      Preferences p;
+      p.begin("fleet", false);
+      p.putString("client_name", nodeClient);
+      p.end();
+      publishStatusTelemetry();
+    }
+  }
+  else if (cmd.startsWith("SETPROJECT:") || cmd.startsWith("SETPROJECT=")) {
+    String val = cmd.substring(11);
+    val.trim();
+    if (val.length() > 0) {
+      Serial.printf("[SYSTEM] Updating project to '%s' (persisted in NVS)\n", val.c_str());
+      nodeProject = val;
+      Preferences p;
+      p.begin("fleet", false);
+      p.putString("proj_name", nodeProject);
+      p.end();
+      publishStatusTelemetry();
+    }
   }
 
   // 5. System Reset Directive

@@ -15,6 +15,7 @@
 #include <PubSubClient.h>
 #include <HTTPUpdate.h>
 #include <mbedtls/sha256.h>
+#include <Preferences.h>
 
 // =============================================================================
 // DEFAULT ENTERPRISE SETTINGS
@@ -49,9 +50,14 @@ public:
      * Initialize Fleet Client with Client Tenant, Project Name, and Device Name
      */
     void begin(const char* clientName, const char* projectName, const char* deviceName, CommandCallback cb = nullptr) {
-        _clientName = clientName;
-        _projectName = projectName;
-        _deviceName = deviceName;
+        _prefs.begin("fleet", false);
+        String savedNode = _prefs.getString("node_name", "");
+        String savedClient = _prefs.getString("client_name", "");
+        String savedProject = _prefs.getString("proj_name", "");
+
+        _clientName = (savedClient.length() > 0) ? savedClient : String(clientName);
+        _projectName = (savedProject.length() > 0) ? savedProject : String(projectName);
+        _deviceName = (savedNode.length() > 0) ? savedNode : String(deviceName);
         _cmdCallback = cb;
 
         // 1. Resolve Hardware MAC & Chip ID
@@ -116,6 +122,16 @@ public:
     void setOfflineMode(bool offline) { _offlineMode = offline; }
     bool isOfflineMode() const { return _offlineMode; }
 
+    /**
+     * Determines whether the node should execute its in-situ job.
+     * If Serve while offline is OFF and network drops, halts job.
+     */
+    bool canServeJob() const {
+        if (!_serviceActive) return false;
+        if (!_offlineMode && WiFi.status() != WL_CONNECTED) return false;
+        return true;
+    }
+
     void setDelaySec(float delaySec) { _delaySec = delaySec; }
     float getDelaySec() const { return _delaySec; }
 
@@ -123,6 +139,7 @@ public:
     String getMacAddress() const { return _macAddress; }
 
 private:
+    Preferences _prefs;
     WiFiClient _wifiClient;
     PubSubClient _mqtt;
     String _clientName;
@@ -266,6 +283,36 @@ private:
             Serial.println("[AnashwarFleet] Remote REBOOT directive accepted. Restarting in 500ms...");
             delay(500);
             ESP.restart();
+        } else if (action.equalsIgnoreCase("PING") || action.equalsIgnoreCase("STATUS") || action.equalsIgnoreCase("REPORT")) {
+            Serial.printf("[AnashwarFleet] Ping received from portal. Responding with presence ACK...\n");
+            publishTelemetry();
+        } else if (action.startsWith("RENAME:")) {
+            String newName = action.substring(7);
+            newName.trim();
+            if (newName.length() > 0) {
+                Serial.printf("[AnashwarFleet] Node renamed from '%s' to '%s' (persisted to NVS)\n", _deviceName.c_str(), newName.c_str());
+                _deviceName = newName;
+                _prefs.putString("node_name", _deviceName);
+                publishTelemetry();
+            }
+        } else if (action.startsWith("SETCLIENT:")) {
+            String newClient = action.substring(10);
+            newClient.trim();
+            if (newClient.length() > 0) {
+                Serial.printf("[AnashwarFleet] Client renamed to '%s' (persisted to NVS)\n", newClient.c_str());
+                _clientName = newClient;
+                _prefs.putString("client_name", _clientName);
+                publishTelemetry();
+            }
+        } else if (action.startsWith("SETPROJECT:")) {
+            String newProj = action.substring(11);
+            newProj.trim();
+            if (newProj.length() > 0) {
+                Serial.printf("[AnashwarFleet] Project renamed to '%s' (persisted to NVS)\n", newProj.c_str());
+                _projectName = newProj;
+                _prefs.putString("proj_name", _projectName);
+                publishTelemetry();
+            }
         } else {
             if (_cmdCallback) _cmdCallback("CUSTOM", action);
         }

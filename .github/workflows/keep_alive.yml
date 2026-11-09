@@ -19,3 +19,4 @@ jobs:
           else
             echo "Success: Server is active and warm."
           fi
+
