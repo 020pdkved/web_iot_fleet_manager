@@ -86,26 +86,24 @@ def build_all_modes():
         return False
 
     os.makedirs(BINARIES_DIR, exist_ok=True)
-    modes = {
-        "mode1": "firmware_mode1.bin",
-        "mode2": "firmware_mode2.bin",
-        "mode3": "firmware_mode3.bin",
-        "mode4": "firmware_mode4.bin"
-    }
+    src = os.path.join(PROJECT_ROOT, ".pio", "build", "esp32dev", "firmware.bin")
+    dest = os.path.join(BINARIES_DIR, "Base_firmware.bin")
+    if os.path.exists(src):
+        with open(src, "rb") as f_in, open(dest, "wb") as f_out:
+            f_out.write(f_in.read())
+        size_kb = os.path.getsize(dest) / 1024.0
+        print(f"  ✓ Base_firmware.bin    ({size_kb:7.1f} KB) -> {dest}")
+    else:
+        for env in ("mode1", "esp32dev"):
+            alt_src = os.path.join(PROJECT_ROOT, ".pio", "build", env, "firmware.bin")
+            if os.path.exists(alt_src):
+                with open(alt_src, "rb") as f_in, open(dest, "wb") as f_out:
+                    f_out.write(f_in.read())
+                size_kb = os.path.getsize(dest) / 1024.0
+                print(f"  ✓ Base_firmware.bin    ({size_kb:7.1f} KB) -> {dest}")
+                break
 
-    print("\n[BUILD] Copying build artifacts to 'binaries/' folder:")
-    for env, filename in modes.items():
-        src = os.path.join(PROJECT_ROOT, ".pio", "build", env, "firmware.bin")
-        dest = os.path.join(BINARIES_DIR, filename)
-        if os.path.exists(src):
-            with open(src, "rb") as f_in, open(dest, "wb") as f_out:
-                f_out.write(f_in.read())
-            size_kb = os.path.getsize(dest) / 1024.0
-            print(f"  ✓ {filename:<20} ({size_kb:7.1f} KB) -> {dest}")
-        else:
-            print(f"  ✗ Missing binary for {env}: {src}")
-
-    print("\n[BUILD] All firmware binaries are ready in 'binaries/'.")
+    print("\n[BUILD] Base_firmware.bin is ready in 'binaries/'.")
     return True
 
 
@@ -264,8 +262,7 @@ def interactive_menu():
         elif choice == "4":
             start_http_server()
         elif choice == "5":
-            target_mode = input("Select target mode to trigger (1, 2, or 3) [default: 2]: ").strip() or "2"
-            url = f"http://{local_ip}:{DEFAULT_HTTP_PORT}/firmware_mode{target_mode}.bin"
+            url = f"http://{local_ip}:{DEFAULT_HTTP_PORT}/Base_firmware.bin"
             publish_mqtt(DEFAULT_MQTT_TOPIC, url)
         elif choice == "6":
             custom_url = input("Enter the public HTTP/HTTPS URL: ").strip()
@@ -296,14 +293,14 @@ if __name__ == "__main__":
         elif action == "trigger":
             if len(sys.argv) > 2:
                 arg = sys.argv[2]
-                if arg in ("1", "2", "3"):
+                if arg in ("1", "2", "3", "base"):
                     ip = get_local_ip()
-                    url = f"http://{ip}:{DEFAULT_HTTP_PORT}/firmware_mode{arg}.bin"
+                    url = f"http://{ip}:{DEFAULT_HTTP_PORT}/Base_firmware.bin"
                 else:
                     url = arg
             else:
                 ip = get_local_ip()
-                url = f"http://{ip}:{DEFAULT_HTTP_PORT}/firmware_mode2.bin"
+                url = f"http://{ip}:{DEFAULT_HTTP_PORT}/Base_firmware.bin"
             publish_mqtt(DEFAULT_MQTT_TOPIC, url)
         elif action == "monitor":
             open_serial_monitor()

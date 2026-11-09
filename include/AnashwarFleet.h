@@ -40,6 +40,41 @@
 #define ANASHWAR_SECURITY_SALT "Anashwar-Enterprise-Hardware-Key-2026"
 #endif
 
+// =============================================================================
+// MCU HARDWARE PROFILE & ARCHITECTURE SPECS (ESP32, ESP8266, BW16, Arduino Uno R4)
+// =============================================================================
+#if defined(ESP32)
+  #define ANASHWAR_MCU_FAMILY     "ESP32"
+  #define ANASHWAR_MCU_ARCH       "Xtensa LX6 Dual-Core @ 240MHz"
+  #define ANASHWAR_MCU_FLASH_MB   4.0f
+  #define ANASHWAR_MCU_SRAM_KB    320
+  #define ANASHWAR_MCU_ANTENNA    "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)"
+#elif defined(ESP8266)
+  #define ANASHWAR_MCU_FAMILY     "ESP8266"
+  #define ANASHWAR_MCU_ARCH       "Tensilica L106 32-bit @ 80/160MHz"
+  #define ANASHWAR_MCU_FLASH_MB   4.0f
+  #define ANASHWAR_MCU_SRAM_KB    80
+  #define ANASHWAR_MCU_ANTENNA    "2.4 GHz 802.11 b/g/n (PCB Antenna)"
+#elif defined(ARDUINO_UNOR4_WIFI)
+  #define ANASHWAR_MCU_FAMILY     "Arduino UNO R4 WiFi"
+  #define ANASHWAR_MCU_ARCH       "Renesas RA4M1 (48MHz ARM Cortex-M4) + ESP32-S3"
+  #define ANASHWAR_MCU_FLASH_MB   0.25f
+  #define ANASHWAR_MCU_SRAM_KB    32
+  #define ANASHWAR_MCU_ANTENNA    "2.4 GHz 802.11 b/g/n + BLE 5.0"
+#elif defined(RTL8720DN) || defined(BOARD_RTL8720DN_BW16)
+  #define ANASHWAR_MCU_FAMILY     "BW16 (RTL8720DN)"
+  #define ANASHWAR_MCU_ARCH       "Realtek Ameba KM4 (200MHz) + KM0 (20MHz)"
+  #define ANASHWAR_MCU_FLASH_MB   4.0f
+  #define ANASHWAR_MCU_SRAM_KB    512
+  #define ANASHWAR_MCU_ANTENNA    "Dual-Band 2.4 GHz & 5.0 GHz 802.11 a/b/g/n + BLE 5.0"
+#else
+  #define ANASHWAR_MCU_FAMILY     "Generic Edge MCU"
+  #define ANASHWAR_MCU_ARCH       "Microcontroller Core"
+  #define ANASHWAR_MCU_FLASH_MB   4.0f
+  #define ANASHWAR_MCU_SRAM_KB    256
+  #define ANASHWAR_MCU_ANTENNA    "2.4 GHz 802.11 b/g/n"
+#endif
+
 class AnashwarFleetClient {
 public:
     typedef void (*CommandCallback)(const String& action, const String& value);
@@ -188,12 +223,13 @@ private:
     }
 
     void publishTelemetry() {
-        char payload[512];
+        char payload[768];
         snprintf(payload, sizeof(payload),
             "{\"name\":\"%s\",\"id\":\"%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
             "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\",\"mode\":1,"
             "\"service\":%s,\"offline\":%s,\"state\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
-            "\"heap\":%u,\"uptime\":%lu,\"delay\":%.1f,\"btn\":0,\"led\":1}",
+            "\"heap\":%u,\"uptime\":%lu,\"delay\":%.1f,\"btn\":0,\"led\":1,"
+            "\"mcu\":\"%s\",\"arch\":\"%s\",\"flash\":%.1f,\"ram\":%d,\"antenna\":\"%s\"}",
             _deviceName.c_str(),
             ("Anashwar-" + _chipId).c_str(),
             _macAddress.c_str(),
@@ -208,7 +244,12 @@ private:
             WiFi.RSSI(),
             (unsigned int)ESP.getFreeHeap(),
             millis() / 1000,
-            _delaySec
+            _delaySec,
+            ANASHWAR_MCU_FAMILY,
+            ANASHWAR_MCU_ARCH,
+            ANASHWAR_MCU_FLASH_MB,
+            ANASHWAR_MCU_SRAM_KB,
+            ANASHWAR_MCU_ANTENNA
         );
 
         _mqtt.publish(ANASHWAR_TOPIC_STATUS, payload, false);

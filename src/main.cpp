@@ -12,6 +12,41 @@
 #include <Preferences.h>
 
 // =============================================================================
+// MCU HARDWARE PROFILE & ARCHITECTURE SPECS (ESP32, ESP8266, BW16, Arduino Uno R4)
+// =============================================================================
+#if defined(ESP32)
+  #define MCU_FAMILY_NAME     "ESP32"
+  #define MCU_ARCH_NAME       "Xtensa LX6 Dual-Core @ 240MHz"
+  #define MCU_FLASH_SIZE_MB   4.0f
+  #define MCU_SRAM_TOTAL_KB   320
+  #define MCU_WIRELESS_CAP    "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)"
+#elif defined(ESP8266)
+  #define MCU_FAMILY_NAME     "ESP8266"
+  #define MCU_ARCH_NAME       "Tensilica L106 32-bit @ 80/160MHz"
+  #define MCU_FLASH_SIZE_MB   4.0f
+  #define MCU_SRAM_TOTAL_KB   80
+  #define MCU_WIRELESS_CAP    "2.4 GHz 802.11 b/g/n (PCB Antenna)"
+#elif defined(ARDUINO_UNOR4_WIFI)
+  #define MCU_FAMILY_NAME     "Arduino UNO R4 WiFi"
+  #define MCU_ARCH_NAME       "Renesas RA4M1 (48MHz Cortex-M4) + ESP32-S3"
+  #define MCU_FLASH_SIZE_MB   0.25f
+  #define MCU_SRAM_TOTAL_KB   32
+  #define MCU_WIRELESS_CAP    "2.4 GHz 802.11 b/g/n + BLE 5.0"
+#elif defined(RTL8720DN) || defined(BOARD_RTL8720DN_BW16)
+  #define MCU_FAMILY_NAME     "BW16 (RTL8720DN)"
+  #define MCU_ARCH_NAME       "Realtek Ameba KM4 (200MHz) + KM0 (20MHz)"
+  #define MCU_FLASH_SIZE_MB   4.0f
+  #define MCU_SRAM_TOTAL_KB   512
+  #define MCU_WIRELESS_CAP    "Dual-Band 2.4 GHz & 5.0 GHz 802.11 a/b/g/n + BLE 5.0"
+#else
+  #define MCU_FAMILY_NAME     "Generic Edge MCU"
+  #define MCU_ARCH_NAME       "Microcontroller Core"
+  #define MCU_FLASH_SIZE_MB   4.0f
+  #define MCU_SRAM_TOTAL_KB   256
+  #define MCU_WIRELESS_CAP    "2.4 GHz 802.11 b/g/n"
+#endif
+
+// =============================================================================
 // GLOBAL STATE & SYSTEM VARIABLES
 // =============================================================================
 // Current active firmware mode:
@@ -431,12 +466,13 @@ void publishStatusTelemetry() {
   if (!mqttClient.connected())
     return;
 
-  char statusPayload[512];
+  char statusPayload[768];
   snprintf(statusPayload, sizeof(statusPayload),
            "{\"name\":\"%s\",\"id\":\"%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
            "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\",\"mode\":%"
            "d,\"service\":%s,\"offline\":%s,\"state\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
-           "\"heap\":%u,\"uptime\":%lu,\"delay\":%.1f,\"btn\":%d,\"led\":%d}",
+           "\"heap\":%u,\"uptime\":%lu,\"delay\":%.1f,\"btn\":%d,\"led\":%d,"
+           "\"mcu\":\"%s\",\"arch\":\"%s\",\"flash\":%.1f,\"ram\":%d,\"antenna\":\"%s\"}",
            nodeName.c_str(), mqttClientId.c_str(), nodeMac.c_str(),
            chipIdStr.c_str(), nodeClient.c_str(), nodeProject.c_str(),
            nodeSecHash.c_str(), currentMode,
@@ -446,7 +482,9 @@ void publishStatusTelemetry() {
            WiFi.localIP().toString().c_str(), WiFi.RSSI(),
            (unsigned int)ESP.getFreeHeap(), millis() / 1000, outputDelaySec,
            rawButtonState ? 1 : 0,
-           (digitalRead(ONBOARD_LED_PIN) == LED_STATE_ON) ? 1 : 0);
+           (digitalRead(ONBOARD_LED_PIN) == LED_STATE_ON) ? 1 : 0,
+           MCU_FAMILY_NAME, MCU_ARCH_NAME, MCU_FLASH_SIZE_MB, MCU_SRAM_TOTAL_KB,
+           MCU_WIRELESS_CAP);
 
   mqttClient.publish(MQTT_TOPIC_STATUS, statusPayload, false);
 }

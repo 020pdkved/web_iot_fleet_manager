@@ -48,11 +48,40 @@ os.makedirs(REGISTRY_DIR, exist_ok=True)
 
 # User Database & Session Store
 users_db = {}
-active_sessions = {}  # token -> {"username": str, "login_time": float}
+active_sessions = {}  # token -> device_info dict with username, os, device_model, ip, location, etc.
+session_history = []  # list of past login device telemetry records
+SESSION_HISTORY_FILE = os.path.join(PROJECT_ROOT, "session_history.json")
 webauthn_credentials = {} # username -> list of credentials
 webauthn_challenges = {} # username / _login_ -> {"challenge": str, "ts": float}
 last_presence_ping_time = 0.0
 geo_cache = {}
+
+def load_session_history():
+    global session_history
+    if os.path.isfile(SESSION_HISTORY_FILE):
+        try:
+            with open(SESSION_HISTORY_FILE, "r") as f:
+                session_history = json.load(f)
+                return
+        except Exception:
+            pass
+    session_history = []
+
+def save_session_history():
+    try:
+        with open(SESSION_HISTORY_FILE, "w") as f:
+            json.dump(session_history[-60:], f, indent=2)
+    except Exception:
+        pass
+
+load_session_history()
+
+def add_session_history(info):
+    global session_history
+    session_history.append(info)
+    if len(session_history) > 60:
+        session_history = session_history[-60:]
+    save_session_history()
 
 def load_webauthn():
     global webauthn_credentials
@@ -90,7 +119,7 @@ def get_ip_geolocation(ip_str=""):
         "city": "Pune",
         "region": "Maharashtra",
         "country": "India",
-        "isp": "Enterprise Edge ISP",
+        "isp": "Reliance Jio Infocomm Limited",
         "public_ip": ""
     }
     try:
@@ -119,6 +148,162 @@ def get_ip_geolocation(ip_str=""):
         pass
     geo_cache[cache_key] = {"ts": time.time(), "data": res}
     return res
+
+def parse_client_device(user_agent_str, headers=None, client_ip="127.0.0.1", extra_payload=None):
+    ua = user_agent_str or ""
+    headers = headers or {}
+    extra_payload = extra_payload or {}
+
+    # 1. Operating System Detection
+    os_name = "Unknown OS"
+    if "iPhone" in ua or "iPad" in ua or "iPod" in ua:
+        os_name = "Apple iOS" if "iPhone" in ua else "Apple iPadOS"
+        m = re.search(r"OS (\d+[_\d]*)", ua)
+        if m:
+            os_name += " " + m.group(1).replace("_", ".")
+    elif "Android" in ua:
+        os_name = "Android"
+        m = re.search(r"Android (\d+(\.\d+)?)", ua)
+        if m:
+            os_name += " " + m.group(1)
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        os_name = "macOS (Apple Mac)"
+        m = re.search(r"Mac OS X (\d+[_\d]*)", ua)
+        if m:
+            os_name += " " + m.group(1).replace("_", ".")
+    elif "Windows NT 10.0" in ua:
+        os_name = "Windows 11 / 10"
+    elif "Windows NT" in ua:
+        os_name = "Windows"
+    elif "Linux" in ua:
+        os_name = "Linux"
+
+    # 2. Device Name & Model
+    device_model = extra_payload.get("device_model", "")
+    if isinstance(device_model, list):
+        device_model = device_model[0] if device_model else ""
+    device_model = device_model.strip() if device_model else ""
+
+    if not device_model:
+        if "iPhone" in ua:
+            device_model = "Apple iPhone"
+        elif "iPad" in ua:
+            device_model = "Apple iPad"
+        elif "SM-" in ua or "Samsung" in ua:
+            m = re.search(r"(SM-[A-Za-z0-9]+)", ua)
+            device_model = f"Samsung Galaxy ({m.group(1)})" if m else "Samsung Galaxy"
+        elif "Pixel" in ua:
+            m = re.search(r"(Pixel [A-Za-z0-9 ]+)", ua)
+            device_model = f"Google {m.group(1)}" if m else "Google Pixel"
+        elif "Macintosh" in ua:
+            device_model = "Apple MacBook / Mac"
+        elif "Windows" in ua:
+            device_model = "PC Desktop / Laptop"
+        else:
+            device_model = "Edge Terminal"
+
+    # 3. Touch Screen & Form Factor
+    is_touch = extra_payload.get("is_touch")
+    if isinstance(is_touch, list):
+        is_touch = is_touch[0] if is_touch else False
+    if isinstance(is_touch, str):
+        is_touch = (is_touch.lower() in ("true", "1", "yes"))
+    if is_touch is None:
+        is_touch = ("Mobile" in ua or "Android" in ua or "iPhone" in ua or "iPad" in ua)
+
+    device_type = "Touch Screen Phone" if ("iPhone" in ua or ("Android" in ua and "Mobile" in ua)) else \
+                  "Touch Screen Tablet" if ("iPad" in ua or ("Android" in ua and "Mobile" not in ua)) else \
+                  "Touch Device" if is_touch else "Desktop / PC (Non-Touch)"
+
+    # Screen resolution
+    screen_res = extra_payload.get("screen", "")
+    if isinstance(screen_res, list):
+        screen_res = screen_res[0] if screen_res else ""
+    screen_res = screen_res or ("Retina Mobile" if is_touch else "Desktop FHD")
+
+    # 4. Geolocation & IP
+    geo = get_ip_geolocation(client_ip)
+
+    now = time.localtime()
+    return {
+        "os": os_name,
+        "device_model": device_model,
+        "device_type": device_type,
+        "is_touch": bool(is_touch),
+        "screen": screen_res,
+        "ip": client_ip,
+        "location": geo.get("location", "Pune, Maharashtra, India"),
+        "carrier": geo.get("isp", "Reliance Jio"),
+        "login_time": time.time(),
+        "login_time_str": time.strftime("%Y-%m-%d %H:%M:%S", now),
+        "last_active": time.time()
+    }
+
+def can_user_view_log(line, caller_username, caller_role):
+    # If no actor tag, default to system event (visible to everyone)
+    if "[ACTOR:" not in line:
+        return True
+    try:
+        tag_start = line.find("[ACTOR:")
+        tag_end = line.find("]", tag_start)
+        if tag_start < 0 or tag_end < 0:
+            return True
+        tag = line[tag_start+7:tag_end]
+        parts = tag.split(":")
+        if len(parts) < 2:
+            return True
+        actor = parts[0]
+        role = parts[1]
+
+        # 1. System hardware telemetry is visible to all users
+        if role == "SYSTEM" or actor == "SYSTEM":
+            return True
+
+        # 2. Super Admin sees ALL actions
+        if caller_role == "Super Admin":
+            return True
+
+        # 3. Fleet Operator:
+        # - sees his own actions
+        # - sees standard Users' actions
+        # - CANNOT see Super Admin actions
+        # - CANNOT see other Fleet Operators' actions
+        if caller_role == "Fleet Operator":
+            if role == "Super Admin":
+                return False
+            if role == "Fleet Operator":
+                return (actor == caller_username)
+            if role == "User":
+                return True
+            return False
+
+        # 4. Standard User:
+        # - sees ONLY his own actions
+        if caller_role == "User":
+            return (actor == caller_username)
+
+        return False
+    except Exception:
+        return True
+
+def format_log_display(line, caller_role):
+    if "[ACTOR:" not in line:
+        return line
+    try:
+        tag_start = line.find("[ACTOR:")
+        tag_end = line.find("]", tag_start)
+        tag = line[tag_start+7:tag_end]
+        parts = tag.split(":")
+        actor = parts[0]
+        role = parts[1]
+        clean_text = (line[:tag_start] + line[tag_end+1:]).strip()
+        if actor == "SYSTEM":
+            return clean_text
+        if caller_role == "Super Admin":
+            return f"{clean_text} [{actor} • {role}]"
+        return f"{clean_text} (by {actor})"
+    except Exception:
+        return line
 
 def load_users():
     global users_db
@@ -342,6 +527,7 @@ nodes_telemetry = {
         "ip": "10.94.142.79",
         "mode": 1,
         "service": True,
+        "offline": False,
         "state": "online",
         "delay": 0.0,
         "btn": 0,
@@ -349,6 +535,11 @@ nodes_telemetry = {
         "rssi": -45,
         "heap": 242000,
         "uptime": 0,
+        "mcu_family": "ESP32",
+        "mcu_arch": "Xtensa LX6 Dual-Core @ 240MHz",
+        "flash_mb": 4.0,
+        "ram_total_kb": 320,
+        "wireless_bands": "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)",
         "last_seen": 0,
         "online": False
     },
@@ -365,6 +556,7 @@ nodes_telemetry = {
         "ip": "10.94.142.111",
         "mode": 1,
         "service": True,
+        "offline": False,
         "state": "online",
         "delay": 0.0,
         "btn": 0,
@@ -372,6 +564,11 @@ nodes_telemetry = {
         "rssi": -42,
         "heap": 241000,
         "uptime": 0,
+        "mcu_family": "ESP32",
+        "mcu_arch": "Xtensa LX6 Dual-Core @ 240MHz",
+        "flash_mb": 4.0,
+        "ram_total_kb": 320,
+        "wireless_bands": "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)",
         "last_seen": 0,
         "online": False
     }
@@ -382,7 +579,7 @@ node_updates = {
     "Node: A": {
         "active": False,
         "route": "cloud",
-        "filename": "firmware_mode1.bin",
+        "filename": "Base_firmware.bin",
         "total_bytes": 0,
         "sent_bytes": 0,
         "percent": 0,
@@ -398,7 +595,7 @@ node_updates = {
     "Node: B": {
         "active": False,
         "route": "cloud",
-        "filename": "firmware_mode1.bin",
+        "filename": "Base_firmware.bin",
         "total_bytes": 0,
         "sent_bytes": 0,
         "percent": 0,
@@ -434,13 +631,19 @@ def sync_telemetry_with_registry():
                 "ip": "0.0.0.0",
                 "mode": 1,
                 "service": True,
-                "state": "online",
+                "offline": False,
+                "state": "offline",
                 "delay": 0.0,
                 "btn": 0,
                 "led": 0,
-                "rssi": -50,
+                "rssi": -60,
                 "heap": 240000,
                 "uptime": 0,
+                "mcu_family": "ESP32",
+                "mcu_arch": "Xtensa LX6 Dual-Core @ 240MHz",
+                "flash_mb": 4.0,
+                "ram_total_kb": 320,
+                "wireless_bands": "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)",
                 "last_seen": 0,
                 "online": False
             }
@@ -452,7 +655,7 @@ def sync_telemetry_with_registry():
             node_updates[n_name] = {
                 "active": False,
                 "route": "cloud",
-                "filename": "firmware_mode1.bin",
+                "filename": "Base_firmware.bin",
                 "total_bytes": 0,
                 "sent_bytes": 0,
                 "percent": 0,
@@ -468,19 +671,20 @@ def sync_telemetry_with_registry():
 
 sync_telemetry_with_registry()
 
-def log_event(msg):
+def log_event(msg, actor="SYSTEM", actor_role="SYSTEM"):
     now = time.localtime()
     day_str = time.strftime("%Y-%m-%d", now)
     ts = time.strftime("[%H:%M:%S]", now)
-    entry = f"{ts} {msg}"
+    meta_tag = f"[ACTOR:{actor}:{actor_role}]"
+    entry = f"{meta_tag} {ts} {msg}"
     activity_logs.append(entry)
     if len(activity_logs) > 400:
         activity_logs.pop(0)
-    print(entry, flush=True)
+    print(f"{ts} [{actor}:{actor_role}] {msg}", flush=True)
     try:
         log_file = os.path.join(REGISTRY_DIR, f"{day_str}.log")
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', now)}] {msg}\n")
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', now)}] {meta_tag} {msg}\n")
     except Exception as e:
         print(f"[REGISTRY] Error writing daily log: {e}", flush=True)
 
@@ -947,13 +1151,19 @@ def start_mqtt_client():
                                     "rssi": int(tdata.get("rssi", -60)),
                                     "heap": int(tdata.get("heap", 240000)),
                                     "uptime": int(tdata.get("uptime", 0)),
+                                    "mcu_family": tdata.get("mcu", "ESP32"),
+                                    "mcu_arch": tdata.get("arch", "Xtensa LX6 Dual-Core @ 240MHz"),
+                                    "flash_mb": float(tdata.get("flash", 4.0)),
+                                    "ram_total_kb": int(tdata.get("ram", 320)),
+                                    "wireless_bands": tdata.get("antenna", "2.4 GHz 802.11 b/g/n + BLE 4.2"),
+                                    "offline": bool(tdata.get("offline", False)),
                                     "last_seen": time.time(),
                                     "online": True
                                 }
                                 node_updates[target_name] = {
                                     "active": False,
                                     "route": "cloud",
-                                    "filename": "firmware_mode1.bin",
+                                    "filename": "Base_firmware.bin",
                                     "total_bytes": 0,
                                     "sent_bytes": 0,
                                     "percent": 0,
@@ -983,6 +1193,12 @@ def start_mqtt_client():
                             node["btn"] = int(tdata.get("btn", 0))
                             node["led"] = int(tdata.get("led", 0))
                             node["sec_hash"] = tdata.get("sec_hash", node.get("sec_hash", ""))
+                            if tdata.get("mcu"): node["mcu_family"] = tdata["mcu"]
+                            if tdata.get("arch"): node["mcu_arch"] = tdata["arch"]
+                            if tdata.get("flash"): node["flash_mb"] = float(tdata["flash"])
+                            if tdata.get("ram"): node["ram_total_kb"] = int(tdata["ram"])
+                            if tdata.get("antenna"): node["wireless_bands"] = tdata["antenna"]
+                            if "offline" in tdata: node["offline"] = bool(tdata["offline"])
                             node["last_seen"] = time.time()
                             node["online"] = True
 
@@ -1211,6 +1427,9 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     elapsed = int(time.time() - u["reboot_start_time"])
                     u["stage_text"] = f"Rebooting & establishing connection... {elapsed}s elapsed (est. 15-25s)"
 
+            caller_role = users_db.get(user, {}).get("role", "User")
+            filtered_logs = [format_log_display(l, caller_role) for l in activity_logs if can_user_view_log(l, user, caller_role)]
+
             payload = {
                 "nodes": nodes_telemetry,
                 "updates": node_updates,
@@ -1220,9 +1439,9 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 "lan_ip": get_lan_ip(),
                 "mdns_url": "http://control.local",
                 "port": PORT,
-                "logs": activity_logs[-40:],
+                "logs": filtered_logs[-40:],
                 "current_user": user,
-                "user_role": users_db.get(user, {}).get("role", "Administrator"),
+                "user_role": caller_role,
                 "usb_devices": scan_usb_devices()
             }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
@@ -1267,7 +1486,21 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     "can_delete": can_del,
                     "biometrics_enrolled": (u in webauthn_credentials and len(webauthn_credentials[u]) > 0)
                 })
-            self.wfile.write(json.dumps({"users": u_list, "current_user": user, "caller_role": caller_role}).encode("utf-8"))
+            # Collect active session device telemetry
+            sessions_data = []
+            for s_tok, s_info in active_sessions.items():
+                s_copy = dict(s_info)
+                s_copy.pop("token", None)
+                s_copy["is_current"] = (s_tok == token)
+                sessions_data.append(s_copy)
+
+            self.wfile.write(json.dumps({
+                "users": u_list,
+                "current_user": user,
+                "caller_role": caller_role,
+                "sessions": sessions_data,
+                "session_history": session_history[-30:]
+            }).encode("utf-8"))
 
         elif path == "/api/registry/calendar":
             user, token = get_authenticated_user(self.headers, parsed)
@@ -1352,14 +1585,17 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             elif date_str == time.strftime("%Y-%m-%d"):
                 events = list(activity_logs)
 
+            caller_role = users_db.get(user, {}).get("role", "User")
+            filtered_events = [format_log_display(line, caller_role) for line in events if can_user_view_log(line, user, caller_role)]
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
                 "date": date_str,
                 "filename": f"{date_str}.log",
-                "count": len(events),
-                "events": events
+                "count": len(filtered_events),
+                "events": filtered_events
             }).encode("utf-8"))
 
         elif path == "/api/registry/download":
@@ -1370,22 +1606,26 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             qp = parse_qs(parsed.query)
             date_str = qp.get("date", [time.strftime("%Y-%m-%d")])[0].strip()
             log_file = os.path.join(REGISTRY_DIR, f"{date_str}.log")
-            if not os.path.isfile(log_file):
-                if date_str == time.strftime("%Y-%m-%d") and activity_logs:
-                    with open(log_file, "w", encoding="utf-8") as f:
-                        for l in activity_logs:
-                            f.write(l + "\n")
-                else:
-                    self.send_error(404, "Log file not found")
-                    return
-            file_size = os.path.getsize(log_file)
+            raw_lines = []
+            if os.path.isfile(log_file):
+                with open(log_file, "r", encoding="utf-8") as f:
+                    raw_lines = f.readlines()
+            elif date_str == time.strftime("%Y-%m-%d") and activity_logs:
+                raw_lines = [l + "\n" for l in activity_logs]
+            else:
+                self.send_error(404, "Log file not found")
+                return
+
+            caller_role = users_db.get(user, {}).get("role", "User")
+            download_lines = [format_log_display(l.strip(), caller_role) + "\n" for l in raw_lines if can_user_view_log(l.strip(), user, caller_role)]
+            content_bytes = "".join(download_lines).encode("utf-8")
+
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Length", str(len(content_bytes)))
             self.send_header("Content-Disposition", f'attachment; filename="anashwar-registry-{date_str}.log"')
             self.end_headers()
-            with open(log_file, "rb") as f:
-                self.wfile.write(f.read())
+            self.wfile.write(content_bytes)
 
         elif path == "/api/usb/scan":
             user, token = get_authenticated_user(self.headers, parsed)
@@ -1492,19 +1732,27 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             p = data.get("password", [""])[0].strip()
             if verify_credentials(u, p):
                 token = secrets.token_hex(24)
-                active_sessions[token] = {"username": u, "login_time": time.time()}
+                client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+                dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, data)
+                dev_info["username"] = u
+                u_role = users_db[u].get("role", "User")
+                dev_info["role"] = u_role
+                dev_info["token"] = token
+                active_sessions[token] = dev_info
+                add_session_history(dev_info)
+
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=604800")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True, "token": token, "username": u, "role": users_db[u].get("role", "Administrator")}).encode("utf-8"))
-                log_event(f"AUTH: User '{u}' logged in successfully")
+                self.wfile.write(json.dumps({"success": True, "token": token, "username": u, "role": u_role, "device": dev_info}).encode("utf-8"))
+                log_event(f"AUTH: User '{u}' logged in from {dev_info['device_model']} ({dev_info['os']}, {dev_info['location']})", actor=u, actor_role=u_role)
             else:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"success": false, "error": "Invalid username or password"}')
-                log_event(f"AUTH WARNING: Failed login attempt for user '{u}'")
+                log_event(f"AUTH WARNING: Failed login attempt for user '{u}'", actor=u, actor_role="UNKNOWN")
             return
 
         elif path == "/api/logout":
@@ -1532,6 +1780,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error": "Unauthorized", "authenticated": false}')
             return
+        caller_role = users_db.get(user, {}).get("role", "User")
 
         # 1. Hardware Node Command Dispatcher
         if path == "/api/command":
@@ -1554,6 +1803,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                         cmd = f"CMD:[{target_node}]:DELAY:{fval:.1f}"
                         publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
                         nodes_telemetry[target_node]["delay"] = fval
+                        log_event(f"CONFIG: [{target_node}] output propagation delay set to {fval:.1f}s", actor=user, actor_role=caller_role)
                 except ValueError:
                     pass
 
@@ -1564,17 +1814,19 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 nodes_telemetry[target_node]["service"] = (state_str == "ON")
                 if state_str == "OFF":
                     nodes_telemetry[target_node]["led"] = 0
+                log_event(f"SERVICE: [{target_node}] master service switched {state_str}", actor=user, actor_role=caller_role)
 
             elif action == "OFFLINE":
                 state_str = "ON" if val.upper() in ("ON", "TRUE", "ENABLE") else "OFF"
                 cmd = f"CMD:[{target_node}]:OFFLINE:{state_str}"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
                 nodes_telemetry[target_node]["offline_mode"] = (state_str == "ON")
-                log_event(f"OFFLINE: Set [{target_node}] autonomous offline mode to {state_str}")
+                log_event(f"OFFLINE: Set [{target_node}] autonomous offline mode to {state_str}", actor=user, actor_role=caller_role)
 
             elif action == "REBOOT":
                 cmd = f"CMD:[{target_node}]:REBOOT"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] software reboot dispatched", actor=user, actor_role=caller_role)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1620,6 +1872,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             if route == "usb":
                 t = threading.Thread(target=run_usb_flash_task, args=(target_node, filename, mode_num), daemon=True)
                 t.start()
+                log_event(f"USB FLASH: Starting for [{target_node}] with '{filename}'", actor=user, actor_role=caller_role)
             else:
                 # Cloud OTA route
                 u["stage"] = "downloading"
@@ -1630,7 +1883,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 ota_url = f"{tunnel}/download/{filename}"
                 cmd = f"OTA:[{target_node}]:{ota_url}"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
-                log_event(f"OTA INITIATED: [{target_node}] instructed to fetch {ota_url}")
+                log_event(f"OTA INITIATED: [{target_node}] instructed to fetch {ota_url}", actor=user, actor_role=caller_role)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1657,7 +1910,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     "projects": []
                 }
                 save_fleet_registry()
-                log_event(f"REGISTRY: Created Client '{name}' ({c_id})")
+                log_event(f"REGISTRY: Created Client '{name}' ({c_id})", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1677,7 +1930,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                         del fleet_registry["projects"][p_id]
                 del fleet_registry["clients"][c_id]
                 save_fleet_registry()
-                log_event(f"REGISTRY: Client '{c_name}' ({c_id}) deleted by '{user}'")
+                log_event(f"REGISTRY: Client '{c_name}' ({c_id}) deleted by '{user}'", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1706,7 +1959,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 }
                 fleet_registry["clients"][client_id]["projects"].append(p_id)
                 save_fleet_registry()
-                log_event(f"REGISTRY: Created Project '{name}' ({p_id}) under Client '{client_id}'")
+                log_event(f"REGISTRY: Created Project '{name}' ({p_id}) under Client '{client_id}'", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1725,7 +1978,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     fleet_registry["clients"][c_id]["projects"].remove(p_id)
                 del fleet_registry["projects"][p_id]
                 save_fleet_registry()
-                log_event(f"REGISTRY: Project '{p_name}' ({p_id}) deleted by '{user}'")
+                log_event(f"REGISTRY: Project '{p_name}' ({p_id}) deleted by '{user}'", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1760,7 +2013,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 fleet_registry["projects"][project_id]["nodes"].append(n_name)
             save_fleet_registry()
             sync_telemetry_with_registry()
-            log_event(f"REGISTRY: Node [{n_name}] manually registered under Project '{project_id}'")
+            log_event(f"REGISTRY: Node [{n_name}] manually registered under Project '{project_id}'", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1781,7 +2034,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 if target_node in node_updates:
                     del node_updates[target_node]
                 save_fleet_registry()
-                log_event(f"REGISTRY: Node [{target_node}] removed from registry by '{user}'")
+                log_event(f"REGISTRY: Node [{target_node}] removed from registry by '{user}'", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1811,7 +2064,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 "created_at": time.strftime("%Y-%m-%d")
             }
             save_users()
-            log_event(f"AUTH: User '{new_u}' ({role}) registered by '{user}'")
+            log_event(f"AUTH: User '{new_u}' ({role}) registered by '{user}'", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1842,7 +2095,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
                 del users_db[del_u]
                 save_users()
-                log_event(f"AUTH: User '{del_u}' deleted their own login account")
+                log_event(f"AUTH: User '{del_u}' deleted their own login account", actor=del_u, actor_role=target_role)
 
                 # Invalidate active sessions
                 for tok, s_info in list(active_sessions.items()):
@@ -1884,7 +2137,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             del users_db[del_u]
             save_users()
-            log_event(f"AUTH: User '{del_u}' ({target_role}) deleted by '{user}' ({caller_role})")
+            log_event(f"AUTH: User '{del_u}' ({target_role}) deleted by '{user}' ({caller_role})", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1906,7 +2159,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 if n.get("client") == old_name:
                     n["client"] = new_name
             publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[*]:SETCLIENT:{new_name}")
-            log_event(f"REGISTRY: Client '{old_name}' renamed to '{new_name}' (Synchronized to nodes)")
+            log_event(f"REGISTRY: Client '{old_name}' renamed to '{new_name}' (Synchronized to nodes)", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1926,7 +2179,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 if n.get("project") == old_name:
                     n["project"] = new_name
             publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[*]:SETPROJECT:{new_name}")
-            log_event(f"REGISTRY: Project '{old_name}' renamed to '{new_name}' (Synchronized to nodes)")
+            log_event(f"REGISTRY: Project '{old_name}' renamed to '{new_name}' (Synchronized to nodes)", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1962,7 +2215,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             # 3. Broadcast rename command to ESP32 to persist in NVS
             publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_key}]:RENAME:{new_name}")
-            log_event(f"REGISTRY: Node [{target_key}] renamed to '{new_name}' (Synchronized to ESP32 NVS)")
+            log_event(f"REGISTRY: Node [{target_key}] renamed to '{new_name}' (Synchronized to ESP32 NVS)", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2016,7 +2269,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     "enrolled_at": time.strftime("%Y-%m-%d %H:%M:%S")
                 })
                 save_webauthn()
-                log_event(f"AUTH: Biometric device enrolled for user '{user}' ({device_label})")
+                log_event(f"AUTH: Biometric device enrolled for user '{user}' ({device_label})", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2065,16 +2318,21 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
                 if matched_user:
                     token = secrets.token_hex(24)
-                    active_sessions[token] = {
-                        "username": matched_user,
-                        "login_time": time.time()
-                    }
-                    log_event(f"AUTH: User '{matched_user}' signed in via {matched_device}")
+                    client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+                    dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, payload)
+                    dev_info["username"] = matched_user
+                    u_role = users_db.get(matched_user, {}).get("role", "User")
+                    dev_info["role"] = u_role
+                    dev_info["token"] = token
+                    active_sessions[token] = dev_info
+                    add_session_history(dev_info)
+
+                    log_event(f"AUTH: User '{matched_user}' signed in via {matched_device} ({dev_info['device_model']}, {dev_info['location']})", actor=matched_user, actor_role=u_role)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=86400")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"success": True, "token": token, "username": matched_user}).encode("utf-8"))
+                    self.wfile.write(json.dumps({"success": True, "token": token, "username": matched_user, "role": u_role, "device": dev_info}).encode("utf-8"))
                 else:
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
@@ -2113,7 +2371,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 nodes_telemetry[node_name]["client"] = fleet_registry["clients"][client_id]["name"]
                 nodes_telemetry[node_name]["project"] = fleet_registry["projects"][project_id]["name"]
                 save_fleet_registry()
-                log_event(f"REGISTRY: Assigned [{node_name}] to Project '{project_id}'")
+                log_event(f"REGISTRY: Assigned [{node_name}] to Project '{project_id}'", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2174,7 +2432,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                             with open(save_path, "wb") as f:
                                 f.write(file_data)
                             info = inspect_esp32_binary(save_path)
-                            log_event(f"CUSTOM BINARY UPLOADED: '{filename}' ({info['size_kb']} KB, Chip: {info['target_chip']})")
+                            log_event(f"CUSTOM BINARY UPLOADED: '{filename}' ({info['size_kb']} KB, Chip: {info['target_chip']})", actor=user, actor_role=caller_role)
 
                             self.send_response(200)
                             self.send_header("Content-Type", "application/json")
@@ -2463,11 +2721,15 @@ def render_login_html():
       btn.disabled = true;
       btn.innerText = 'Verifying Credentials...';
 
+      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || window.matchMedia('(pointer: coarse)').matches;
+      const screenRes = `${window.screen.width}x${window.screen.height}`;
+      const devModel = (navigator.userAgentData && navigator.userAgentData.model) ? navigator.userAgentData.model : "";
+
       try {
         const resp = await fetch('/api/login', {
           method: 'POST',
           headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}`
+          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&screen=${encodeURIComponent(screenRes)}&is_touch=${isTouch}&device_model=${encodeURIComponent(devModel)}`
         });
         const data = await resp.json();
         if (data.success && data.token) {
@@ -2533,10 +2795,14 @@ def render_login_html():
 
         const credId = btoa(String.fromCharCode(...new Uint8Array(assertion.rawId))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
 
+        const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || window.matchMedia('(pointer: coarse)').matches;
+        const screenRes = `${window.screen.width}x${window.screen.height}`;
+        const devModel = (navigator.userAgentData && navigator.userAgentData.model) ? navigator.userAgentData.model : "";
+
         const verifyRes = await fetch('/api/webauthn/login/verify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: credId, rawId: credId })
+          body: JSON.stringify({ id: credId, rawId: credId, screen: screenRes, is_touch: isTouch, device_model: devModel })
         });
         const vData = await verifyRes.json();
 
@@ -3519,6 +3785,148 @@ def render_fleet_html(current_user="admin", token=""):
       color: #94A3B8;
       line-height: 1.6;
     }
+
+    /* Two-Form Display System: Touch Screen Phone vs Non-Touch PC/Mac Desktop */
+    .form-mode-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 100px;
+      background: rgba(225, 29, 72, 0.12);
+      border: 1px solid rgba(225, 29, 72, 0.35);
+      color: #FB7185;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-family: var(--font);
+    }
+    .form-mode-pill:hover {
+      background: rgba(225, 29, 72, 0.25);
+      border-color: var(--crimson);
+      color: #FFFFFF;
+      transform: translateY(-1px);
+    }
+
+    /* Base Firmware Golden Reference Card */
+    .base-firmware-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-bottom: 18px;
+    }
+    .base-firmware-card:hover {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    .base-firmware-card.active {
+      background: rgba(225, 29, 72, 0.12);
+      border-color: var(--crimson);
+      box-shadow: 0 4px 20px rgba(225, 29, 72, 0.25);
+    }
+
+    /* Mobile Bottom Navigation Bar */
+    .mobile-bottom-nav {
+      display: none;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 64px;
+      background: rgba(13, 17, 26, 0.95);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-top: 1px solid var(--card-border);
+      z-index: 150;
+      grid-template-columns: repeat(4, 1fr);
+      align-items: center;
+      padding: 0 8px;
+      box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.6);
+    }
+    .bottom-nav-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 8px 4px;
+      border-radius: 10px;
+      transition: all 0.2s;
+      text-decoration: none;
+      min-height: 48px;
+    }
+    .bottom-nav-item .bnav-icon {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+    .bottom-nav-item .bnav-label {
+      font-size: 11px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+    .bottom-nav-item.active, .bottom-nav-item:active {
+      color: #38BDF8;
+    }
+    .bottom-nav-item.active .bnav-icon {
+      transform: scale(1.15);
+    }
+
+    /* Responsive Phone Touch Mode (Default <= 860px or overridden by class) */
+    @media (max-width: 860px) {
+      .sidebar { display: none !important; }
+      .mobile-bottom-nav { display: grid !important; }
+      .content-area { padding: 14px 16px 84px 16px !important; }
+      .topbar { padding: 0 16px !important; height: 60px !important; }
+      .search-box { display: none !important; }
+      #mdns-link, #public-tunnel-link { display: none !important; }
+      .kpi-grid { grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
+      .kpi-card { padding: 16px !important; border-radius: 14px !important; }
+      .kpi-title { font-size: 12px !important; }
+      .kpi-value { font-size: 20px !important; }
+      .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
+      .clients-grid, .projects-grid, .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+      .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
+      .modal-overlay { align-items: flex-end !important; }
+      .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
+      .apple-switch { width: 56px !important; height: 32px !important; }
+      .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
+      .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
+      .btn-main, .btn-secondary { min-height: 48px !important; font-size: 14px !important; }
+      .form-input { min-height: 46px !important; font-size: 15px !important; }
+    }
+
+    body.mode-phone-touch .sidebar { display: none !important; }
+    body.mode-phone-touch .mobile-bottom-nav { display: grid !important; }
+    body.mode-phone-touch .content-area { padding: 14px 16px 84px 16px !important; }
+    body.mode-phone-touch .topbar { padding: 0 16px !important; height: 60px !important; }
+    body.mode-phone-touch .search-box { display: none !important; }
+    body.mode-phone-touch #mdns-link, body.mode-phone-touch #public-tunnel-link { display: none !important; }
+    body.mode-phone-touch .kpi-grid { grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
+    body.mode-phone-touch .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
+    body.mode-phone-touch .clients-grid, body.mode-phone-touch .projects-grid, body.mode-phone-touch .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+    body.mode-phone-touch .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
+    body.mode-phone-touch .modal-overlay { align-items: flex-end !important; }
+    body.mode-phone-touch .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
+    body.mode-phone-touch .apple-switch { width: 56px !important; height: 32px !important; }
+    body.mode-phone-touch .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
+    body.mode-phone-touch .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
+    body.mode-phone-touch .btn-main, body.mode-phone-touch .btn-secondary { min-height: 48px !important; font-size: 14px !important; }
+    body.mode-phone-touch .form-input { min-height: 46px !important; font-size: 15px !important; }
+
+    body.mode-desktop-pc .sidebar { display: flex !important; }
+    body.mode-desktop-pc .mobile-bottom-nav { display: none !important; }
+    body.mode-desktop-pc .content-area { padding: 28px 32px !important; }
+    body.mode-desktop-pc .kpi-grid { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; }
+    body.mode-desktop-pc .node-detail-layout { display: grid !important; grid-template-columns: 1.1fr 0.9fr !important; }
+    body.mode-desktop-pc .modal-overlay { align-items: center !important; }
+    body.mode-desktop-pc .modal-card { border-radius: 20px !important; }
   </style>
 </head>
 <body>
@@ -3601,6 +4009,9 @@ def render_fleet_html(current_user="admin", token=""):
         <a id="public-tunnel-link" href="#" target="_blank" class="status-pill pill-crimson" style="text-decoration:none;">
           🌐 Public Web View
         </a>
+        <button id="form-mode-toggle-btn" class="form-mode-pill" onclick="toggleDisplayFormOverride()" title="Toggle Touch Phone / Desktop PC View">
+          📱 Touch Phone View
+        </button>
         <div style="display:flex; align-items:center; gap:8px; border-left:1px solid rgba(255,255,255,0.12); padding-left:12px; margin-left:4px;">
           <div class="user-pill-btn" onclick="openUserModal()" title="Current Logged In User">
             <span style="font-size:14px;">👤</span>
@@ -3902,8 +4313,6 @@ def render_fleet_html(current_user="admin", token=""):
               </div>
             </div>
 
-            <!-- In-Situ Web Server Gateway -->
-            <div class="glass-card">
             <!-- In-Situ Embedded Server Card -->
             <div class="glass-card" style="margin-top: 24px;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
@@ -3924,6 +4333,18 @@ def render_fleet_html(current_user="admin", token=""):
 
           <!-- Right Column: Firmware Pipeline & Hardware Specs -->
           <div>
+            <!-- Microcontroller Hardware Profile & Wireless Capabilities -->
+            <div class="glass-card" style="margin-bottom: 24px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                <div class="panel-title" style="margin: 0;">Microcontroller Hardware Profile</div>
+                <span id="spec-mcu-family-pill" class="status-pill pill-cyan" style="font-size: 11px;">ESP32 (Tensilica)</span>
+              </div>
+              <div class="node-spec-row"><span class="node-spec-lbl">MCU Architecture</span><span class="node-spec-val" id="spec-mcu-arch" style="color:#A78BFA;">Tensilica Xtensa Dual-Core 240MHz</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Flash Memory</span><span class="node-spec-val" id="spec-mcu-flash" style="color:#38BDF8;">4 MB SPI Flash</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Total SRAM</span><span class="node-spec-val" id="spec-mcu-ram" style="color:#34D399;">320 KB Total SRAM</span></div>
+              <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Onboard Antenna Band</span><span class="node-spec-val" id="spec-mcu-antenna" style="color:#FBBF24;">2.4 GHz 802.11 b/g/n + BLE 4.2</span></div>
+            </div>
+
             <!-- Hardware Specifications Card -->
             <div class="glass-card" style="margin-bottom: 24px;">
               <div class="panel-title">Node Telemetry & Markers</div>
@@ -3941,24 +4362,19 @@ def render_fleet_html(current_user="admin", token=""):
             <!-- Firmware Deployment Hub -->
             <div class="glass-card">
               <div class="panel-title">Firmware Deployment Pipeline</div>
-              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Select a pre-compiled multi-mode binary or drag & drop a custom .bin:</p>
+              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Select the golden reference build or drag &amp; drop a custom verified .bin:</p>
 
-              <div class="mode-select-grid">
-                <div class="mode-btn active" id="btn-mode-1" onclick="selectFirmwareMode(1)">
-                  <div class="mode-btn-title">Firmware 1</div>
-                  <div class="mode-btn-desc">Pressed: Solid ON<br>Released: OFF</div>
+              <!-- Golden Base Firmware Reference Build -->
+              <div class="base-firmware-card active" id="card-base-firmware" onclick="selectBaseFirmware()">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                  <div style="font-size: 14px; font-weight: 700; color: #FFFFFF; display: flex; align-items: center; gap: 8px;">
+                    <span style="color:#F59E0B;">⭐</span> <span>Base_firmware.bin</span>
+                    <span class="status-pill pill-green" style="font-size: 10px; padding: 2px 8px;">GOLDEN REFERENCE</span>
+                  </div>
+                  <span class="status-pill pill-cyan" style="font-size: 10px; padding: 2px 8px;">1059.5 KB</span>
                 </div>
-                <div class="mode-btn" id="btn-mode-2" onclick="selectFirmwareMode(2)">
-                  <div class="mode-btn-title">Firmware 2</div>
-                  <div class="mode-btn-desc">Pressed: Blinking<br>Released: OFF</div>
-                </div>
-                <div class="mode-btn" id="btn-mode-3" onclick="selectFirmwareMode(3)">
-                  <div class="mode-btn-title">Firmware 3</div>
-                  <div class="mode-btn-desc">Released: Solid ON<br>Pressed: OFF</div>
-                </div>
-                <div class="mode-btn" id="btn-mode-4" onclick="selectFirmwareMode(4)">
-                  <div class="mode-btn-title">Firmware 4</div>
-                  <div class="mode-btn-desc">Released: Blinking<br>Pressed: OFF</div>
+                <div style="font-size: 12px; color: var(--text-muted); line-height: 1.5;">
+                  Standard golden reference image for multi-MCU fleet integration (ESP32, ESP8266, BW16, Arduino Uno R4). Validated with dual-OTA partition fit, HiveMQ broker telemetry, onboard in-situ web console, hardware SHA-256 fingerprint, and autonomous offline service.
                 </div>
               </div>
 
@@ -4104,16 +4520,28 @@ def render_fleet_html(current_user="admin", token=""):
 
   <!-- Modal: User Management -->
   <div class="modal-overlay" id="modal-users">
-    <div class="modal-card" style="max-width: 540px;">
+    <div class="modal-card" style="max-width: 580px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-        <h3 style="margin: 0;">Enterprise User Accounts</h3>
+        <h3 style="margin: 0;">Enterprise User Accounts & Device Telemetry</h3>
         <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px;" onclick="closeModal('modal-users')">✕ Close</button>
       </div>
-      <p>Manage authenticated administrators and operators with portal access.</p>
+      <p>Manage authenticated administrators, operators, and review connected device sessions.</p>
       
       <div style="margin-bottom: 20px;">
         <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 8px;">Existing Accounts</div>
         <div id="users-list-container" style="max-height: 180px; overflow-y: auto;">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- Active Sessions & Connected Device Telemetry -->
+      <div style="margin-bottom: 20px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <div style="font-size: 12px; font-weight: 700; color: #CBD5E1;">📱 Connected Devices & Active Login Sessions</div>
+          <span class="status-pill pill-cyan" id="sessions-count-pill" style="font-size: 10px;">1 Active</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 10px;">Hardware, OS, device model, form factor, IP, and location captured per login:</div>
+        <div id="sessions-list-container" style="max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
           <!-- Populated by JS -->
         </div>
       </div>
@@ -4182,13 +4610,33 @@ def render_fleet_html(current_user="admin", token=""):
     </div>
   </div>
 
+  <!-- Mobile Bottom Navigation Bar (Touch Screen Phone Form) -->
+  <nav class="mobile-bottom-nav" id="mobile-bottom-nav">
+    <button class="bottom-nav-item active" id="bnav-dashboard" onclick="navigateTo('dashboard')">
+      <span class="bnav-icon">🏢</span>
+      <span class="bnav-label">Clients</span>
+    </button>
+    <button class="bottom-nav-item" id="bnav-node-detail" onclick="openNodeDetail(selectedNodeName || 'Node: A')">
+      <span class="bnav-icon">🖧</span>
+      <span class="bnav-label">Node Detail</span>
+    </button>
+    <button class="bottom-nav-item" id="bnav-registry" onclick="navigateTo('registry')">
+      <span class="bnav-icon">📜</span>
+      <span class="bnav-label">Registry</span>
+    </button>
+    <button class="bottom-nav-item" id="bnav-users" onclick="openUserModal()">
+      <span class="bnav-icon">👥</span>
+      <span class="bnav-label">Sessions</span>
+    </button>
+  </nav>
+
   <script>
     // State
     let currentView = "dashboard";
     let selectedClientId = "client_1";
     let selectedProjectId = "proj_1";
     let selectedNodeName = "Node: A";
-    let selectedFirmwareFile = "firmware_mode1.bin";
+    let selectedFirmwareFile = "Base_firmware.bin";
 
     let fleetData = {};
     let telemetryData = {};
@@ -4204,6 +4652,18 @@ def render_fleet_html(current_user="admin", token=""):
       currentView = view;
       document.querySelectorAll("#view-dashboard, #view-client, #view-project, #view-node-detail, #view-registry, #view-registry-day").forEach(el => el.style.display = "none");
       document.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
+      document.querySelectorAll(".bottom-nav-item").forEach(el => el.classList.remove("active"));
+
+      if (view === "dashboard" || view === "clients" || view === "client" || view === "projects" || view === "project") {
+        const b = document.getElementById("bnav-dashboard");
+        if (b) b.classList.add("active");
+      } else if (view === "registry" || view === "registry-day") {
+        const b = document.getElementById("bnav-registry");
+        if (b) b.classList.add("active");
+      } else if (view === "node-detail") {
+        const b = document.getElementById("bnav-node-detail");
+        if (b) b.classList.add("active");
+      }
 
       const breadcrumb = document.getElementById("breadcrumb-container");
 
@@ -4445,6 +4905,46 @@ def render_fleet_html(current_user="admin", token=""):
           `;
         }
         listContainer.innerHTML = html;
+
+        // Populate Active & Recent Connected Device Sessions
+        const sessContainer = document.getElementById("sessions-list-container");
+        const sessCountPill = document.getElementById("sessions-count-pill");
+        if (sessContainer && data.sessions) {
+          if (sessCountPill) sessCountPill.innerText = `${data.sessions.length} Active Session${data.sessions.length === 1 ? "" : "s"}`;
+          let sHtml = "";
+          for (const s of data.sessions) {
+            const isTouch = s.is_touch;
+            const icon = isTouch ? "📱" : "💻";
+            const formBadge = isTouch ? '<span class="status-pill pill-crimson" style="font-size:10px; padding:2px 8px;">📱 Touch Phone</span>' : '<span class="status-pill pill-cyan" style="font-size:10px; padding:2px 8px;">💻 Desktop PC</span>';
+            const currBadge = s.is_current ? '<span class="status-pill pill-green" style="font-size:10px; padding:2px 8px;">This Device</span>' : '';
+            sHtml += `
+              <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); padding:10px 12px; border-radius:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                  <div style="font-weight:700; font-size:13px; color:#FFFFFF; display:flex; align-items:center; gap:6px;">
+                    <span>${icon}</span>
+                    <span>${s.device_model || "Hardware Device"}</span>
+                    ${formBadge}
+                    ${currBadge}
+                  </div>
+                  <span style="font-size:11px; color:#38BDF8; font-weight:700;">${s.username} (${s.role})</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim); display:flex; flex-wrap:wrap; gap:8px; line-height:1.4;">
+                  <span><strong>OS:</strong> ${s.os || "Unknown"}</span>
+                  <span>&bull;</span>
+                  <span><strong>IP:</strong> ${s.ip || "127.0.0.1"}</span>
+                  <span>&bull;</span>
+                  <span><strong>Location:</strong> ${s.location || "Pune, Maharashtra, India"}</span>
+                  <span>&bull;</span>
+                  <span><strong>Carrier:</strong> ${s.carrier || "Network"}</span>
+                  ${s.screen_res ? `<span>&bull;</span><span><strong>Display:</strong> ${s.screen_res}</span>` : ""}
+                  <span>&bull;</span>
+                  <span><strong>Active:</strong> ${s.login_time_str || "Online"}</span>
+                </div>
+              </div>
+            `;
+          }
+          sessContainer.innerHTML = sHtml || '<div style="font-size:12px; color:var(--text-dim); padding:8px;">No active sessions recorded</div>';
+        }
       } catch (e) {
         console.error("Error loading users:", e);
       }
@@ -4753,25 +5253,28 @@ def render_fleet_html(current_user="admin", token=""):
       `;
     }
 
-    function selectFirmwareMode(m) {
-      for (let i = 1; i <= 4; i++) {
-        const btn = document.getElementById("btn-mode-" + i);
-        if (btn) btn.classList.toggle("active", i === m);
-      }
-      selectedFirmwareFile = `firmware_mode${m}.bin`;
-      document.getElementById("dropzone-label").innerText = `Selected: firmware_mode${m}.bin (Pre-Compiled Mode ${m})`;
+    function selectBaseFirmware() {
+      selectedFirmwareFile = "Base_firmware.bin";
+      const card = document.getElementById("card-base-firmware");
+      if (card) card.classList.add("active");
+      const dropLabel = document.getElementById("dropzone-label");
+      if (dropLabel) dropLabel.innerText = "Selected: Base_firmware.bin (Golden Reference Build)";
       
       updateBinaryInspectionCard({
-        filename: selectedFirmwareFile,
-        size_kb: 1059,
-        ota_partition_fit: "Fits standard 1.25MB / 1.87MB OTA partition",
-        target_chip: "ESP32 (Tensilica Xtensa Dual-Core)",
+        filename: "Base_firmware.bin",
+        size_kb: 1059.5,
+        ota_partition_fit: "Fits standard 1.25MB / 1.87MB OTA partition (82.8% used)",
+        target_chip: "ESP32 (Tensilica Xtensa Dual-Core 240MHz)",
         magic_byte: "0xE9 (ESP32 Standard)",
         app_desc_magic: "0xABCD5432 (ESP-IDF Validated)",
         broker_endpoint: "broker.hivemq.com:1883",
         compliance_score: 9,
-        markers_summary: "9/9 Adherent (MAC, eFuse, Local IP, Delay, Service, SHA-256)"
+        markers_summary: "9/9 Compliant (MAC, eFuse, Local IP, Delay, Service, Offline, SHA-256)"
       });
+    }
+
+    function selectFirmwareMode(m) {
+      selectBaseFirmware();
     }
 
     function triggerDeployment(route) {
@@ -5189,6 +5692,23 @@ def render_fleet_html(current_user="admin", token=""):
       if (document.getElementById("spec-public-ip")) document.getElementById("spec-public-ip").innerText = `${node.public_ip || "WAN IP"} (${node.carrier_isp || "Carrier"})`;
       if (document.getElementById("spec-hash")) document.getElementById("spec-hash").innerText = (node.sec_hash || "").substring(0, 24) + "...";
 
+      // Microcontroller Hardware Profile & Wireless Bands
+      if (document.getElementById("spec-mcu-family-pill")) {
+        document.getElementById("spec-mcu-family-pill").innerText = node.mcu_family || "ESP32 (Tensilica)";
+      }
+      if (document.getElementById("spec-mcu-arch")) {
+        document.getElementById("spec-mcu-arch").innerText = node.mcu_arch || "Tensilica Xtensa Dual-Core 240MHz";
+      }
+      if (document.getElementById("spec-mcu-flash")) {
+        document.getElementById("spec-mcu-flash").innerText = (node.flash_mb || 4) + " MB SPI Flash";
+      }
+      if (document.getElementById("spec-mcu-ram")) {
+        document.getElementById("spec-mcu-ram").innerText = (node.ram_total_kb || 320) + " KB Total SRAM";
+      }
+      if (document.getElementById("spec-mcu-antenna")) {
+        document.getElementById("spec-mcu-antenna").innerText = node.wireless_bands || "2.4 GHz 802.11 b/g/n + BLE 4.2";
+      }
+
       // Controls (Side-by-side Dual Toggles)
       if (document.getElementById("detail-service-toggle")) document.getElementById("detail-service-toggle").checked = !!node.service;
       if (document.getElementById("detail-offline-toggle")) document.getElementById("detail-offline-toggle").checked = !!node.offline;
@@ -5314,6 +5834,46 @@ def render_fleet_html(current_user="admin", token=""):
         })
         .catch(e => console.error("Telemetry error:", e));
     }
+
+    // Two-Form Display Engine (Touch Screen Phone vs Non-Touch PC/Mac Desktop)
+    function getDisplayFormMode() {
+      const stored = localStorage.getItem("fleet_form_mode");
+      if (stored === "phone" || stored === "desktop") return stored;
+      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || window.matchMedia('(pointer: coarse)').matches;
+      const isNarrow = window.innerWidth <= 860;
+      return (isNarrow || isTouch) ? "phone" : "desktop";
+    }
+
+    function applyDisplayFormMode(mode) {
+      const body = document.body;
+      const btn = document.getElementById("form-mode-toggle-btn");
+      if (mode === "phone") {
+        body.classList.remove("mode-desktop-pc");
+        body.classList.add("mode-phone-touch");
+        if (btn) btn.innerHTML = '📱 Touch Phone View';
+      } else {
+        body.classList.remove("mode-phone-touch");
+        body.classList.add("mode-desktop-pc");
+        if (btn) btn.innerHTML = '💻 Desktop PC View';
+      }
+    }
+
+    function toggleDisplayFormOverride() {
+      const current = document.body.classList.contains("mode-phone-touch") ? "phone" : "desktop";
+      const next = current === "phone" ? "desktop" : "phone";
+      localStorage.setItem("fleet_form_mode", next);
+      applyDisplayFormMode(next);
+    }
+
+    window.addEventListener("resize", () => {
+      if (!localStorage.getItem("fleet_form_mode")) {
+        applyDisplayFormMode(getDisplayFormMode());
+      }
+    });
+
+    // Initialize display form mode & golden base firmware
+    applyDisplayFormMode(getDisplayFormMode());
+    selectBaseFirmware();
 
     // Polling interval
     fetchTelemetry();
