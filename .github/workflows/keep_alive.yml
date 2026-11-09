@@ -1,0 +1,21 @@
+name: Keep Render 24-7 Alive
+on:
+  schedule:
+    # Trigger every 10 minutes to prevent Render free instance spin-down
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Anashwar Fleet Server
+        run: |
+          echo "Pinging Anashwar Fleet Portal to keep it warm 24/7..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://anashwar-fleet.onrender.com/api/binaries)
+          echo "Response HTTP Status: $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "Warning: Received HTTP $STATUS"
+          else
+            echo "Success: Server is active and warm."
+          fi
