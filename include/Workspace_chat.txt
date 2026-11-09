@@ -1,0 +1,49 @@
+Please integrate the Anashwar Fleet Management System into this ESP32 project so it connects and aligns 100% with our central fleet portal.
+
+Here are the exact integration specifications:
+
+1. DEPENDENCIES:
+Ensure 'knolleary/PubSubClient' is added to platformio.ini (or included in the project) alongside WiFi.h and HTTPUpdate.h.
+
+2. FLEET IDENTIFIERS (Configure for this project):
+- Client Name: "<Your Company or Client Name, e.g. Anashwar Technologies>"
+- Project Name: "<Your Project Name, e.g. Smart Solar Inverter V2>"
+- Device Name: "<Unique Node Name, e.g. Node: Solar-01>"
+
+3. MQTT BROKER & TOPICS:
+- Broker Host: "broker.hivemq.com"
+- Port: 1883
+- Status Topic (Device -> Cloud): "anashwar/poc/status"
+- Command Topic (Cloud -> Device): "anashwar/poc/commands"
+- Security Salt: "Anashwar-Enterprise-Hardware-Key-2026"
+
+4. HARDWARE TELEMETRY & SECURITY PAYLOAD:
+Every 3 seconds (and immediately upon MQTT connect), publish a JSON heartbeat string to "anashwar/poc/status" formatted as:
+{
+  "name": "<Device Name>",
+  "id": "Anashwar-<ChipID>",
+  "mac": "<STA_MAC_Address>",
+  "chip_id": "<eFuse_Chip_ID>",
+  "client": "<Client Name>",
+  "project": "<Project Name>",
+  "sec_hash": "<SHA256(MAC + ChipID + Salt)>",
+  "mode": 1,
+  "service": true,
+  "state": "online",
+  "ip": "<WiFi_Local_IP>",
+  "rssi": <WiFi_RSSI>,
+  "heap": <ESP_Free_Heap>,
+  "uptime": <millis() / 1000>,
+  "delay": 0.0,
+  "btn": 0,
+  "led": 1
+}
+
+5. REMOTE COMMAND & OTA HANDLER:
+Subscribe to "anashwar/poc/commands" and parse incoming directives addressed to this device:
+- "OTA:[<Device Name>]:<firmware_url>": Trigger httpUpdate.update(wifiClient, url) to flash new firmware over the air.
+- "CMD:[<Device Name>]:REBOOT": Restart ESP32 (ESP.restart()).
+- "CMD:[<Device Name>]:SERVICE:<ON|OFF>": Toggle operational service active/standby.
+- "CMD:[<Device Name>]:DELAY:<seconds>": Update output delay.
+
+Please inspect our existing setup() and loop() functions and non-blockingly add this telemetry and command logic without breaking our existing sensor or hardware code.

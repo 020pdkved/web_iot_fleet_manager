@@ -22,6 +22,9 @@ import re
 import hashlib
 import subprocess
 import atexit
+import secrets
+import urllib.request
+import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
@@ -36,8 +39,138 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BINARIES_DIR = os.path.join(PROJECT_ROOT, "binaries")
 STATIC_DIR = os.path.join(PROJECT_ROOT, "static")
 REGISTRY_FILE = os.path.join(PROJECT_ROOT, "fleet_registry.json")
+USERS_FILE = os.path.join(PROJECT_ROOT, "users.json")
 os.makedirs(BINARIES_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
+
+# User Database & Session Store
+users_db = {}
+active_sessions = {}  # token -> {"username": str, "login_time": float}
+
+def load_users():
+    global users_db
+    if os.path.isfile(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r") as f:
+                users_db = json.load(f)
+                return
+        except Exception as e:
+            print(f"[AUTH] Error reading {USERS_FILE}: {e}")
+    users_db = {
+        "admin": {
+            "username": "admin",
+            "password_hash": hashlib.sha256("At@12345".encode("utf-8")).hexdigest(),
+            "role": "Super Admin",
+            "created_at": time.strftime("%Y-%m-%d")
+        }
+    }
+    save_users()
+
+def save_users():
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(users_db, f, indent=2)
+    except Exception as e:
+        print(f"[AUTH] Error saving {USERS_FILE}: {e}")
+
+load_users()
+
+def verify_credentials(username, password):
+    if username in users_db:
+        stored_hash = users_db[username].get("password_hash", "")
+        pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        if stored_hash == pwd_hash or stored_hash == password:
+            return True
+    return False
+
+def get_authenticated_user(headers, parsed_url=None, body_data=None):
+    token = None
+    # 1. URL Query Parameter: ?token=... or ?auth=...
+    if parsed_url and parsed_url.query:
+        qp = parse_qs(parsed_url.query)
+        if "token" in qp:
+            token = qp["token"][0].strip()
+        elif "auth" in qp:
+            token = qp["auth"][0].strip()
+
+    # 2. Authorization Header: Bearer <token>
+    if not token:
+        auth_header = headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+
+    # 3. Cookie Header: session_token=<token>
+    if not token:
+        cookie_header = headers.get("Cookie", "")
+        if "session_token=" in cookie_header:
+            for part in cookie_header.split(";"):
+                part = part.strip()
+                if part.startswith("session_token="):
+                    token = part.split("=")[1].strip()
+                    break
+
+    # 4. Request Body: token=...
+    if not token and body_data:
+        if isinstance(body_data, dict) and "token" in body_data:
+            val = body_data["token"]
+            token = val[0].strip() if isinstance(val, list) else str(val).strip()
+
+    if token and token in active_sessions:
+        return active_sessions[token]["username"], token
+    return None, None
+
+def scan_usb_devices():
+    ports = glob.glob("/dev/cu.usbserial*") + glob.glob("/dev/cu.SLAB_USBtoUART*") + glob.glob("/dev/cu.wchusbserial*") + glob.glob("/dev/cu.usbmodem*")
+    ports = sorted(list(set(ports)))
+    devices = []
+    for p in ports:
+        matched_node = None
+        for n_name, n in nodes_telemetry.items():
+            if n.get("port") == p:
+                matched_node = n
+                break
+        if not matched_node:
+            for n_name, r in fleet_registry.get("registered_nodes", {}).items():
+                if r.get("port") == p:
+                    matched_node = r
+                    break
+        devices.append({
+            "port": p,
+            "assigned": matched_node is not None,
+            "node_name": matched_node.get("name", "") if matched_node else "",
+            "mac": matched_node.get("mac", "") if matched_node else "",
+            "chip_id": matched_node.get("chip_id", "") if matched_node else "",
+            "client": matched_node.get("client", "") if matched_node else "",
+            "project": matched_node.get("project", "") if matched_node else ""
+        })
+    return devices
+
+def check_node_web_ui(ip, port=80, timeout=0.8):
+    if not ip or ip.startswith("0.0.0.0") or ip == "127.0.0.1":
+        return False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def background_web_ui_detector():
+    while True:
+        try:
+            for name, node in list(nodes_telemetry.items()):
+                if node.get("online") and node.get("ip"):
+                    node["has_web_ui"] = check_node_web_ui(node["ip"], 80)
+                else:
+                    node["has_web_ui"] = False
+        except Exception:
+            pass
+        time.sleep(10)
+
+t_webui = threading.Thread(target=background_web_ui_detector, daemon=True)
+t_webui.start()
 
 ESPTOOL_PATH = "/Users/vedangphadke/.platformio/packages/tool-esptoolpy/esptool.py"
 PYTHON_ENV_PATH = "/Users/vedangphadke/.platformio/penv/bin/python3"
@@ -207,6 +340,61 @@ node_updates = {
     }
 }
 
+def sync_telemetry_with_registry():
+    global nodes_telemetry, node_updates, fleet_registry
+    for n_name, r_node in fleet_registry.get("registered_nodes", {}).items():
+        c_id = r_node.get("client_id", "client_1")
+        p_id = r_node.get("project_id", "proj_1")
+        c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "Alpha Enterprise Corp")
+        p_name = fleet_registry.get("projects", {}).get(p_id, {}).get("name", "Enterprise OTA Fleet")
+        if n_name not in nodes_telemetry:
+            nodes_telemetry[n_name] = {
+                "name": n_name,
+                "mac": r_node.get("mac", ""),
+                "chip_id": r_node.get("chip_id", ""),
+                "port": r_node.get("port", "WiFi Wireless"),
+                "client": c_name,
+                "project": p_name,
+                "sec_hash": r_node.get("expected_hash", ""),
+                "trust_score": 100,
+                "trust_level": "Verified (High Trust)",
+                "ip": "0.0.0.0",
+                "mode": 1,
+                "service": True,
+                "state": "online",
+                "delay": 0.0,
+                "btn": 0,
+                "led": 0,
+                "rssi": -50,
+                "heap": 240000,
+                "uptime": 0,
+                "last_seen": 0,
+                "online": False
+            }
+        else:
+            nodes_telemetry[n_name]["client"] = c_name
+            nodes_telemetry[n_name]["project"] = p_name
+
+        if n_name not in node_updates:
+            node_updates[n_name] = {
+                "active": False,
+                "route": "cloud",
+                "filename": "firmware_mode1.bin",
+                "total_bytes": 0,
+                "sent_bytes": 0,
+                "percent": 0,
+                "speed_kbps": 0.0,
+                "stage": "idle",
+                "stage_text": "Ready",
+                "target_mode": 1,
+                "start_time": 0,
+                "reboot_start_time": 0,
+                "verified_time": 0,
+                "error_message": ""
+            }
+
+sync_telemetry_with_registry()
+
 def log_event(msg):
     ts = time.strftime("[%H:%M:%S]")
     entry = f"{ts} {msg}"
@@ -313,16 +501,24 @@ def stop_mdns_broadcast():
 atexit.register(stop_mdns_broadcast)
 
 def get_active_tunnel():
+    # 1. Cloud environment variable (Render, Railway, or user specified)
+    env_url = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    # 2. Local active tunnel file if created by tunnel daemon
     tunnel_file = os.path.join(PROJECT_ROOT, "active_tunnel.txt")
     if os.path.isfile(tunnel_file):
         try:
             with open(tunnel_file, "r") as f:
                 url = f.read().strip()
                 if url:
-                    return url
+                    return url.rstrip("/")
         except Exception:
             pass
-    return "https://coordinate-mechanics-difficulties-functioning.trycloudflare.com"
+
+    # 3. Permanent canonical domain
+    return "https://manage.anashwartech.com"
 
 def inspect_esp32_binary(file_path):
     info = {
@@ -468,21 +664,114 @@ def start_mqtt_client():
                                 elif ip == "10.94.142.111": target_key = "Node: B"
 
                             if not target_key:
-                                # New auto-discovered node!
-                                auto_name = raw_name or f"Discovered-{raw_mac[-5:] if len(raw_mac)>5 else 'Node'}"
-                                auto_discovered_nodes[auto_name] = {
-                                    "name": auto_name,
+                                # ZERO-TOUCH FLEET AUTO-ONBOARDING:
+                                # Automatically register Client, Project, and Node dynamically!
+                                target_name = (raw_name.strip() if raw_name else "") or f"Node-{raw_mac[-5:].replace(':','').upper() if len(raw_mac)>=5 else str(int(time.time()))[-4:]}"
+                                client_name = (tdata.get("client") or "").strip() or "Alpha Enterprise Corp"
+                                project_name = (tdata.get("project") or "").strip() or "Connected Edge Fleet"
+
+                                # 1. Match or Create Client
+                                client_id = None
+                                for cid, c in fleet_registry["clients"].items():
+                                    if c.get("name", "").strip().lower() == client_name.lower():
+                                        client_id = cid
+                                        break
+                                if not client_id:
+                                    clean_code = "".join([w[0] for w in client_name.split() if w.isalnum()])[:4].upper() or "ENT"
+                                    client_id = f"client_{int(time.time())}_{abs(hash(client_name)) % 1000}"
+                                    fleet_registry["clients"][client_id] = {
+                                        "id": client_id,
+                                        "name": client_name,
+                                        "code": clean_code,
+                                        "description": f"Auto-discovered Enterprise Client: {client_name}",
+                                        "tier": "Tier-1 Enterprise SLA",
+                                        "contact": "ops@anashwartech.com",
+                                        "created_at": time.strftime("%Y-%m-%d"),
+                                        "projects": []
+                                    }
+
+                                # 2. Match or Create Project
+                                project_id = None
+                                for pid, p in fleet_registry["projects"].items():
+                                    if p.get("client_id") == client_id and p.get("name", "").strip().lower() == project_name.lower():
+                                        project_id = pid
+                                        break
+                                if not project_id:
+                                    proj_code = "".join([w[0] for w in project_name.split() if w.isalnum()])[:4].upper() or "PRJ"
+                                    project_id = f"proj_{int(time.time())}_{abs(hash(project_name)) % 1000}"
+                                    fleet_registry["projects"][project_id] = {
+                                        "id": project_id,
+                                        "client_id": client_id,
+                                        "name": project_name,
+                                        "code": proj_code,
+                                        "description": f"Autonomous Edge Project: {project_name}",
+                                        "created_at": time.strftime("%Y-%m-%d"),
+                                        "nodes": []
+                                    }
+                                    if project_id not in fleet_registry["clients"][client_id]["projects"]:
+                                        fleet_registry["clients"][client_id]["projects"].append(project_id)
+
+                                # 3. Register Node under Project & Registry
+                                if target_name not in fleet_registry["projects"][project_id]["nodes"]:
+                                    fleet_registry["projects"][project_id]["nodes"].append(target_name)
+
+                                fleet_registry["registered_nodes"][target_name] = {
+                                    "name": target_name,
                                     "mac": raw_mac,
                                     "chip_id": raw_chip,
-                                    "ip": tdata.get("ip", ""),
-                                    "sec_hash": tdata.get("sec_hash", ""),
-                                    "rssi": tdata.get("rssi", -60),
-                                    "mode": tdata.get("mode", 1),
-                                    "last_seen": time.time()
+                                    "client_id": client_id,
+                                    "project_id": project_id,
+                                    "port": tdata.get("port", "WiFi Wireless"),
+                                    "expected_hash": tdata.get("sec_hash", "")
                                 }
-                                continue
+                                save_fleet_registry()
+
+                                # 4. Initialize in-memory telemetry & update tracking
+                                nodes_telemetry[target_name] = {
+                                    "name": target_name,
+                                    "mac": raw_mac,
+                                    "chip_id": raw_chip,
+                                    "port": tdata.get("port", "WiFi Wireless"),
+                                    "client": client_name,
+                                    "project": project_name,
+                                    "sec_hash": tdata.get("sec_hash", ""),
+                                    "trust_score": 100,
+                                    "trust_level": "Verified (High Trust)",
+                                    "ip": tdata.get("ip", "0.0.0.0"),
+                                    "mode": int(tdata.get("mode", 1)),
+                                    "service": bool(tdata.get("service", True)),
+                                    "state": tdata.get("state", "online"),
+                                    "delay": float(tdata.get("delay", 0.0)),
+                                    "btn": int(tdata.get("btn", 0)),
+                                    "led": int(tdata.get("led", 0)),
+                                    "rssi": int(tdata.get("rssi", -60)),
+                                    "heap": int(tdata.get("heap", 240000)),
+                                    "uptime": int(tdata.get("uptime", 0)),
+                                    "last_seen": time.time(),
+                                    "online": True
+                                }
+                                node_updates[target_name] = {
+                                    "active": False,
+                                    "route": "cloud",
+                                    "filename": "firmware_mode1.bin",
+                                    "total_bytes": 0,
+                                    "sent_bytes": 0,
+                                    "percent": 0,
+                                    "speed_kbps": 0.0,
+                                    "stage": "idle",
+                                    "stage_text": "Ready",
+                                    "target_mode": 1,
+                                    "start_time": 0,
+                                    "reboot_start_time": 0,
+                                    "verified_time": 0,
+                                    "error_message": ""
+                                }
+                                target_key = target_name
+                                log_event(f"AUTO-DISCOVERY: Node '{target_name}' onboarded into Client '{client_name}' & Project '{project_name}'")
 
                             node = nodes_telemetry[target_key]
+                            if tdata.get("client"): node["client"] = tdata["client"]
+                            if tdata.get("project"): node["project"] = tdata["project"]
                             node["mode"] = tdata.get("mode", node["mode"])
                             node["service"] = bool(tdata.get("service", True))
                             node["state"] = tdata.get("state", "online")
@@ -651,12 +940,19 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/":
+        if path in ("/", "/login"):
+            user, token = get_authenticated_user(self.headers, parsed)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            if token:
+                self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=604800")
             self.end_headers()
-            html = render_fleet_html()
+            if not user:
+                html = render_login_html()
+            else:
+                html = render_fleet_html(user, token)
             self.wfile.write(html.encode("utf-8"))
+            return
 
         elif path.startswith("/static/"):
             filename = os.path.basename(path)
@@ -680,6 +976,14 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Static file not found")
 
         elif path == "/api/telemetry":
+            user, token = get_authenticated_user(self.headers, parsed)
+            if not user:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "Unauthorized", "authenticated": false}')
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -705,7 +1009,10 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 "lan_ip": get_lan_ip(),
                 "mdns_url": "http://control.local",
                 "port": PORT,
-                "logs": activity_logs[-40:]
+                "logs": activity_logs[-40:],
+                "current_user": user,
+                "user_role": users_db.get(user, {}).get("role", "Administrator"),
+                "usb_devices": scan_usb_devices()
             }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
 
@@ -719,6 +1026,66 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 if info["valid"]:
                     bins.append(info)
             self.wfile.write(json.dumps({"binaries": bins}).encode("utf-8"))
+
+        elif path == "/api/users":
+            user, token = get_authenticated_user(self.headers, parsed)
+            if not user:
+                self.send_error(401, "Unauthorized")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            u_list = [{"username": u, "role": d.get("role", "Administrator"), "created_at": d.get("created_at", "")} for u, d in users_db.items()]
+            self.wfile.write(json.dumps({"users": u_list, "current_user": user}).encode("utf-8"))
+
+        elif path == "/api/usb/scan":
+            user, token = get_authenticated_user(self.headers, parsed)
+            if not user:
+                self.send_error(401, "Unauthorized")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"devices": scan_usb_devices()}).encode("utf-8"))
+
+        elif path.startswith("/proxy/node/"):
+            user, token = get_authenticated_user(self.headers, parsed)
+            if not user:
+                self.send_error(401, "Unauthorized")
+                return
+
+            rest = path[len("/proxy/node/"):]
+            parts = rest.split("/", 1)
+            target_node_raw = urllib.parse.unquote(parts[0])
+            subpath = parts[1] if len(parts) > 1 else ""
+            if parsed.query:
+                subpath += "?" + parsed.query
+
+            target_node = resolve_target_node(target_node_raw)
+            if not target_node or target_node not in nodes_telemetry:
+                self.send_error(404, "Node not found")
+                return
+
+            node_ip = nodes_telemetry[target_node].get("ip")
+            if not node_ip:
+                self.send_error(502, "Node has no valid IP address")
+                return
+
+            target_url = f"http://{node_ip}/{subpath}"
+            try:
+                req = urllib.request.Request(target_url, headers={"User-Agent": "Anashwar-Fleet-Proxy"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.send_response(resp.status)
+                    for k, v in resp.headers.items():
+                        if k.lower() in ("content-type", "content-length", "cache-control"):
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(resp.read())
+            except Exception as e:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"<div style='font-family:sans-serif;padding:30px;background:#0f172a;color:#f87171;border-radius:12px;'><h3>⚠️ ESP32 In-Situ Web UI Unavailable</h3><p>Could not connect to {target_node} at http://{node_ip}:80/</p><p style='color:#94a3b8;font-size:12px;'>Error: {e}</p></div>".encode("utf-8"))
 
         elif path.startswith("/download/"):
             filename = os.path.basename(path)
@@ -770,6 +1137,53 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
+        if path == "/api/login":
+            data = parse_qs(body.decode("utf-8"))
+            u = data.get("username", [""])[0].strip()
+            p = data.get("password", [""])[0].strip()
+            if verify_credentials(u, p):
+                token = secrets.token_hex(24)
+                active_sessions[token] = {"username": u, "login_time": time.time()}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=604800")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "token": token, "username": u, "role": users_db[u].get("role", "Administrator")}).encode("utf-8"))
+                log_event(f"AUTH: User '{u}' logged in successfully")
+            else:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Invalid username or password"}')
+                log_event(f"AUTH WARNING: Failed login attempt for user '{u}'")
+            return
+
+        elif path == "/api/logout":
+            u, token = get_authenticated_user(self.headers, parsed)
+            if token and token in active_sessions:
+                del active_sessions[token]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "session_token=; Path=/; SameSite=None; Secure; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+            self.end_headers()
+            self.wfile.write(b'{"success": true}')
+            return
+
+        # Verification of session token for all operations below
+        data = {}
+        try:
+            data = parse_qs(body.decode("utf-8"))
+        except Exception:
+            pass
+
+        user, token = get_authenticated_user(self.headers, parsed, data)
+        if not user:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Unauthorized", "authenticated": false}')
+            return
+
         # 1. Hardware Node Command Dispatcher
         if path == "/api/command":
             data = parse_qs(body.decode("utf-8"))
@@ -801,6 +1215,13 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 nodes_telemetry[target_node]["service"] = (state_str == "ON")
                 if state_str == "OFF":
                     nodes_telemetry[target_node]["led"] = 0
+
+            elif action == "OFFLINE":
+                state_str = "ON" if val.upper() in ("ON", "TRUE", "ENABLE") else "OFF"
+                cmd = f"CMD:[{target_node}]:OFFLINE:{state_str}"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                nodes_telemetry[target_node]["offline_mode"] = (state_str == "ON")
+                log_event(f"OFFLINE: Set [{target_node}] autonomous offline mode to {state_str}")
 
             elif action == "REBOOT":
                 cmd = f"CMD:[{target_node}]:REBOOT"
@@ -895,7 +1316,27 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(400, "Client name is required")
 
-        # 4. Create Project Endpoint
+        # 4. Delete Client Endpoint
+        elif path == "/api/client/delete":
+            data = parse_qs(body.decode("utf-8"))
+            c_id = data.get("client_id", [""])[0].strip()
+            if c_id in fleet_registry["clients"]:
+                c_name = fleet_registry["clients"][c_id]["name"]
+                proj_ids = list(fleet_registry["clients"][c_id].get("projects", []))
+                for p_id in proj_ids:
+                    if p_id in fleet_registry["projects"]:
+                        del fleet_registry["projects"][p_id]
+                del fleet_registry["clients"][c_id]
+                save_fleet_registry()
+                log_event(f"REGISTRY: Client '{c_name}' ({c_id}) deleted by '{user}'")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": true}')
+            else:
+                self.send_error(404, "Client not found")
+
+        # 5. Create Project Endpoint
         elif path == "/api/project/create":
             data = parse_qs(body.decode("utf-8"))
             client_id = data.get("client_id", [""])[0].strip()
@@ -924,7 +1365,137 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(400, "Invalid client ID or project name")
 
-        # 5. Assign Node to Project Endpoint
+        # 6. Delete Project Endpoint
+        elif path == "/api/project/delete":
+            data = parse_qs(body.decode("utf-8"))
+            p_id = data.get("project_id", [""])[0].strip()
+            if p_id in fleet_registry["projects"]:
+                p_name = fleet_registry["projects"][p_id]["name"]
+                c_id = fleet_registry["projects"][p_id].get("client_id")
+                if c_id and c_id in fleet_registry["clients"] and p_id in fleet_registry["clients"][c_id]["projects"]:
+                    fleet_registry["clients"][c_id]["projects"].remove(p_id)
+                del fleet_registry["projects"][p_id]
+                save_fleet_registry()
+                log_event(f"REGISTRY: Project '{p_name}' ({p_id}) deleted by '{user}'")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": true}')
+            else:
+                self.send_error(404, "Project not found")
+
+        # 7. Create/Register Node Endpoint
+        elif path == "/api/node/create":
+            data = parse_qs(body.decode("utf-8"))
+            n_name = data.get("name", [""])[0].strip()
+            mac = data.get("mac", [""])[0].strip()
+            chip_id = data.get("chip_id", [""])[0].strip()
+            port = data.get("port", ["WiFi Wireless"])[0].strip()
+            project_id = data.get("project_id", [""])[0].strip()
+
+            if not n_name or not project_id or project_id not in fleet_registry["projects"]:
+                self.send_error(400, "Valid node name and project required")
+                return
+
+            c_id = fleet_registry["projects"][project_id]["client_id"]
+            fleet_registry["registered_nodes"][n_name] = {
+                "name": n_name,
+                "mac": mac,
+                "chip_id": chip_id,
+                "client_id": c_id,
+                "project_id": project_id,
+                "port": port,
+                "expected_hash": compute_security_hash(mac, chip_id) if (mac and chip_id) else ""
+            }
+            if n_name not in fleet_registry["projects"][project_id]["nodes"]:
+                fleet_registry["projects"][project_id]["nodes"].append(n_name)
+            save_fleet_registry()
+            sync_telemetry_with_registry()
+            log_event(f"REGISTRY: Node [{n_name}] manually registered under Project '{project_id}'")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"success": true}')
+
+        # 8. Delete Node Endpoint
+        elif path == "/api/node/delete":
+            data = parse_qs(body.decode("utf-8"))
+            n_name = data.get("node_name", [""])[0].strip()
+            target_node = resolve_target_node(n_name) or n_name
+            if target_node in fleet_registry["registered_nodes"]:
+                p_id = fleet_registry["registered_nodes"][target_node].get("project_id")
+                if p_id and p_id in fleet_registry["projects"] and target_node in fleet_registry["projects"][p_id]["nodes"]:
+                    fleet_registry["projects"][p_id]["nodes"].remove(target_node)
+                del fleet_registry["registered_nodes"][target_node]
+                if target_node in nodes_telemetry:
+                    del nodes_telemetry[target_node]
+                if target_node in node_updates:
+                    del node_updates[target_node]
+                save_fleet_registry()
+                log_event(f"REGISTRY: Node [{target_node}] removed from registry by '{user}'")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": true}')
+            else:
+                self.send_error(404, "Node not found")
+
+        # 9. User Management: Create User
+        elif path == "/api/users/create":
+            data = parse_qs(body.decode("utf-8"))
+            new_u = data.get("username", [""])[0].strip()
+            new_p = data.get("password", [""])[0].strip()
+            role = data.get("role", ["Fleet Operator"])[0].strip()
+            if not new_u or not new_p:
+                self.send_error(400, "Username and password required")
+                return
+            if new_u in users_db:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Username already exists"}')
+                return
+            users_db[new_u] = {
+                "username": new_u,
+                "password_hash": hashlib.sha256(new_p.encode("utf-8")).hexdigest(),
+                "role": role,
+                "created_at": time.strftime("%Y-%m-%d")
+            }
+            save_users()
+            log_event(f"AUTH: User '{new_u}' ({role}) registered by '{user}'")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+
+        # 10. User Management: Delete User
+        elif path == "/api/users/delete":
+            data = parse_qs(body.decode("utf-8"))
+            del_u = data.get("username", [""])[0].strip()
+            if del_u == user:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Cannot delete your own active account"}')
+                return
+            if del_u == "admin":
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Cannot delete primary administrator"}')
+                return
+            if del_u in users_db:
+                del users_db[del_u]
+                save_users()
+                log_event(f"AUTH: User '{del_u}' deleted by '{user}'")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            else:
+                self.send_error(404, "User not found")
+
+        # 11. Assign Node to Project Endpoint
         elif path == "/api/node/assign":
             data = parse_qs(body.decode("utf-8"))
             node_name = data.get("node_name", [""])[0].strip()
@@ -932,7 +1503,6 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             if project_id in fleet_registry["projects"] and node_name in nodes_telemetry:
                 client_id = fleet_registry["projects"][project_id]["client_id"]
-                # Update fleet registry
                 if node_name not in fleet_registry["registered_nodes"]:
                     fleet_registry["registered_nodes"][node_name] = {
                         "name": node_name,
@@ -963,7 +1533,40 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(400, "Invalid node or project")
 
-        # 6. Binary Drag-and-Drop Upload Endpoint
+        # 12. Reverse Proxy for Node In-Situ Web UI (POST Support)
+        elif path.startswith("/proxy/node/"):
+            rest = path[len("/proxy/node/"):]
+            parts = rest.split("/", 1)
+            target_node_raw = urllib.parse.unquote(parts[0])
+            subpath = parts[1] if len(parts) > 1 else ""
+            if parsed.query:
+                subpath += "?" + parsed.query
+            target_node = resolve_target_node(target_node_raw)
+            if not target_node or target_node not in nodes_telemetry:
+                self.send_error(404, "Node not found")
+                return
+            node_ip = nodes_telemetry[target_node].get("ip")
+            if not node_ip:
+                self.send_error(502, "Node has no valid IP address")
+                return
+            target_url = f"http://{node_ip}/{subpath}"
+            try:
+                content_type = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
+                req = urllib.request.Request(target_url, data=body, method="POST", headers={"Content-Type": content_type, "User-Agent": "Anashwar-Fleet-Proxy"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.send_response(resp.status)
+                    for k, v in resp.headers.items():
+                        if k.lower() in ("content-type", "content-length", "cache-control"):
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(resp.read())
+            except Exception as e:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"<h3>Proxy Error</h3><p>{e}</p>".encode("utf-8"))
+
+        # 13. Binary Drag-and-Drop Upload Endpoint
         elif path == "/api/upload_bin":
             content_type = self.headers.get("Content-Type", "")
             if "multipart/form-data" in content_type:
@@ -998,8 +1601,296 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 # =============================================================================
 # HTML FRONTEND (DASHTAIL + APPLE FROSTED GLASS UI/UX)
 # =============================================================================
-def render_fleet_html():
+def render_login_html():
     return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anashwar Technologies - Operations Console Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #080C15;
+      color: #F8FAFC;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+      padding: 20px;
+    }
+    .ambient-glow-1 {
+      position: absolute;
+      top: -150px;
+      left: -150px;
+      width: 500px;
+      height: 500px;
+      background: radial-gradient(circle, rgba(225, 29, 72, 0.22) 0%, rgba(225, 29, 72, 0) 70%);
+      filter: blur(80px);
+      pointer-events: none;
+    }
+    .ambient-glow-2 {
+      position: absolute;
+      bottom: -150px;
+      right: -150px;
+      width: 550px;
+      height: 550px;
+      background: radial-gradient(circle, rgba(14, 165, 233, 0.20) 0%, rgba(14, 165, 233, 0) 70%);
+      filter: blur(90px);
+      pointer-events: none;
+    }
+    .login-card {
+      position: relative;
+      z-index: 10;
+      width: 100%;
+      max-width: 420px;
+      background: rgba(15, 23, 42, 0.65);
+      backdrop-filter: blur(28px);
+      -webkit-backdrop-filter: blur(28px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 24px;
+      padding: 40px 32px;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    }
+    .login-brand {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .login-logo {
+      height: 44px;
+      width: auto;
+      margin-bottom: 14px;
+      filter: drop-shadow(0 4px 12px rgba(225, 29, 72, 0.3));
+    }
+    .login-title {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #FFFFFF;
+    }
+    .login-subtitle {
+      font-size: 13px;
+      color: #94A3B8;
+      margin-top: 4px;
+    }
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(225, 29, 72, 0.12);
+      border: 1px solid rgba(225, 29, 72, 0.3);
+      color: #FB7185;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 100px;
+      margin-top: 10px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+      text-align: left;
+    }
+    .form-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #CBD5E1;
+      margin-bottom: 8px;
+      letter-spacing: 0.2px;
+    }
+    .input-wrapper {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .input-icon {
+      position: absolute;
+      left: 14px;
+      font-size: 16px;
+      color: #64748B;
+      pointer-events: none;
+    }
+    .form-input {
+      width: 100%;
+      background: rgba(30, 41, 59, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 12px 14px 12px 42px;
+      font-size: 14px;
+      color: #FFFFFF;
+      outline: none;
+      transition: all 0.2s ease;
+      font-family: inherit;
+    }
+    .form-input:focus {
+      border-color: #E11D48;
+      background: rgba(30, 41, 59, 0.9);
+      box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.25);
+    }
+    .btn-submit {
+      width: 100%;
+      background: linear-gradient(135deg, #E11D48 0%, #BE123C 100%);
+      color: #FFFFFF;
+      border: none;
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 10px 25px rgba(225, 29, 72, 0.35);
+      margin-top: 8px;
+    }
+    .btn-submit:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 14px 30px rgba(225, 29, 72, 0.45);
+      background: linear-gradient(135deg, #F43F5E 0%, #E11D48 100%);
+    }
+    .error-box {
+      display: none;
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #FCA5A5;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 12px;
+      margin-bottom: 18px;
+      text-align: center;
+      font-weight: 600;
+    }
+    .login-footer {
+      text-align: center;
+      margin-top: 24px;
+      font-size: 11px;
+      color: #64748B;
+      line-height: 1.5;
+    }
+    .login-hint {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px dashed rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 8px 12px;
+      margin-top: 14px;
+      font-size: 11px;
+      color: #94A3B8;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient-glow-1"></div>
+  <div class="ambient-glow-2"></div>
+
+  <div class="login-card">
+    <div class="login-brand">
+      <img src="/static/logo.png" alt="Anashwar Technologies" class="login-logo" onerror="this.style.display='none'">
+      <div class="login-title">Anashwar Technologies</div>
+      <div class="login-subtitle">Enterprise Edge Fleet Management Portal</div>
+      <div class="badge-pill">🔒 Encrypted Operations Console</div>
+    </div>
+
+    <div class="error-box" id="error-banner"></div>
+
+    <form onsubmit="handleLogin(event)">
+      <div class="form-group">
+        <label class="form-label">Username</label>
+        <div class="input-wrapper">
+          <span class="input-icon">👤</span>
+          <input type="text" id="login-username" class="form-input" placeholder="Enter username" required autofocus autocomplete="username">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <div class="input-wrapper">
+          <span class="input-icon">🔑</span>
+          <input type="password" id="login-password" class="form-input" placeholder="Enter password" required autocomplete="current-password">
+        </div>
+      </div>
+
+      <button type="submit" class="btn-submit" id="login-btn">Sign In to Fleet Console &rarr;</button>
+    </form>
+
+    <div class="login-hint">
+      🔑 <b>Test Access:</b> User <code>admin</code> &bull; Password <code>At@12345</code>
+    </div>
+
+    <div class="login-footer">
+      Anashwar Technologies Private Limited &bull; Enterprise Fleet Portal<br>
+      Authorized Personnel Only &bull; All sessions logged & authenticated
+    </div>
+  </div>
+
+  <script>
+    // Check if session token already exists in localStorage / sessionStorage
+    (function checkExistingSession() {
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get('logout') === 'true') {
+        localStorage.removeItem('anashwar_token');
+        sessionStorage.removeItem('anashwar_token');
+        return;
+      }
+      const savedToken = localStorage.getItem('anashwar_token') || sessionStorage.getItem('anashwar_token');
+      if (savedToken && !urlParams.get('token')) {
+        window.location.href = '/?token=' + encodeURIComponent(savedToken);
+      }
+    })();
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const errBox = document.getElementById('error-banner');
+      const btn = document.getElementById('login-btn');
+      errBox.style.display = 'none';
+
+      const u = document.getElementById('login-username').value.trim();
+      const p = document.getElementById('login-password').value;
+      if (!u || !p) return;
+
+      btn.disabled = true;
+      btn.innerText = 'Verifying Credentials...';
+
+      try {
+        const resp = await fetch('/api/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}`
+        });
+        const data = await resp.json();
+        if (data.success && data.token) {
+          btn.innerText = '✓ Authenticated! Loading Console...';
+          localStorage.setItem('anashwar_token', data.token);
+          sessionStorage.setItem('anashwar_token', data.token);
+          try {
+            document.cookie = `session_token=${data.token}; Path=/; SameSite=None; Secure; Max-Age=604800`;
+          } catch(e) {}
+          // Pass token in URL query parameter to guarantee access in cross-site frames and third-party cookie blocked environments
+          window.location.href = '/?token=' + encodeURIComponent(data.token);
+        } else {
+          errBox.innerText = data.error || 'Invalid credentials. Access denied.';
+          errBox.style.display = 'block';
+          btn.disabled = false;
+          btn.innerText = 'Sign In to Fleet Console →';
+        }
+      } catch (err) {
+        errBox.innerText = 'Network error contacting authorization server.';
+        errBox.style.display = 'block';
+        btn.disabled = false;
+        btn.innerText = 'Sign In to Fleet Console →';
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+def render_fleet_html(current_user="admin", token=""):
+    html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -1178,6 +2069,46 @@ def render_fleet_html():
       background: rgba(6, 182, 212, 0.15);
       color: #38BDF8;
       border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+    .delete-btn-tiny {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #F87171;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      line-height: 1;
+    }
+    .delete-btn-tiny:hover {
+      background: rgba(239, 68, 68, 0.35);
+      color: #FFFFFF;
+      transform: scale(1.05);
+    }
+    .user-pill-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 5px 12px;
+      border-radius: 100px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .user-pill-btn:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    .btn-cyan {
+      background: linear-gradient(135deg, #0EA5E9 0%, #0284C7 100%);
+      box-shadow: 0 4px 14px rgba(14, 165, 233, 0.35);
+      color: #FFFFFF;
+    }
+    .btn-cyan:hover {
+      background: linear-gradient(135deg, #38BDF8 0%, #0EA5E9 100%);
+      box-shadow: 0 6px 20px rgba(14, 165, 233, 0.45);
     }
     .pulsing-dot {
       width: 7px;
@@ -1996,6 +2927,14 @@ def render_fleet_html():
         <a id="public-tunnel-link" href="#" target="_blank" class="status-pill pill-crimson" style="text-decoration:none;">
           🌐 Public Web View
         </a>
+        <div style="display:flex; align-items:center; gap:8px; border-left:1px solid rgba(255,255,255,0.12); padding-left:12px; margin-left:4px;">
+          <div class="user-pill-btn" onclick="openUserModal()" title="Current Logged In User">
+            <span style="font-size:14px;">👤</span>
+            <span id="topbar-user-name" style="font-weight:700; font-size:12px;">__CURRENT_USER__</span>
+          </div>
+          <button class="btn-secondary" style="padding:5px 10px; font-size:11px;" onclick="openUserModal()" title="Manage Users">👥 Users</button>
+          <button class="btn-secondary" style="padding:5px 10px; font-size:11px; border-color:rgba(239,68,68,0.4); color:#F87171;" onclick="handleLogout()" title="Sign Out">🚪 Logout</button>
+        </div>
       </div>
     </header>
 
@@ -2097,6 +3036,7 @@ def render_fleet_html():
 
         <div class="section-header-row">
           <div class="section-heading">🖧 Project Hardware Nodes</div>
+          <button class="btn-main btn-crimson" onclick="openAddNodeModal()">+ Register Node to Project</button>
         </div>
         <div class="nodes-grid" id="project-nodes-container">
           <!-- Populated by JS -->
@@ -2109,14 +3049,16 @@ def render_fleet_html():
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <div>
               <button class="btn-secondary" style="margin-bottom: 12px;" onclick="backToProject()">&larr; Back to Project</button>
-              <div style="display: flex; align-items: center; gap: 12px;">
+              <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
                 <h2 id="detail-node-name" style="font-size: 26px; font-weight: 800; color: #FFFFFF;">Node: A</h2>
                 <span id="detail-node-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> ONLINE</span>
                 <span class="status-pill pill-cyan">✓ SHA-256 VERIFIED</span>
+                <button class="btn-main btn-cyan" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">🌐 On-Board Web UI</button>
+                <button class="btn-secondary" style="border-color: rgba(239,68,68,0.4); color: #F87171; font-size: 12px; padding: 6px 12px;" onclick="deleteNode(selectedNodeName)">🗑️ Delete Node</button>
               </div>
             </div>
-            <!-- Quick switcher between Node: A and Node: B -->
-            <div style="display: flex; gap: 8px;">
+            <!-- Quick switcher for all nodes -->
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;" id="node-switcher-container">
               <button class="btn-secondary" onclick="openNodeDetail('Node: A')">Node: A</button>
               <button class="btn-secondary" onclick="openNodeDetail('Node: B')">Node: B</button>
             </div>
@@ -2134,6 +3076,18 @@ def render_fleet_html():
               </div>
               <label class="apple-switch">
                 <input type="checkbox" id="detail-service-toggle" onchange="toggleMasterService()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <!-- Autonomous Offline Mode Box -->
+            <div class="service-switch-box" style="margin-top: 14px;">
+              <div class="service-info">
+                <h4>Autonomous Offline Mode</h4>
+                <p>When enabled, hardware operates 100% locally without blocking on internet drops. All hardware loops and in-situ web servers stay live.</p>
+              </div>
+              <label class="apple-switch">
+                <input type="checkbox" id="detail-offline-toggle" onchange="toggleOfflineMode()">
                 <span class="slider"></span>
               </label>
             </div>
@@ -2181,11 +3135,21 @@ def render_fleet_html():
 
             <!-- In-Situ Web Server Gateway -->
             <div class="glass-card">
-              <div class="panel-title">In-Situ Self-Hosted Web Server (Port 80)</div>
-              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">The ESP32 runs an onboard web server serving its own branded in-situ configuration console:</p>
-              <a id="detail-insitu-link" href="#" target="_blank" class="btn-main btn-crimson" style="text-decoration:none; display:inline-flex;">
-                🔗 Launch In-Situ Server (<span id="detail-insitu-ip">10.94.142.79</span>) &rarr;
-              </a>
+            <!-- In-Situ Embedded Server Card -->
+            <div class="glass-card" style="margin-top: 24px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div class="panel-title" style="margin: 0;">On-Board Web Server (In-Situ)</div>
+                <span id="insitu-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> Port 80 Live</span>
+              </div>
+              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">The ESP32 runs an onboard web server serving its own branded in-situ configuration console. View it live through the secure portal reverse proxy:</p>
+              <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button class="btn-main btn-cyan" onclick="openInsituModal()" style="flex: 1; min-width: 170px; font-size: 13px;">
+                  🌐 Launch In-Portal Proxy Viewer
+                </button>
+                <a id="detail-insitu-link" href="#" target="_blank" class="btn-secondary" style="flex: 1; min-width: 150px; text-decoration: none; text-align: center; font-size: 13px;">
+                  ↗ Direct LAN (<span id="detail-insitu-ip">10.94.142.79</span>)
+                </a>
+              </div>
             </div>
           </div>
 
@@ -2316,6 +3280,101 @@ def render_fleet_html():
     </div>
   </div>
 
+  <!-- Modal: Add Node -->
+  <div class="modal-overlay" id="modal-add-node">
+    <div class="modal-card">
+      <h3>Register Node to Project</h3>
+      <p>Provision hardware identity and assign it to the current project.</p>
+      
+      <div class="form-group">
+        <label>Detected USB Device (Auto-Detect Hardware)</label>
+        <select class="form-input" id="new-node-usb-select" onchange="onUsbSelectChange()">
+          <option value="">-- Scanning USB Ports... --</option>
+        </select>
+        <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">Select a detected USB port to auto-populate port and identity.</div>
+      </div>
+
+      <div class="form-group">
+        <label>Node Display Name</label>
+        <input type="text" class="form-input" id="new-node-name" placeholder="e.g. Node: C">
+      </div>
+
+      <div class="form-group">
+        <label>Hardware Port / Route</label>
+        <input type="text" class="form-input" id="new-node-port" placeholder="/dev/cu.usbserial-XXXX or WiFi Wireless">
+      </div>
+
+      <div class="form-group">
+        <label>Hardware MAC Address (STA)</label>
+        <input type="text" class="form-input" id="new-node-mac" placeholder="e.g. 24:6F:28:XX:XX:XX">
+      </div>
+
+      <div class="form-group">
+        <label>eFuse Chip ID</label>
+        <input type="text" class="form-input" id="new-node-chip" placeholder="e.g. 9408FFFFC9EC">
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="closeModal('modal-add-node')">Cancel</button>
+        <button class="btn-main btn-crimson" onclick="submitNewNode()">Register Node</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: User Management -->
+  <div class="modal-overlay" id="modal-users">
+    <div class="modal-card" style="max-width: 540px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <h3 style="margin: 0;">Enterprise User Accounts</h3>
+        <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px;" onclick="closeModal('modal-users')">✕ Close</button>
+      </div>
+      <p>Manage authenticated administrators and operators with portal access.</p>
+      
+      <div style="margin-bottom: 20px;">
+        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 8px;">Existing Accounts</div>
+        <div id="users-list-container" style="max-height: 180px; overflow-y: auto;">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
+        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 10px;">Register New User</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+          <input type="text" class="form-input" id="new-user-username" placeholder="Username">
+          <input type="password" class="form-input" id="new-user-password" placeholder="Password">
+        </div>
+        <div style="display: flex; gap: 10px;">
+          <select class="form-input" id="new-user-role" style="flex: 1;">
+            <option value="Super Admin">Super Admin</option>
+            <option value="Fleet Operator" selected>Fleet Operator</option>
+            <option value="Viewer">Viewer (Read-Only)</option>
+          </select>
+          <button class="btn-main btn-crimson" onclick="submitNewUser()" style="padding: 10px 18px; font-size: 13px;">+ Add User</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: In-Situ Web UI Viewer -->
+  <div class="modal-overlay" id="modal-insitu-webui">
+    <div class="modal-card" style="max-width: 960px; width: 95vw; padding: 20px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px;">
+        <div>
+          <h3 style="margin: 0;" id="insitu-modal-title">In-Situ On-Board Web UI</h3>
+          <div style="font-size: 11px; color: #34D399; margin-top: 2px;">● Connected via Anashwar High-Speed Hardware Reverse Proxy</div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="refreshInsituIframe()">🔄 Reload</button>
+          <a id="insitu-modal-direct-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 12px; font-size: 12px; text-decoration: none;">↗ Direct Link</a>
+          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">✕ Close</button>
+        </div>
+      </div>
+      <div style="width: 100%; height: 580px; border-radius: 14px; overflow: hidden; background: #0B0F19; border: 1px solid rgba(255,255,255,0.1);">
+        <iframe id="insitu-iframe" style="width: 100%; height: 100%; border: none;" src="about:blank"></iframe>
+      </div>
+    </div>
+  </div>
+
   <script>
     // State
     let currentView = 'dashboard';
@@ -2337,7 +3396,11 @@ def render_fleet_html():
         document.getElementById('view-dashboard').style.display = 'block';
         breadcrumb.innerHTML = '<span class="breadcrumb-active">🏠 Dashboard Overview</span>';
       } else if (view === 'clients' || view === 'client') {
-        if (param1) selectedClientId = param1;
+        if (param1) {
+          selectedClientId = param1;
+        } else if (!selectedClientId && fleetData.clients && Object.keys(fleetData.clients).length > 0) {
+          selectedClientId = Object.keys(fleetData.clients)[0];
+        }
         document.getElementById('view-client').style.display = 'block';
         const client = fleetData.clients ? fleetData.clients[selectedClientId] : null;
         const cName = client ? client.name : selectedClientId;
@@ -2350,7 +3413,11 @@ def render_fleet_html():
         `;
         renderClientProjects();
       } else if (view === 'projects' || view === 'project') {
-        if (param1) selectedProjectId = param1;
+        if (param1) {
+          selectedProjectId = param1;
+        } else if (!selectedProjectId && fleetData.projects && Object.keys(fleetData.projects).length > 0) {
+          selectedProjectId = Object.keys(fleetData.projects)[0];
+        }
         document.getElementById('view-project').style.display = 'block';
         const proj = fleetData.projects ? fleetData.projects[selectedProjectId] : null;
         const client = (proj && fleetData.clients) ? fleetData.clients[proj.client_id] : null;
@@ -2367,11 +3434,18 @@ def render_fleet_html():
         renderProjectNodes();
       } else if (view === 'node-detail') {
         if (param1) selectedNodeName = param1;
+        const regNode = (fleetData.registered_nodes && fleetData.registered_nodes[selectedNodeName]) ? fleetData.registered_nodes[selectedNodeName] : null;
+        if (regNode && regNode.project_id) {
+          selectedProjectId = regNode.project_id;
+          selectedClientId = regNode.client_id;
+        }
         document.getElementById('view-node-detail').style.display = 'block';
+        const proj = fleetData.projects ? fleetData.projects[selectedProjectId] : null;
+        const pName = proj ? proj.name : 'Project';
         breadcrumb.innerHTML = `
           <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-item" onclick="navigateTo('project', '${selectedProjectId}')">📁 Project</span>
+          <span class="breadcrumb-item" onclick="navigateTo('project', '${selectedProjectId}')">📁 ${pName}</span>
           <span class="breadcrumb-sep">&gt;</span>
           <span class="breadcrumb-active">⚡ ${selectedNodeName}</span>
         `;
@@ -2398,13 +3472,243 @@ def render_fleet_html():
     function openAddProjectModal() { document.getElementById('modal-add-project').classList.add('open'); }
     function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
+    // Session & Auth Token Management for Cross-Origin Frames
+    const CURRENT_AUTH_TOKEN = "__CURRENT_TOKEN__" || localStorage.getItem('anashwar_token') || sessionStorage.getItem('anashwar_token') || "";
+    if (CURRENT_AUTH_TOKEN) {
+      try {
+        localStorage.setItem('anashwar_token', CURRENT_AUTH_TOKEN);
+        sessionStorage.setItem('anashwar_token', CURRENT_AUTH_TOKEN);
+      } catch(e) {}
+    }
+
+    function authedFetch(url, options = {}) {
+      options.headers = options.headers || {};
+      const token = CURRENT_AUTH_TOKEN || localStorage.getItem('anashwar_token') || sessionStorage.getItem('anashwar_token') || "";
+      if (token) {
+        if (options.headers instanceof Headers) {
+          options.headers.set('Authorization', 'Bearer ' + token);
+        } else {
+          options.headers['Authorization'] = 'Bearer ' + token;
+        }
+        const sep = url.includes('?') ? '&' : '?';
+        url = url + sep + 'token=' + encodeURIComponent(token);
+      }
+      return fetch(url, options);
+    }
+
+    // User Authentication & Management
+    async function handleLogout() {
+      localStorage.removeItem('anashwar_token');
+      sessionStorage.removeItem('anashwar_token');
+      try {
+        await authedFetch('/api/logout', { method: 'POST' });
+      } catch(e) {}
+      window.location.href = '/?logout=true';
+    }
+
+    function openUserModal() {
+      document.getElementById('modal-users').classList.add('open');
+      loadUsersList();
+    }
+
+    async function loadUsersList() {
+      try {
+        const res = await authedFetch('/api/users');
+        const data = await res.json();
+        const listContainer = document.getElementById('users-list-container');
+        if (!listContainer || !data.users) return;
+        let html = '';
+        for (const u of data.users) {
+          const isSelf = (u.username === data.current_user);
+          const isPrimaryAdmin = (u.username === 'admin');
+          html += `
+            <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); padding:10px 14px; border-radius:10px; margin-bottom:8px;">
+              <div>
+                <div style="font-weight:700; font-size:13px; color:#FFFFFF;">${u.username} ${isSelf ? '<span style="color:#38BDF8; font-size:11px;">(You)</span>' : ''}</div>
+                <div style="font-size:11px; color:var(--text-dim);">${u.role} &bull; Created ${u.created_at || 'Recently'}</div>
+              </div>
+              <div>
+                ${(!isSelf && !isPrimaryAdmin) ? `<button class="delete-btn-tiny" onclick="deleteUser('${u.username}')">🗑️ Delete</button>` : `<span style="font-size:11px; color:#64748B;">Protected</span>`}
+              </div>
+            </div>
+          `;
+        }
+        listContainer.innerHTML = html;
+      } catch (e) {
+        console.error("Error loading users:", e);
+      }
+    }
+
+    async function submitNewUser() {
+      const u = document.getElementById('new-user-username').value.trim();
+      const p = document.getElementById('new-user-password').value;
+      const r = document.getElementById('new-user-role').value;
+      if (!u || !p) return alert("Username and password are required");
+      const res = await authedFetch('/api/users/create', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}`
+      });
+      const data = await res.json();
+      if (data.success) {
+        document.getElementById('new-user-username').value = '';
+        document.getElementById('new-user-password').value = '';
+        loadUsersList();
+      } else {
+        alert(data.error || "Failed to create user");
+      }
+    }
+
+    async function deleteUser(username) {
+      if (!confirm(`Are you sure you want to delete user '${username}'?`)) return;
+      const res = await authedFetch('/api/users/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `username=${encodeURIComponent(username)}`
+      });
+      const data = await res.json();
+      if (data.success) {
+        loadUsersList();
+      } else {
+        alert(data.error || "Failed to delete user");
+      }
+    }
+
+    // Client & Project Deletion
+    async function deleteClient(clientId, clientName) {
+      if (!confirm(`Delete Client "${clientName}" and all associated projects?`)) return;
+      const res = await authedFetch('/api/client/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `client_id=${encodeURIComponent(clientId)}`
+      });
+      if (res.ok) {
+        fetchTelemetry();
+        navigateTo('dashboard');
+      } else {
+        alert("Error deleting client");
+      }
+    }
+
+    async function deleteProject(projectId, projectName) {
+      if (!confirm(`Delete Project "${projectName}"?`)) return;
+      const res = await authedFetch('/api/project/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `project_id=${encodeURIComponent(projectId)}`
+      });
+      if (res.ok) {
+        fetchTelemetry();
+        navigateTo('client', selectedClientId);
+      } else {
+        alert("Error deleting project");
+      }
+    }
+
+    // Node Registration & Deletion
+    async function deleteNode(nodeName) {
+      if (!confirm(`Delete Node "${nodeName}" from registry?`)) return;
+      const res = await authedFetch('/api/node/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `node_name=${encodeURIComponent(nodeName)}`
+      });
+      if (res.ok) {
+        fetchTelemetry();
+        navigateTo('project', selectedProjectId);
+      } else {
+        alert("Error deleting node");
+      }
+    }
+
+    async function openAddNodeModal() {
+      document.getElementById('modal-add-node').classList.add('open');
+      try {
+        const res = await authedFetch('/api/usb/scan');
+        const data = await res.json();
+        const sel = document.getElementById('new-node-usb-select');
+        if (sel && data.devices) {
+          sel.innerHTML = '<option value="">-- Select Detected USB Device (Optional) --</option>';
+          for (const d of data.devices) {
+            sel.innerHTML += `<option value="${d.port}" data-mac="${d.mac}" data-chip="${d.chip_id}" data-name="${d.node_name}">
+              ${d.port} ${d.node_name ? '('+d.node_name+')' : '(Available to Assign)'}
+            </option>`;
+          }
+        }
+      } catch(e) {
+        console.error("USB scan error:", e);
+      }
+    }
+
+    function onUsbSelectChange() {
+      const sel = document.getElementById('new-node-usb-select');
+      const opt = sel.options[sel.selectedIndex];
+      if (opt && opt.value) {
+        document.getElementById('new-node-port').value = opt.value;
+        if (opt.dataset.name) document.getElementById('new-node-name').value = opt.dataset.name;
+        if (opt.dataset.mac) document.getElementById('new-node-mac').value = opt.dataset.mac;
+        if (opt.dataset.chip) document.getElementById('new-node-chip').value = opt.dataset.chip;
+      }
+    }
+
+    async function submitNewNode() {
+      const name = document.getElementById('new-node-name').value.trim();
+      const port = document.getElementById('new-node-port').value.trim() || 'WiFi Wireless';
+      const mac = document.getElementById('new-node-mac').value.trim();
+      const chip = document.getElementById('new-node-chip').value.trim();
+      if (!name) return alert("Please enter Node Name");
+      const res = await authedFetch('/api/node/create', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `name=${encodeURIComponent(name)}&port=${encodeURIComponent(port)}&mac=${encodeURIComponent(mac)}&chip_id=${encodeURIComponent(chip)}&project_id=${encodeURIComponent(selectedProjectId)}`
+      });
+      if (res.ok) {
+        closeModal('modal-add-node');
+        fetchTelemetry();
+      } else {
+        alert("Error registering node");
+      }
+    }
+
+    // In-Situ Reverse Proxy Viewer
+    function openInsituModal() {
+      const modal = document.getElementById('modal-insitu-webui');
+      const iframe = document.getElementById('insitu-iframe');
+      const title = document.getElementById('insitu-modal-title');
+      const directLink = document.getElementById('insitu-modal-direct-link');
+      
+      const node = telemetryData.nodes ? telemetryData.nodes[selectedNodeName] : null;
+      const ip = node ? node.ip : '0.0.0.0';
+      
+      title.innerText = `In-Situ On-Board Web UI: ${selectedNodeName}`;
+      iframe.src = `/proxy/node/${encodeURIComponent(selectedNodeName)}/`;
+      directLink.href = `http://${ip}/`;
+      modal.classList.add('open');
+    }
+
+    function refreshInsituIframe() {
+      const iframe = document.getElementById('insitu-iframe');
+      if (iframe) iframe.src = iframe.src;
+    }
+
+    // Autonomous Offline Mode Toggle
+    function toggleOfflineMode() {
+      const chk = document.getElementById('detail-offline-toggle');
+      const state = chk.checked ? 'ON' : 'OFF';
+      authedFetch('/api/command', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `target=${encodeURIComponent(selectedNodeName)}&action=OFFLINE&val=${state}`
+      });
+    }
+
     function submitNewClient() {
       const name = document.getElementById('new-client-name').value;
       const code = document.getElementById('new-client-code').value;
       const desc = document.getElementById('new-client-desc').value;
       if (!name) return alert('Please enter client name');
       
-      fetch('/api/client/create', {
+      authedFetch('/api/client/create', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: `name=${encodeURIComponent(name)}&code=${encodeURIComponent(code)}&description=${encodeURIComponent(desc)}`
@@ -2420,7 +3724,7 @@ def render_fleet_html():
       const desc = document.getElementById('new-proj-desc').value;
       if (!name) return alert('Please enter project name');
 
-      fetch('/api/project/create', {
+      authedFetch('/api/project/create', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: `client_id=${encodeURIComponent(selectedClientId)}&name=${encodeURIComponent(name)}&code=${encodeURIComponent(code)}&description=${encodeURIComponent(desc)}`
@@ -2434,7 +3738,7 @@ def render_fleet_html():
     function toggleMasterService() {
       const chk = document.getElementById('detail-service-toggle');
       const state = chk.checked ? 'ON' : 'OFF';
-      fetch('/api/command', {
+      authedFetch('/api/command', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: `target=${encodeURIComponent(selectedNodeName)}&action=SERVICE&val=${state}`
@@ -2449,7 +3753,7 @@ def render_fleet_html():
       val = parseFloat(val).toFixed(1);
       document.getElementById('delay-range').value = val;
       document.getElementById('delay-display-val').innerText = val + 's';
-      fetch('/api/command', {
+      authedFetch('/api/command', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: `target=${encodeURIComponent(selectedNodeName)}&action=DELAY&val=${val}`
@@ -2467,7 +3771,7 @@ def render_fleet_html():
 
     function triggerDeployment(route) {
       if (!confirm(`Deploy ${selectedFirmwareFile} to [${selectedNodeName}] via ${route.toUpperCase()}?`)) return;
-      fetch('/api/deploy', {
+      authedFetch('/api/deploy', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: `target=${encodeURIComponent(selectedNodeName)}&route=${route}&filename=${encodeURIComponent(selectedFirmwareFile)}`
@@ -2484,7 +3788,7 @@ def render_fleet_html():
       
       document.getElementById('dropzone-label').innerText = `Uploading & validating ${file.name}...`;
 
-      fetch('/api/upload_bin', {
+      authedFetch('/api/upload_bin', {
         method: 'POST',
         body: formData
       }).then(r => r.json()).then(d => {
@@ -2518,7 +3822,10 @@ def render_fleet_html():
           <div class="glass-card client-tile" onclick="navigateTo('client', '${c_id}')">
             <div class="client-tile-header">
               <div class="client-avatar">${client.code ? client.code.substring(0,2) : 'CL'}</div>
-              <span class="status-pill pill-crimson">${client.tier || 'Enterprise'}</span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill pill-crimson">${client.tier || 'Enterprise'}</span>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteClient('${c_id}', '${client.name}')" title="Delete Client">🗑️</button>
+              </div>
             </div>
             <div class="client-name">${client.name}</div>
             <div class="client-desc">${client.description}</div>
@@ -2563,9 +3870,12 @@ def render_fleet_html():
 
         html += `
           <div class="glass-card project-card" onclick="navigateTo('project', '${p_id}')">
-            <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:12px; align-items:center;">
               <span class="status-pill pill-cyan">${proj.code || 'PROJ'}</span>
-              <span class="status-pill pill-green">${numNodes} Nodes</span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill pill-green">${numNodes} Nodes</span>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteProject('${p_id}', '${proj.name}')" title="Delete Project">🗑️</button>
+              </div>
             </div>
             <div class="client-name">${proj.name}</div>
             <div class="client-desc">${proj.description}</div>
@@ -2611,9 +3921,12 @@ def render_fleet_html():
                 <span style="font-size:20px;">⚡</span>
                 <span class="node-name">${n_name}</span>
               </div>
-              <span class="status-pill ${isOnline ? 'pill-green' : 'pill-crimson'}">
-                <span class="pulsing-dot"></span> ${isOnline ? 'ONLINE' : 'OFFLINE'}
-              </span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill ${isOnline ? 'pill-green' : 'pill-crimson'}">
+                  <span class="pulsing-dot"></span> ${isOnline ? 'ONLINE' : 'OFFLINE'}
+                </span>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteNode('${n_name}')" title="Delete Node">🗑️</button>
+              </div>
             </div>
 
             <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val">${node.mac}</span></div>
@@ -2630,6 +3943,14 @@ def render_fleet_html():
           </div>
         `;
       }
+
+      html += `
+        <div class="add-card-btn" onclick="openAddNodeModal()">
+          <div class="add-icon-circle">+</div>
+          <div style="font-weight:700;">Register Node to Project</div>
+          <div style="font-size:11px;color:var(--text-dim);">Assign an ESP32 hardware node</div>
+        </div>
+      `;
 
       container.innerHTML = html;
     }
@@ -2655,7 +3976,7 @@ def render_fleet_html():
               </span>
             </div>
 
-            <div class="node-spec-row"><span class="node-spec-lbl">Client / Project</span><span class="node-spec-val" style="font-size:12px;">Client 1 / Project 1</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Client / Project</span><span class="node-spec-val" style="font-size:12px;">${node.client || 'Enterprise'} / ${node.project || 'Project'}</span></div>
             <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val">${node.mac}</span></div>
             <div class="node-spec-row"><span class="node-spec-lbl">IP Address</span><span class="node-spec-val" style="color:#38BDF8;">${node.ip}</span></div>
             <div class="node-spec-row"><span class="node-spec-lbl">Active Mode</span><span class="node-spec-val">${modeTitles[node.mode] || 'Mode ' + node.mode}</span></div>
@@ -2684,6 +4005,17 @@ def render_fleet_html():
       } else {
         statusPill.className = 'status-pill pill-crimson';
         statusPill.innerHTML = '<span class="pulsing-dot"></span> OFFLINE';
+      }
+
+      // Quick switcher buttons
+      const sw = document.getElementById('node-switcher-container');
+      if (sw && telemetryData.nodes) {
+        let swHtml = '';
+        for (const nName of Object.keys(telemetryData.nodes)) {
+          const isSel = (nName === selectedNodeName);
+          swHtml += `<button class="${isSel ? 'btn-main btn-crimson' : 'btn-secondary'}" style="padding: 6px 14px; font-size: 12px;" onclick="openNodeDetail('${nName}')">${nName}</button>`;
+        }
+        sw.innerHTML = swHtml;
       }
 
       // Specs
@@ -2768,9 +4100,18 @@ def render_fleet_html():
     }
 
     function fetchTelemetry() {
-      fetch('/api/telemetry')
-        .then(r => r.json())
+      authedFetch('/api/telemetry')
+        .then(r => {
+          if (r.status === 401) {
+            localStorage.removeItem('anashwar_token');
+            sessionStorage.removeItem('anashwar_token');
+            window.location.href = '/?logout=true';
+            return;
+          }
+          return r.json();
+        })
         .then(data => {
+          if (!data) return;
           telemetryData = data;
           fleetData = data.fleet || DEFAULT_FLEET;
 
@@ -2819,6 +4160,7 @@ def render_fleet_html():
 </body>
 </html>
 """
+    return html_content.replace("__CURRENT_USER__", current_user).replace("__CURRENT_TOKEN__", token)
 
 def run_server():
     start_mqtt_client()

@@ -11,6 +11,16 @@
       "projects": [
         "proj_1"
       ]
+    },
+    "client_1793973495": {
+      "id": "client_1793973495",
+      "name": "Hamley's x Cadbury Milkinis",
+      "code": "TBD",
+      "description": "Namesake",
+      "tier": "Tier-1 Enterprise SLA",
+      "contact": "admin@enterprise.com",
+      "created_at": "2026-11-06",
+      "projects": []
     }
   },
   "projects": {

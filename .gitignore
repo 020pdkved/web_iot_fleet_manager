@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+.cache/
+__pycache__/
+*.pyc
+*.tar.gz
+compile_commands.json

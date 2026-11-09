@@ -1,0 +1,17 @@
+[Unit]
+Description=Anashwar Enterprise Fleet Management Console
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/anashwar-fleet
+ExecStart=/usr/bin/python3 /opt/anashwar-fleet/web_portal.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
