@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.tar.gz
 compile_commands.json
+active_sessions.json
+session_history.json
+registry_logs/

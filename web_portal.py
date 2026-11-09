@@ -49,12 +49,33 @@ os.makedirs(REGISTRY_DIR, exist_ok=True)
 # User Database & Session Store
 users_db = {}
 active_sessions = {}  # token -> device_info dict with username, os, device_model, ip, location, etc.
+ACTIVE_SESSIONS_FILE = os.path.join(PROJECT_ROOT, "active_sessions.json")
 session_history = []  # list of past login device telemetry records
 SESSION_HISTORY_FILE = os.path.join(PROJECT_ROOT, "session_history.json")
 webauthn_credentials = {} # username -> list of credentials
 webauthn_challenges = {} # username / _login_ -> {"challenge": str, "ts": float}
 last_presence_ping_time = 0.0
 geo_cache = {}
+
+def load_active_sessions():
+    global active_sessions
+    if os.path.isfile(ACTIVE_SESSIONS_FILE):
+        try:
+            with open(ACTIVE_SESSIONS_FILE, "r") as f:
+                active_sessions = json.load(f)
+                return
+        except Exception as e:
+            print(f"[AUTH] Error reading {ACTIVE_SESSIONS_FILE}: {e}")
+    active_sessions = {}
+
+def save_active_sessions():
+    try:
+        with open(ACTIVE_SESSIONS_FILE, "w") as f:
+            json.dump(active_sessions, f, indent=2)
+    except Exception as e:
+        print(f"[AUTH] Error saving {ACTIVE_SESSIONS_FILE}: {e}")
+
+load_active_sessions()
 
 def load_session_history():
     global session_history
@@ -1739,6 +1760,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 dev_info["role"] = u_role
                 dev_info["token"] = token
                 active_sessions[token] = dev_info
+                save_active_sessions()
                 add_session_history(dev_info)
 
                 self.send_response(200)
@@ -1759,6 +1781,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             u, token = get_authenticated_user(self.headers, parsed)
             if token and token in active_sessions:
                 del active_sessions[token]
+                save_active_sessions()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Set-Cookie", "session_token=; Path=/; SameSite=None; Secure; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
@@ -2049,7 +2072,22 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             new_p = data.get("password", [""])[0].strip()
             role = data.get("role", ["Fleet Operator"])[0].strip()
             if not new_u or not new_p:
-                self.send_error(400, "Username and password required")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Username and password required"}')
+                return
+            if caller_role not in ("Super Admin", "Fleet Operator"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Permission Denied: Insufficient privileges to create users."}')
+                return
+            if caller_role != "Super Admin" and role == "Super Admin":
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Permission Denied: Only Super Admins can create Super Admin accounts."}')
                 return
             if new_u in users_db:
                 self.send_response(400)
@@ -2101,6 +2139,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 for tok, s_info in list(active_sessions.items()):
                     if s_info.get("username") == del_u:
                         del active_sessions[tok]
+                save_active_sessions()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2137,6 +2176,10 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             del users_db[del_u]
             save_users()
+            for tok, s_info in list(active_sessions.items()):
+                if s_info.get("username") == del_u:
+                    del active_sessions[tok]
+            save_active_sessions()
             log_event(f"AUTH: User '{del_u}' ({target_role}) deleted by '{user}' ({caller_role})", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2325,6 +2368,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     dev_info["role"] = u_role
                     dev_info["token"] = token
                     active_sessions[token] = dev_info
+                    save_active_sessions()
                     add_session_history(dev_info)
 
                     log_event(f"AUTH: User '{matched_user}' signed in via {matched_device} ({dev_info['device_model']}, {dev_info['location']})", actor=matched_user, actor_role=u_role)
@@ -3715,12 +3759,14 @@ def render_fleet_html(current_user="admin", token=""):
     .modal-overlay.open { display: flex; }
     .modal-card {
       width: 100%;
-      max-width: 480px;
+      max-width: 580px;
       background: #0E131F;
       border: 1px solid var(--card-border);
       border-radius: 20px;
       padding: 28px;
       box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+      max-height: 90vh;
+      overflow-y: auto;
     }
     .modal-card h3 {
       font-size: 18px;
@@ -3926,14 +3972,14 @@ def render_fleet_html(current_user="admin", token=""):
     body.mode-desktop-pc .kpi-grid { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; }
     body.mode-desktop-pc .node-detail-layout { display: grid !important; grid-template-columns: 1.1fr 0.9fr !important; }
     body.mode-desktop-pc .modal-overlay { align-items: center !important; }
-    body.mode-desktop-pc .modal-card { border-radius: 20px !important; }
+    body.mode-desktop-pc .modal-card { border-radius: 20px !important; max-height: 88vh !important; overflow-y: auto !important; }
   </style>
 </head>
 <body>
 
   <!-- Left Sidebar -->
   <aside class="sidebar">
-    <div class="brand-header">
+    <div class="brand-header" onclick="navigateTo('dashboard')" style="cursor: pointer;">
       <div class="brand-logo">
         <img src="/static/logo.png" alt="Anashwar Technologies Logo">
       </div>
@@ -3949,13 +3995,17 @@ def render_fleet_html(current_user="admin", token=""):
         <span class="nav-icon">📊</span> Dashboard Overview
       </div>
       <div class="nav-item" id="nav-registry" onclick="navigateTo('registry')">
-        <span class="nav-icon">📋</span> Operations Registry
+        <span class="nav-icon">📜</span> Operations Registry
       </div>
-      <div class="nav-item" onclick="openNodeDetail('Node: A')">
-        <span class="nav-icon">⚡</span> Node: A (Console)
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title" style="display: flex; justify-content: space-between; align-items: center;">
+        <span>Hardware Nodes</span>
+        <span class="status-pill pill-cyan" id="sidebar-node-count" style="font-size: 10px; padding: 1px 6px;">0 Online</span>
       </div>
-      <div class="nav-item" onclick="openNodeDetail('Node: B')">
-        <span class="nav-icon">⚡</span> Node: B (Console)
+      <div id="sidebar-nodes-list" style="display: flex; flex-direction: column; gap: 3px; max-height: 220px; overflow-y: auto;">
+        <!-- Populated live by fetchTelemetry() -->
       </div>
     </div>
 
@@ -3964,26 +4014,22 @@ def render_fleet_html(current_user="admin", token=""):
       <div class="nav-item" onclick="openUserModal()">
         <span class="nav-icon">👥</span> Users & Access
       </div>
-      <div class="nav-item" onclick="showSecurityModal()">
-        <span class="nav-icon">🔒</span> Security Keys
+      <div class="nav-item" onclick="selectBaseFirmware(); navigateTo('dashboard');">
+        <span class="nav-icon">⭐</span> Golden Base Firmware
       </div>
     </div>
 
     <div class="sidebar-footer">
       <div class="status-badge-row">
-        <span>LAN mDNS</span>
-        <span class="status-pill pill-cyan">control.local</span>
-      </div>
-      <div class="status-badge-row">
-        <span>HiveMQ Broker</span>
+        <span>HiveMQ Cloud</span>
         <span class="status-pill pill-green"><span class="pulsing-dot"></span> Connected</span>
       </div>
       <div class="status-badge-row">
-        <span>Cloudflare Tunnel</span>
-        <span class="status-pill pill-cyan">Active 🚀</span>
+        <span>Fleet Mesh</span>
+        <span class="status-pill pill-cyan">Port 1883</span>
       </div>
       <div style="font-size: 10px; color: var(--text-dim); text-align: center; margin-top: 10px;">
-        Anashwar Fleet OS v4.2 &bull; Dual ESP32
+        Anashwar Fleet OS v4.2 &bull; Edge Fleet
       </div>
     </div>
   </aside>
@@ -4003,15 +4049,6 @@ def render_fleet_html(current_user="admin", token=""):
           <input type="text" placeholder="Search fleet, nodes, MAC...">
           <span class="kbd-shortcut">⌘K</span>
         </div>
-        <a id="mdns-link" href="http://control.local" target="_blank" class="status-pill pill-cyan" style="text-decoration:none;">
-          📡 control.local
-        </a>
-        <a id="public-tunnel-link" href="#" target="_blank" class="status-pill pill-crimson" style="text-decoration:none;">
-          🌐 Public Web View
-        </a>
-        <button id="form-mode-toggle-btn" class="form-mode-pill" onclick="toggleDisplayFormOverride()" title="Toggle Touch Phone / Desktop PC View">
-          📱 Touch Phone View
-        </button>
         <div style="display:flex; align-items:center; gap:8px; border-left:1px solid rgba(255,255,255,0.12); padding-left:12px; margin-left:4px;">
           <div class="user-pill-btn" onclick="openUserModal()" title="Current Logged In User">
             <span style="font-size:14px;">👤</span>
@@ -4549,8 +4586,8 @@ def render_fleet_html(current_user="admin", token=""):
       <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
         <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 10px;">Register New User</div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-          <input type="text" class="form-input" id="new-user-username" placeholder="Username">
-          <input type="password" class="form-input" id="new-user-password" placeholder="Password">
+          <input type="text" class="form-input" id="new-user-username" placeholder="Username" autocomplete="off">
+          <input type="password" class="form-input" id="new-user-password" placeholder="Password" autocomplete="new-password">
         </div>
         <div style="display: flex; gap: 10px;">
           <select class="form-input" id="new-user-role" style="flex: 1;">
@@ -4558,7 +4595,7 @@ def render_fleet_html(current_user="admin", token=""):
             <option value="Fleet Operator" selected>Fleet Operator</option>
             <option value="User">User</option>
           </select>
-          <button class="btn-main btn-crimson" onclick="submitNewUser()" style="padding: 10px 18px; font-size: 13px;">+ Add User</button>
+          <button id="btn-add-user" class="btn-main btn-crimson" onclick="submitNewUser()" style="padding: 10px 18px; font-size: 13px;">+ Add User</button>
         </div>
       </div>
 
@@ -4671,7 +4708,7 @@ def render_fleet_html(current_user="admin", token=""):
         const navD = document.getElementById("nav-dashboard");
         if (navD) navD.classList.add("active");
         document.getElementById("view-dashboard").style.display = "block";
-        breadcrumb.innerHTML = "<span class=\"breadcrumb-active\">🏠 Dashboard Overview</span>";
+        breadcrumb.innerHTML = `<span class="breadcrumb-active">🏠 Dashboard Overview</span>`;
         renderClients();
       } else if (view === "registry") {
         const navR = document.getElementById("nav-registry");
@@ -4876,14 +4913,27 @@ def render_fleet_html(current_user="admin", token=""):
 
     function openUserModal() {
       document.getElementById("modal-users").classList.add("open");
+      const uInput = document.getElementById("new-user-username");
+      const pInput = document.getElementById("new-user-password");
+      if (uInput) uInput.value = "";
+      if (pInput) pInput.value = "";
       loadUsersList();
     }
 
     async function loadUsersList() {
+      const listContainer = document.getElementById("users-list-container");
+      const sessContainer = document.getElementById("sessions-list-container");
       try {
         const res = await authedFetch("/api/users");
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.error("Error loading users:", res.status, errData);
+          if (listContainer) {
+            listContainer.innerHTML = `<div style="color:#F87171; padding:10px; font-size:12px;">Failed to load accounts: ${errData.error || res.statusText} (Status ${res.status})</div>`;
+          }
+          return;
+        }
         const data = await res.json();
-        const listContainer = document.getElementById("users-list-container");
         if (!listContainer || !data.users) return;
         let html = "";
         for (const u of data.users) {
@@ -4904,15 +4954,15 @@ def render_fleet_html(current_user="admin", token=""):
             </div>
           `;
         }
-        listContainer.innerHTML = html;
+        listContainer.innerHTML = html || '<div style="font-size:12px; color:var(--text-dim); padding:8px;">No accounts found</div>';
 
         // Populate Active & Recent Connected Device Sessions
-        const sessContainer = document.getElementById("sessions-list-container");
         const sessCountPill = document.getElementById("sessions-count-pill");
-        if (sessContainer && data.sessions) {
-          if (sessCountPill) sessCountPill.innerText = `${data.sessions.length} Active Session${data.sessions.length === 1 ? "" : "s"}`;
+        if (sessContainer) {
+          const sessions = data.sessions || [];
+          if (sessCountPill) sessCountPill.innerText = `${sessions.length} Active Session${sessions.length === 1 ? "" : "s"}`;
           let sHtml = "";
-          for (const s of data.sessions) {
+          for (const s of sessions) {
             const isTouch = s.is_touch;
             const icon = isTouch ? "📱" : "💻";
             const formBadge = isTouch ? '<span class="status-pill pill-crimson" style="font-size:10px; padding:2px 8px;">📱 Touch Phone</span>' : '<span class="status-pill pill-cyan" style="font-size:10px; padding:2px 8px;">💻 Desktop PC</span>';
@@ -4947,6 +4997,9 @@ def render_fleet_html(current_user="admin", token=""):
         }
       } catch (e) {
         console.error("Error loading users:", e);
+        if (listContainer) {
+          listContainer.innerHTML = `<div style="color:#F87171; padding:10px; font-size:12px;">Error connecting to user service: ${e.message}</div>`;
+        }
       }
     }
 
@@ -4955,18 +5008,35 @@ def render_fleet_html(current_user="admin", token=""):
       const p = document.getElementById("new-user-password").value;
       const r = document.getElementById("new-user-role").value;
       if (!u || !p) return alert("Username and password are required");
-      const res = await authedFetch("/api/users/create", {
-        method: "POST",
-        headers: {"Content-Type": "application/x-www-form-urlencoded"},
-        body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}`
-      });
-      const data = await res.json();
-      if (data.success) {
-        document.getElementById("new-user-username").value = "";
-        document.getElementById("new-user-password").value = "";
-        loadUsersList();
-      } else {
-        alert(data.error || "Failed to create user");
+
+      const submitBtn = document.getElementById("btn-add-user");
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerText = "Adding User...";
+      }
+
+      try {
+        const res = await authedFetch("/api/users/create", {
+          method: "POST",
+          headers: {"Content-Type": "application/x-www-form-urlencoded"},
+          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}`
+        });
+        const data = await res.json();
+        if (data.success) {
+          document.getElementById("new-user-username").value = "";
+          document.getElementById("new-user-password").value = "";
+          await loadUsersList();
+          alert(`✓ User '${u}' (${r}) registered successfully!`);
+        } else {
+          alert(data.error || "Failed to create user");
+        }
+      } catch(err) {
+        alert("Network error creating user: " + err);
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerText = "+ Add User";
+        }
       }
     }
 
@@ -5032,7 +5102,7 @@ def render_fleet_html(current_user="admin", token=""):
         });
         const vData = await vRes.json();
         if (vData.success) {
-          alert("✓ Apple Face ID / Samsung Fingerprint successfully enrolled for this device!\nYou can now sign in using the biometric button on the login screen.");
+          alert(`✓ Apple Face ID / Samsung Fingerprint successfully enrolled for this device!\nYou can now sign in using the biometric button on the login screen.`);
           loadUsersList();
         } else {
           alert("Biometric verification failed: " + (vData.error || "Unknown error"));
@@ -5097,7 +5167,7 @@ def render_fleet_html(current_user="admin", token=""):
         const data = await res.json();
         const sel = document.getElementById("new-node-usb-select");
         if (sel && data.devices) {
-          sel.innerHTML = "<option value=\"\">-- Select Detected USB Device (Optional) --</option>";
+          sel.innerHTML = '<option value="">-- Select Detected USB Device (Optional) --</option>';
           for (const d of data.devices) {
             sel.innerHTML += `<option value="${d.port}" data-mac="${d.mac}" data-chip="${d.chip_id}" data-name="${d.node_name}">
               ${d.port} ${d.node_name ? "("+d.node_name+")" : "(Available to Assign)"}
@@ -5766,20 +5836,6 @@ def render_fleet_html(current_user="admin", token=""):
       }
     }
 
-    function showSecurityModal() {
-      alert(`Anashwar Cryptographic Security Registry:\n\n` +
-            `Node: A\n` +
-            `  MAC: EC:C9:FF:FF:08:94\n` +
-            `  eFuse ID: 9408FFFFC9EC\n` +
-            `  SHA-256: 0647df22dceea927a2fe279cdb6fe999fc873a2d1d8f0cfca79934833eb5ed7d\n` +
-            `  Trust: Verified (4-Point Majority)\n\n` +
-            `Node: B\n` +
-            `  MAC: 70:4B:CA:48:E6:BC\n` +
-            `  eFuse ID: BCE648CA4B70\n` +
-            `  SHA-256: d56ab3dfed28a8a361a0b323be53b3abbd43dbfc16a1eb040a23c940cefbe703\n` +
-            `  Trust: Verified (4-Point Majority)`);
-    }
-
     function fetchTelemetry() {
       authedFetch("/api/telemetry")
         .then(r => {
@@ -5796,9 +5852,34 @@ def render_fleet_html(current_user="admin", token=""):
           telemetryData = data;
           fleetData = data.fleet || DEFAULT_FLEET;
 
-          // Public tunnel link
-          if (data.public_tunnel && document.getElementById("public-tunnel-link")) {
-            document.getElementById("public-tunnel-link").href = data.public_tunnel;
+          // Dynamic Sidebar Nodes List
+          const sidebarList = document.getElementById("sidebar-nodes-list");
+          const sidebarCount = document.getElementById("sidebar-node-count");
+          if (sidebarList && data.nodes) {
+            let sHtml = "";
+            let sOnline = 0;
+            const entries = Object.entries(data.nodes);
+            for (const [nName, nInfo] of entries) {
+              const isOnline = !!nInfo.online;
+              if (isOnline) sOnline++;
+              const dotClass = isOnline ? "online-dot" : "offline-dot";
+              const mcu = nInfo.mcu_type || "ESP32";
+              const isActive = (currentView === "node-detail" && selectedNodeName === nName) ? "active" : "";
+              sHtml += `
+                <div class="nav-item ${isActive}" onclick="openNodeDetail('${nName}')" style="font-size:12px; padding:7px 12px; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
+                  <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
+                    <span class="status-dot ${dotClass}" style="width:7px; height:7px; flex-shrink:0;"></span>
+                    <span style="font-weight:600; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${nName}</span>
+                  </div>
+                  <span class="status-pill pill-cyan" style="font-size:9px; padding:1px 5px; flex-shrink:0;">${mcu}</span>
+                </div>
+              `;
+            }
+            if (!entries.length) {
+              sHtml = '<div style="font-size:11px; color:var(--text-dim); padding:8px 12px;">No hardware nodes registered</div>';
+            }
+            sidebarList.innerHTML = sHtml;
+            if (sidebarCount) sidebarCount.innerText = `${sOnline} Online`;
           }
 
           // KPI Active nodes
@@ -5835,44 +5916,30 @@ def render_fleet_html(current_user="admin", token=""):
         .catch(e => console.error("Telemetry error:", e));
     }
 
-    // Two-Form Display Engine (Touch Screen Phone vs Non-Touch PC/Mac Desktop)
+    // Automatic Responsive Display Engine (Touch Screen Phone vs Non-Touch PC/Mac Desktop)
     function getDisplayFormMode() {
-      const stored = localStorage.getItem("fleet_form_mode");
-      if (stored === "phone" || stored === "desktop") return stored;
-      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || window.matchMedia('(pointer: coarse)').matches;
+      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
       const isNarrow = window.innerWidth <= 860;
       return (isNarrow || isTouch) ? "phone" : "desktop";
     }
 
-    function applyDisplayFormMode(mode) {
+    function applyDisplayFormMode() {
+      const mode = getDisplayFormMode();
       const body = document.body;
-      const btn = document.getElementById("form-mode-toggle-btn");
       if (mode === "phone") {
         body.classList.remove("mode-desktop-pc");
         body.classList.add("mode-phone-touch");
-        if (btn) btn.innerHTML = '📱 Touch Phone View';
       } else {
         body.classList.remove("mode-phone-touch");
         body.classList.add("mode-desktop-pc");
-        if (btn) btn.innerHTML = '💻 Desktop PC View';
       }
     }
 
-    function toggleDisplayFormOverride() {
-      const current = document.body.classList.contains("mode-phone-touch") ? "phone" : "desktop";
-      const next = current === "phone" ? "desktop" : "phone";
-      localStorage.setItem("fleet_form_mode", next);
-      applyDisplayFormMode(next);
-    }
+    window.addEventListener("resize", applyDisplayFormMode);
+    window.addEventListener("orientationchange", applyDisplayFormMode);
 
-    window.addEventListener("resize", () => {
-      if (!localStorage.getItem("fleet_form_mode")) {
-        applyDisplayFormMode(getDisplayFormMode());
-      }
-    });
-
-    // Initialize display form mode & golden base firmware
-    applyDisplayFormMode(getDisplayFormMode());
+    // Initialize auto display mode & golden base firmware
+    applyDisplayFormMode();
     selectBaseFirmware();
 
     // Polling interval
