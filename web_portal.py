@@ -998,11 +998,9 @@ def resolve_target_node(val):
         return val_clean
 
     v = val_clean.lower()
-    if "node: a" in v or v in ("node a", "a", "alpha", "node alpha"):
-        return "Node: A"
-    if "node: b" in v or v in ("node b", "b", "beta", "node beta"):
-        return "Node: B"
     for name, node in nodes_telemetry.items():
+        if v == name.lower():
+            return name
         if v == node.get("mac", "").lower():
             return name
         if v == node.get("chip_id", "").lower():
@@ -1011,6 +1009,10 @@ def resolve_target_node(val):
             return name
         if v == node.get("ip", "").lower():
             return name
+    if "node: a" in v or v in ("node a", "a", "alpha", "node alpha"):
+        return "Node: A"
+    if "node: b" in v or v in ("node b", "b", "beta", "node beta"):
+        return "Node: B"
     return None
 
 # =============================================================================
@@ -1932,6 +1934,17 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 cmd = f"CMD:[{target_node}]:REBOOT"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
                 log_event(f"COMMAND: [{target_node}] software reboot dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "PING":
+                cmd = f"CMD:[{target_node}]:PING"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] manual presence ping dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "RAW_CMD":
+                clean_cmd = str(val).strip()
+                cmd = f"CMD:[{target_node}]:{clean_cmd}"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"DIRECTIVE: [{target_node}] custom command dispatched: '{clean_cmd}'", actor=user, actor_role=caller_role)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4397,14 +4410,15 @@ def render_fleet_html(current_user="admin", token=""):
                 <span id="detail-node-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> ONLINE</span>
                 <span class="status-pill pill-cyan">✓ SHA-256 VERIFIED</span>
                 <button class="btn-main btn-cyan" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">🌐 On-Board Web UI</button>
+                <button class="btn-main btn-crimson" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodeReboot(selectedNodeName)" title="Reboot MCU via MQTT">🔄 Reboot</button>
+                <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodePing(selectedNodeName)" title="Ping node for immediate ACK">📡 Ping</button>
                 <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="openRenameModal('node', selectedNodeName, selectedNodeName)">✏️ Rename</button>
                 <button class="btn-secondary" style="border-color: rgba(239,68,68,0.4); color: #F87171; font-size: 12px; padding: 6px 12px;" onclick="deleteNode(selectedNodeName)">🗑️ Delete Node</button>
               </div>
             </div>
             <!-- Quick switcher for all nodes -->
             <div style="display: flex; gap: 8px; flex-wrap: wrap;" id="node-switcher-container">
-              <button class="btn-secondary" onclick="openNodeDetail('Node: A')">Node: A</button>
-              <button class="btn-secondary" onclick="openNodeDetail('Node: B')">Node: B</button>
+              <!-- Dynamically populated with all registered nodes -->
             </div>
           </div>
         </div>
@@ -4418,7 +4432,7 @@ def render_fleet_html(current_user="admin", token=""):
               <div class="service-switch-box" style="margin: 0;">
                 <div class="service-info">
                   <h4>Master Service Switch</h4>
-                  <p>ACTIVE: Service driven. STANDBY: Suspends hardware & turns off LED.</p>
+                  <p>ACTIVE: Operation driven. STANDBY: Hardware suspended.</p>
                 </div>
                 <label class="apple-switch">
                   <input type="checkbox" id="detail-service-toggle" onchange="toggleMasterService()">
@@ -4439,8 +4453,30 @@ def render_fleet_html(current_user="admin", token=""):
               </div>
             </div>
 
-            <!-- Output Delay Configurator -->
-            <div class="delay-box">
+            <!-- Universal Custom Command & Directive Console -->
+            <div class="glass-card" style="margin-bottom: 18px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div class="panel-title" style="margin: 0;">⚡ Project Action & Directive Console</div>
+                <span class="status-pill pill-cyan">Real-Time MQTT</span>
+              </div>
+              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Dispatch custom action directives to this node (e.g. RELAY:ON, LIGHTS:1, BRIGHTNESS:80, or your project's custom commands):</p>
+              
+              <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                <input type="text" id="custom-directive-input" class="form-input" style="flex: 1;" placeholder="Enter directive, e.g. SERVICE:ON or RELAY:1" onkeydown="if(event.key==='Enter') sendCustomDirective(selectedNodeName)">
+                <button class="btn-main btn-crimson" style="padding: 0 16px; font-size: 13px; font-weight: 700;" onclick="sendCustomDirective(selectedNodeName)">Dispatch &rarr;</button>
+              </div>
+
+              <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                <span style="font-size: 11px; color: var(--text-dim); align-self: center; margin-right: 4px;">Quick Actions:</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'PING')">📡 PING</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:ON')">⚡ Service ON</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:OFF')">⏸️ Service OFF</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'REBOOT')">🔄 REBOOT</span>
+              </div>
+            </div>
+
+            <!-- Output Delay Configurator (Optional / POC Feature) -->
+            <div class="delay-box" id="delay-box-container">
               <div class="delay-header">
                 <div>
                   <h4 style="font-size: 15px; font-weight: 700; color: #FFFFFF;">Configurable Output Propagation Delay</h4>
@@ -4460,10 +4496,13 @@ def render_fleet_html(current_user="admin", token=""):
               </div>
             </div>
 
-            <!-- Live Hardware Visualizer -->
-            <div class="hw-visualizer">
-              <div class="panel-title">Real-Time Hardware Visualizer</div>
-              <p style="font-size: 12px; color: var(--text-muted);">Dynamic state mirrored from physical GPIO 2 & GPIO 0</p>
+            <!-- Live Hardware Visualizer (POC Demonstration Component) -->
+            <div class="hw-visualizer" id="poc-visualizer-container">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div class="panel-title" style="margin: 0;">Dual-ESP32 POC Hardware Visualizer</div>
+                <span style="font-size: 10px; color: var(--text-dim);">GPIO 2 & 0 Mirror</span>
+              </div>
+              <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px 0;">Demonstration visualizer active for nodes with physical button & LED attached. Custom project nodes can ignore these pins.</p>
               
               <div class="hw-display-row">
                 <div class="hw-unit">
@@ -4803,7 +4842,7 @@ def render_fleet_html(current_user="admin", token=""):
       <span class="bnav-icon">🏢</span>
       <span class="bnav-label">Clients</span>
     </button>
-    <button class="bottom-nav-item" id="bnav-node-detail" onclick="openNodeDetail(selectedNodeName || 'Node: A')">
+    <button class="bottom-nav-item" id="bnav-node-detail" onclick="openCurrentNodeDetail()">
       <span class="bnav-icon">🖧</span>
       <span class="bnav-label">Node Detail</span>
     </button>
@@ -5503,6 +5542,54 @@ def render_fleet_html(current_user="admin", token=""):
       });
     }
 
+    function triggerNodeReboot(nodeName) {
+      if (!confirm(`Send hardware reboot signal to [${nodeName}]?`)) return;
+      authedFetch("/api/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: `target=${encodeURIComponent(nodeName)}&action=REBOOT&val=1`
+      }).then(() => fetchTelemetry());
+    }
+
+    function triggerNodePing(nodeName) {
+      authedFetch("/api/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: `target=${encodeURIComponent(nodeName)}&action=PING&val=1`
+      }).then(() => fetchTelemetry());
+    }
+
+    function sendCustomDirective(nodeName) {
+      const input = document.getElementById("custom-directive-input");
+      const cmd = input ? input.value.trim() : "";
+      if (!cmd) return alert("Please enter a directive or command string");
+      authedFetch("/api/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: `target=${encodeURIComponent(nodeName)}&action=RAW_CMD&val=${encodeURIComponent(cmd)}`
+      }).then(r => r.json()).then(d => {
+        if (input) input.value = "";
+        fetchTelemetry();
+      });
+    }
+
+    function sendQuickDirective(nodeName, cmd) {
+      authedFetch("/api/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: `target=${encodeURIComponent(nodeName)}&action=RAW_CMD&val=${encodeURIComponent(cmd)}`
+      }).then(() => fetchTelemetry());
+    }
+
+    function openCurrentNodeDetail() {
+      let target = selectedNodeName;
+      if (!target || (target === "Node: A" && telemetryData.nodes && !telemetryData.nodes["Node: A"])) {
+        const keys = Object.keys(telemetryData.nodes || {});
+        if (keys.length > 0) target = keys[keys.length - 1];
+      }
+      openNodeDetail(target || 'Node: A');
+    }
+
     function submitNewClient() {
       const name = document.getElementById("new-client-name").value;
       const code = document.getElementById("new-client-code").value;
@@ -5961,12 +6048,19 @@ def render_fleet_html(current_user="admin", token=""):
             <div class="node-spec-row"><span class="node-spec-lbl">Active Mode</span><span class="node-spec-val">${modeTitles[modeNum] || "Mode " + modeNum}</span></div>
             <div class="node-spec-row"><span class="node-spec-lbl">Master Service</span><span class="node-spec-val" style="color:${node.service ? "#34D399":"#FBBF24"}">${node.service ? "ACTIVE" : "STANDBY"}</span></div>
             <div class="node-spec-row"><span class="node-spec-lbl">Autonomous Offline</span><span class="node-spec-val" style="color:${node.offline ? "#34D399":"#94A3B8"}">${node.offline ? "ENABLED" : "DISABLED"}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Output Delay</span><span class="node-spec-val">${node.delay.toFixed(1)}s</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Output Delay</span><span class="node-spec-val">${(node.delay || 0).toFixed(1)}s</span></div>
             <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Security Hash</span><span class="node-spec-val" style="color:#34D399;font-size:11px;">✓ Verified</span></div>
 
-            <div class="client-footer-btn" style="margin-top:14px;">
-              <span>Manage & Control Node</span>
-              <span>&rarr;</span>
+            <div style="display: grid; grid-template-columns: 1fr auto auto; gap: 8px; margin-top: 14px;">
+              <button class="btn-main btn-crimson" style="padding: 9px 14px; font-size: 13px; font-weight: 700; width: 100%; text-align: center;" onclick="event.stopPropagation(); openNodeDetail('${n_name}')">
+                ⚡ Open Node Controls &rarr;
+              </button>
+              <button class="btn-secondary" style="padding: 9px 12px; font-size: 13px;" onclick="event.stopPropagation(); triggerNodePing('${n_name}')" title="Ping Node (ACK)">
+                📡
+              </button>
+              <button class="btn-secondary" style="padding: 9px 12px; font-size: 13px;" onclick="event.stopPropagation(); triggerNodeReboot('${n_name}')" title="Reboot MCU via MQTT">
+                🔄
+              </button>
             </div>
           </div>
         `;
@@ -6045,6 +6139,13 @@ def render_fleet_html(current_user="admin", token=""):
       if (document.getElementById("detail-offline-toggle")) document.getElementById("detail-offline-toggle").checked = !!node.offline;
       if (document.getElementById("delay-range")) document.getElementById("delay-range").value = node.delay || 0;
       if (document.getElementById("delay-display-val")) document.getElementById("delay-display-val").innerText = (node.delay || 0).toFixed(1) + "s";
+
+      // POC Visualizer adaptation: Show only for legacy dual-ESP32 test nodes (Node: A, Node: B) or if explicitly reporting active pins
+      const pocVis = document.getElementById("poc-visualizer-container");
+      const delayBox = document.getElementById("delay-box-container");
+      const isLegacyDemo = (node.name === "Node: A" || node.name === "Node: B" || (node.btn !== undefined && node.btn > 0) || (node.led !== undefined && node.led > 0));
+      if (pocVis) pocVis.style.display = isLegacyDemo ? "block" : "none";
+      if (delayBox) delayBox.style.display = isLegacyDemo ? "block" : "none";
 
       // In-situ link
       const insituLink = document.getElementById("detail-insitu-link");
