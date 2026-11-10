@@ -5739,9 +5739,10 @@ def render_fleet_html(current_user="admin", token=""):
       
       const node = telemetryData.nodes ? telemetryData.nodes[selectedNodeName] : null;
       const ip = node ? node.ip : "0.0.0.0";
+      const tok = CURRENT_AUTH_TOKEN || localStorage.getItem("anashwar_token") || sessionStorage.getItem("anashwar_token") || "";
       
       title.innerText = `In-Situ On-Board Web UI: ${selectedNodeName}`;
-      iframe.src = `/proxy/node/${encodeURIComponent(selectedNodeName)}/`;
+      iframe.src = `/proxy/node/${encodeURIComponent(selectedNodeName)}/?token=${encodeURIComponent(tok)}`;
       directLink.href = `http://${ip}/`;
       modal.classList.add("open");
     }

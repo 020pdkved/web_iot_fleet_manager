@@ -1,10 +1,9 @@
 // =============================================================================
-// Plug & Play Multi-AP ESP32 Fleet Node with Embedded In-Situ Web Server (Port 80)
+// Anashwar Technologies - Universal Plug & Play ESP32 Fleet Node
 // Wi-Fi Profiles:
 //   1. "VED-FI"        / "11111111"
 //   2. "AnashwarTech2" / "At@12345"
-//   3. "vedfi"         / "11111111"
-// Portal: https://manage.anashwartech.com
+// Global Fleet Portal: https://manage.anashwartech.com
 // =============================================================================
 
 #include <WiFi.h>
@@ -93,7 +92,7 @@ void onMqttCommand(char* topic, byte* payload, unsigned int length) {
   // Target Check: Wildcard [*] or this node name
   if (cmd.indexOf("[*]") < 0 && cmd.indexOf("[" + nodeName + "]") < 0) return;
 
-  Serial.printf("[CMD] Received: %s\n", cmd.c_str());
+  Serial.printf("[CMD] Directive received: %s\n", cmd.c_str());
 
   // 1. Presence Ping Response (<100ms ACK)
   if (cmd.indexOf("PING") >= 0) {
@@ -128,34 +127,98 @@ void onMqttCommand(char* topic, byte* payload, unsigned int length) {
 // IN-SITU ON-BOARD WEB SERVER (Port 80)
 // =============================================================================
 void setupWebServer() {
+  // 1. Root In-Situ Web UI (Exact frosted-glass styling)
   localServer.on("/", HTTP_GET, []() {
-    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>" + nodeName + " - Node Console</title><style>";
-    html += "body{background:#0B0F17;color:#F8FAFC;font-family:-apple-system,sans-serif;padding:20px;text-align:center;}";
-    html += ".card{max-width:440px;margin:20px auto;background:#161B22;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:22px;text-align:left;}";
-    html += "h1{font-size:20px;color:#E11D48;margin-bottom:14px;text-align:center;}";
-    html += ".row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);font-size:13px;}";
-    html += ".btn{width:100%;padding:12px;border:none;border-radius:10px;font-weight:700;margin-top:14px;cursor:pointer;}";
-    html += ".btn-on{background:#10B981;color:#fff;} .btn-off{background:#F59E0B;color:#fff;}";
-    html += "</style></head><body><div class='card'>";
-    html += "<h1>⚡ " + nodeName + "</h1>";
-    html += "<div class='row'><span>Client</span><b>" + nodeClient + "</b></div>";
-    html += "<div class='row'><span>Project</span><b>" + nodeProject + "</b></div>";
-    html += "<div class='row'><span>Local IP</span><b style='color:#38BDF8;'>" + WiFi.localIP().toString() + "</b></div>";
-    html += "<div class='row'><span>Connected SSID</span><b>" + WiFi.SSID() + "</b></div>";
-    html += "<div class='row'><span>MAC</span><b>" + nodeMac + "</b></div>";
-    html += "<div class='row'><span>Wi-Fi Signal</span><b>" + String(WiFi.RSSI()) + " dBm</b></div>";
-    html += "<div class='row'><span>Service State</span><b style='color:" + String(masterActive ? "#10B981'>ACTIVE" : "#F59E0B'>STANDBY") + "</b></div>";
-    html += "<form method='POST' action='/toggle'><button class='btn " + String(masterActive ? "btn-off'>Set STANDBY" : "btn-on'>Set ACTIVE") + "</button></form>";
-    html += "</div></body></html>";
+    String html = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>" + nodeName + " - On-Board Console</title><style>";
+    html += ":root{--bg:#0B0F17;--card:rgba(22,27,34,0.85);--border:rgba(255,255,255,0.08);--crimson:#E11D48;--green:#10B981;--blue:#38BDF8;--text:#F8FAFC;--muted:#94A3B8;}";
+    html += "* {box-sizing:border-box;margin:0;padding:0;}";
+    html += "body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:18px 16px;min-height:100vh;}";
+    html += ".container{max-width:520px;margin:0 auto;}";
+    html += ".header{display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border);}";
+    html += ".logo{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#E11D48,#9F1239);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:19px;color:#fff;box-shadow:0 4px 14px rgba(225,29,72,0.4);}";
+    html += ".card{background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:14px;box-shadow:0 8px 32px rgba(0,0,0,0.4);}";
+    html += ".node-title{font-size:20px;font-weight:800;color:#fff;}";
+    html += ".badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;}";
+    html += ".badge-act{background:rgba(16,185,129,0.15);color:var(--green);border:1px solid rgba(16,185,129,0.3);}";
+    html += ".badge-sby{background:rgba(245,158,11,0.15);color:#FBBF24;border:1px solid rgba(245,158,11,0.3);}";
+    html += ".row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;}";
+    html += ".row:last-child{border-bottom:none;} .lbl{color:var(--muted);} .val{font-family:monospace;font-weight:600;}";
+    html += "button{width:100%;padding:12px;border-radius:10px;font-size:14px;font-weight:700;margin-top:10px;cursor:pointer;border:none;transition:0.2s;}";
+    html += ".btn-on{background:linear-gradient(135deg,#10B981,#059669);color:#fff;}";
+    html += ".btn-off{background:linear-gradient(135deg,#F59E0B,#D97706);color:#fff;}";
+    html += ".btn-reboot{background:transparent;color:#EF4444;border:1px solid rgba(239,68,68,0.3);margin-top:10px;}";
+    html += ".hw-pill{background:rgba(56,189,248,0.12);color:#38BDF8;border:1px solid rgba(56,189,248,0.3);padding:3px 8px;border-radius:12px;font-size:10px;font-weight:700;}";
+    html += "</style></head><body><div class='container'>";
+    
+    // Header
+    html += "<div class='header'><div class='logo'>at</div><div style='flex:1;'>";
+    html += "<div style='display:flex;justify-content:space-between;align-items:center;'><h1 style='font-size:16px;font-weight:700;'>Anashwar Technologies</h1><span class='hw-pill'>● On-Board Server (Port 80)</span></div>";
+    html += "<p style='font-size:11px;color:var(--muted);margin-top:2px;'>Edge Node Hardware Console &bull; Connected to " + WiFi.SSID() + "</p></div></div>";
+
+    // Summary Card
+    html += "<div class='card'>";
+    html += "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;'><div class='node-title'>⚡ " + nodeName + "</div>";
+    html += "<span class='badge " + String(masterActive ? "badge-act' id='badge-state'>ACTIVE" : "badge-sby' id='badge-state'>STANDBY") + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Client</span><span class='val'>" + nodeClient + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Project</span><span class='val'>" + nodeProject + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Local IP (STA)</span><span class='val' style='color:#38BDF8;'>" + WiFi.localIP().toString() + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Connected Wi-Fi</span><span class='val' style='color:#34D399;'>" + WiFi.SSID() + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Hardware MAC</span><span class='val'>" + nodeMac + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Chip ID</span><span class='val'>" + chipIdStr + "</span></div>";
+    html += "<div class='row'><span class='lbl'>Wi-Fi Signal</span><span class='val'>" + String(WiFi.RSSI()) + " dBm</span></div>";
+    html += "<div class='row'><span class='lbl'>Free Heap RAM</span><span class='val'>" + String(ESP.getFreeHeap() / 1024) + " KB</span></div>";
+    html += "<div class='row'><span class='lbl'>Security Attestation</span><span class='val' style='color:#34D399;font-size:11px;'>" + secHash.substring(0, 16) + "...</span></div>";
+
+    // Service Toggle Form
+    html += "<form method='POST' action='/api/service'>";
+    html += "<button type='submit' class='" + String(masterActive ? "btn-off'>⏸ Put Node into STANDBY" : "btn-on'>▶ Put Node into ACTIVE") + "</button>";
+    html += "</form>";
+
+    // Reboot Form
+    html += "<form method='POST' action='/api/reboot' onsubmit='return confirm(\"Reboot this node?\");'>";
+    html += "<button type='submit' class='btn-reboot'>🔄 Reboot Hardware</button>";
+    html += "</form>";
+    html += "</div></div>";
+
+    // Auto-refresh script
+    html += "<script>setInterval(()=>{fetch('/api/status').then(r=>r.json()).then(d=>{";
+    html += "const b=document.getElementById('badge-state');if(b){b.className='badge '+(d.service?'badge-act':'badge-sby');b.innerText=d.service?'ACTIVE':'STANDBY';}";
+    html += "}).catch(()=>{});},1500);</script></body></html>";
+
     localServer.send(200, "text/html", html);
   });
 
-  localServer.on("/toggle", HTTP_POST, []() {
+  // 2. Service Toggle API
+  localServer.on("/api/service", HTTP_POST, []() {
     masterActive = !masterActive;
     publishTelemetry();
     localServer.sendHeader("Location", "/");
     localServer.send(303);
+  });
+
+  // 3. Remote Reboot API
+  localServer.on("/api/reboot", HTTP_POST, []() {
+    localServer.send(200, "text/plain", "Rebooting ESP32...");
+    delay(250);
+    ESP.restart();
+  });
+
+  // 4. JSON Status Telemetry Endpoint
+  localServer.on("/api/status", HTTP_GET, []() {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+      "{\"name\":\"%s\",\"id\":\"%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
+      "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\","
+      "\"service\":%s,\"state\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap\":%u,\"uptime\":%lu}",
+      nodeName.c_str(), ("Anashwar-" + chipIdStr).c_str(), nodeMac.c_str(), chipIdStr.c_str(),
+      nodeClient.c_str(), nodeProject.c_str(), secHash.c_str(),
+      masterActive ? "true" : "false",
+      masterActive ? "online" : "standby",
+      WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+      (unsigned int)ESP.getFreeHeap(), millis() / 1000);
+    localServer.send(200, "application/json", buf);
   });
 
   localServer.begin();
@@ -195,13 +258,12 @@ void setup() {
   snprintf(cBuf, sizeof(cBuf), "%04X%08X", (uint16_t)(mac >> 32), (uint32_t)mac);
   chipIdStr = String(cBuf);
 
-  // 2. Plug & Play Multi-AP Wi-Fi Configuration
+  // 2. Plug & Play Multi-AP Wi-Fi Configuration (VED-FI and AnashwarTech2)
   WiFi.mode(WIFI_STA);
   wifiMulti.addAP("VED-FI", "11111111");
   wifiMulti.addAP("AnashwarTech2", "At@12345");
-  wifiMulti.addAP("vedfi", "11111111");
 
-  Serial.println("\n[WiFi] Scanning for known Wi-Fi networks (VED-FI, AnashwarTech2, vedfi)...");
+  Serial.println("\n[WiFi] Scanning for known networks (VED-FI, AnashwarTech2)...");
   while (wifiMulti.run() != WL_CONNECTED) {
     delay(400);
     Serial.print(".");
@@ -210,7 +272,7 @@ void setup() {
   nodeMac = WiFi.macAddress();
   secHash = computeSecHash(nodeMac + chipIdStr + String(SECURITY_SALT));
 
-  Serial.println("\n[WiFi] Connected to: " + WiFi.SSID());
+  Serial.println("\n[WiFi] Connected to SSID: " + WiFi.SSID());
   Serial.printf("[WiFi] Local Assigned IP : %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("[SECURITY] SHA-256 Fingerprint: %s\n", secHash.c_str());
 
