@@ -1,26 +1,27 @@
 // =============================================================================
-// Minimal ESP32 Fleet Node Firmware with Embedded In-Situ Web Server (Port 80)
-// Wi-Fi: "AnashwarTech2" | Password: "At@12345"
+// Plug & Play Multi-AP ESP32 Fleet Node with Embedded In-Situ Web Server (Port 80)
+// Wi-Fi Profiles:
+//   1. "VED-FI"        / "11111111"
+//   2. "AnashwarTech2" / "At@12345"
+//   3. "vedfi"         / "11111111"
 // Portal: https://manage.anashwartech.com
 // =============================================================================
 
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
 #include <HTTPUpdate.h>
 #include <mbedtls/sha256.h>
 
-// 1. NETWORK & CLOUD BROKER CONFIGURATION
-const char* WIFI_SSID     = "AnashwarTech2";
-const char* WIFI_PASSWORD = "At@12345";
-
+// 1. CLOUD BROKER & PROTOCOL CONFIGURATION
 const char* MQTT_BROKER    = "broker.hivemq.com";
 const int   MQTT_PORT      = 1883;
 const char* TOPIC_STATUS   = "anashwar/poc/status";
 const char* TOPIC_COMMANDS = "anashwar/poc/commands";
 const char* SECURITY_SALT  = "AnashwarEnterprise2026SecureSalt";
 
-// 2. FLEET & NODE IDENTITY (Rename as needed)
+// 2. FLEET & NODE IDENTITY (Change as needed)
 String nodeName    = "Tree 1";
 String nodeClient  = "Hamley’s x Cadbury";
 String nodeProject = "Connected Edge Fleet";
@@ -30,6 +31,7 @@ String chipIdStr    = "";
 String secHash      = "";
 bool   masterActive = true;
 
+WiFiMulti    wifiMulti;
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
 WebServer    localServer(80);
@@ -97,7 +99,7 @@ void onMqttCommand(char* topic, byte* payload, unsigned int length) {
   if (cmd.indexOf("PING") >= 0) {
     publishTelemetry();
   }
-  // 2. Hardware Reboot
+  // 2. Remote Reboot
   else if (cmd.indexOf("REBOOT") >= 0) {
     delay(200);
     ESP.restart();
@@ -115,7 +117,7 @@ void onMqttCommand(char* topic, byte* payload, unsigned int length) {
     int lastCol = cmd.lastIndexOf(':');
     if (lastCol > 0) {
       String url = cmd.substring(lastCol + 1);
-      Serial.printf("[OTA] Updating from %s...\n", url.c_str());
+      Serial.printf("[OTA] Commencing update from %s...\n", url.c_str());
       WiFiClient otaClient;
       httpUpdate.update(otaClient, url);
     }
@@ -126,7 +128,6 @@ void onMqttCommand(char* topic, byte* payload, unsigned int length) {
 // IN-SITU ON-BOARD WEB SERVER (Port 80)
 // =============================================================================
 void setupWebServer() {
-  // Root Dashboard Page
   localServer.on("/", HTTP_GET, []() {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<title>" + nodeName + " - Node Console</title><style>";
@@ -140,7 +141,8 @@ void setupWebServer() {
     html += "<h1>⚡ " + nodeName + "</h1>";
     html += "<div class='row'><span>Client</span><b>" + nodeClient + "</b></div>";
     html += "<div class='row'><span>Project</span><b>" + nodeProject + "</b></div>";
-    html += "<div class='row'><span>IP Address</span><b style='color:#38BDF8;'>" + WiFi.localIP().toString() + "</b></div>";
+    html += "<div class='row'><span>Local IP</span><b style='color:#38BDF8;'>" + WiFi.localIP().toString() + "</b></div>";
+    html += "<div class='row'><span>Connected SSID</span><b>" + WiFi.SSID() + "</b></div>";
     html += "<div class='row'><span>MAC</span><b>" + nodeMac + "</b></div>";
     html += "<div class='row'><span>Wi-Fi Signal</span><b>" + String(WiFi.RSSI()) + " dBm</b></div>";
     html += "<div class='row'><span>Service State</span><b style='color:" + String(masterActive ? "#10B981'>ACTIVE" : "#F59E0B'>STANDBY") + "</b></div>";
@@ -187,17 +189,20 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // 1. Hardware Identifiers & SHA-256 Attestation
+  // 1. Silicon Hardware Identifiers & SHA-256 Attestation
   uint64_t mac = ESP.getEfuseMac();
   char cBuf[32];
   snprintf(cBuf, sizeof(cBuf), "%04X%08X", (uint16_t)(mac >> 32), (uint32_t)mac);
   chipIdStr = String(cBuf);
 
-  // 2. Wi-Fi Connection
+  // 2. Plug & Play Multi-AP Wi-Fi Configuration
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("\n[WiFi] Connecting to %s", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
+  wifiMulti.addAP("VED-FI", "11111111");
+  wifiMulti.addAP("AnashwarTech2", "At@12345");
+  wifiMulti.addAP("vedfi", "11111111");
+
+  Serial.println("\n[WiFi] Scanning for known Wi-Fi networks (VED-FI, AnashwarTech2, vedfi)...");
+  while (wifiMulti.run() != WL_CONNECTED) {
     delay(400);
     Serial.print(".");
   }
@@ -205,8 +210,8 @@ void setup() {
   nodeMac = WiFi.macAddress();
   secHash = computeSecHash(nodeMac + chipIdStr + String(SECURITY_SALT));
 
-  Serial.println("\n[WiFi] Connected!");
-  Serial.printf("[WiFi] Local IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.println("\n[WiFi] Connected to: " + WiFi.SSID());
+  Serial.printf("[WiFi] Local Assigned IP : %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("[SECURITY] SHA-256 Fingerprint: %s\n", secHash.c_str());
 
   // 3. MQTT Client
@@ -222,17 +227,13 @@ void setup() {
 // ARDUINO LOOP
 // =============================================================================
 void loop() {
-  // 1. Wi-Fi Watchdog
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long lastRetry = 0;
-    if (millis() - lastRetry >= 6000) {
-      lastRetry = millis();
-      WiFi.reconnect();
-    }
+  // 1. Plug & Play Wi-Fi Roaming Watchdog
+  if (wifiMulti.run() != WL_CONNECTED) {
+    delay(400);
     return;
   }
 
-  // 2. MQTT Client & Telemetry (Heartbeat every 5s)
+  // 2. MQTT Client & Telemetry Heartbeat (every 5 seconds)
   if (!mqtt.connected()) {
     reconnectMQTT();
   } else {
@@ -248,4 +249,3 @@ void loop() {
 
   delay(5);
 }
-

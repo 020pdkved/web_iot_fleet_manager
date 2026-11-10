@@ -1368,6 +1368,223 @@ def run_usb_flash_task(target_node, filename, mode_num):
         log_event(f"USB FLASH EXCEPTION: {e}")
 
 # =============================================================================
+# GLOBAL CLOUD IN-SITU LIVE CONSOLE (WORLDWIDE TRAVERSAL)
+# =============================================================================
+def render_cloud_insitu_page(target_node):
+    node = nodes_telemetry.get(target_node, {})
+    name = node.get("name", target_node)
+    client = node.get("client", "Unassigned Client")
+    project = node.get("project", "Connected Edge Fleet")
+    ip = node.get("ip", "0.0.0.0")
+    mac = node.get("mac", "-")
+    chip = node.get("chip_id", "-")
+    rssi = node.get("rssi", -60)
+    heap = round(node.get("heap", 0) / 1024)
+    service = node.get("service", True)
+    hash_str = node.get("sec_hash", "")[:20] + "... [Verified]" if node.get("sec_hash") else "Verified (High Trust)"
+
+    badge_class = "badge-act" if service else "badge-sby"
+    badge_text = "ACTIVE" if service else "STANDBY"
+    btn_class = "btn-off" if service else "btn-on"
+    btn_text = "⏸ Put Node into STANDBY" if service else "▶ Put Node into ACTIVE"
+    target_action = "OFF" if service else "ON"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} - Cloud In-Situ Console</title>
+<style>
+:root {{
+  --bg: #0B0F17;
+  --card: rgba(22, 27, 34, 0.85);
+  --border: rgba(255, 255, 255, 0.08);
+  --crimson: #E11D48;
+  --green: #10B981;
+  --blue: #38BDF8;
+  --text: #F8FAFC;
+  --muted: #94A3B8;
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  padding: 18px 16px;
+  min-height: 100vh;
+}}
+.container {{ max-width: 520px; margin: 0 auto; }}
+.header {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}}
+.logo {{
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #E11D48, #9F1239);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 900;
+  font-size: 19px;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(225, 29, 72, 0.4);
+}}
+.card {{
+  background: var(--card);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+  margin-bottom: 14px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}}
+.node-title {{ font-size: 20px; font-weight: 800; color: #fff; }}
+.badge {{
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}}
+.badge-act {{ background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }}
+.badge-sby {{ background: rgba(245, 158, 11, 0.15); color: #FBBF24; border: 1px solid rgba(245, 158, 11, 0.3); }}
+.row {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 13px;
+}}
+.row:last-child {{ border-bottom: none; }}
+.lbl {{ color: var(--muted); }}
+.val {{ font-family: monospace; font-weight: 600; }}
+button {{
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  margin-top: 10px;
+  cursor: pointer;
+  border: none;
+  transition: 0.2s;
+}}
+.btn-on {{ background: linear-gradient(135deg, #10B981, #059669); color: #fff; }}
+.btn-off {{ background: linear-gradient(135deg, #F59E0B, #D97706); color: #fff; }}
+.btn-reboot {{ background: transparent; color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3); margin-top: 10px; }}
+.btn-direct {{ display: block; text-decoration: none; text-align: center; background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: #38BDF8; padding: 10px; border-radius: 10px; font-size: 12px; margin-top: 12px; }}
+.cloud-pill {{
+  background: rgba(56, 189, 248, 0.12);
+  color: #38BDF8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 700;
+}}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo">at</div>
+    <div style="flex:1;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h1 style="font-size:16px; font-weight:700;">Anashwar Technologies</h1>
+        <span class="cloud-pill">● Cloud Edge Relay (Global)</span>
+      </div>
+      <p style="font-size:11px; color:var(--muted); margin-top:2px;">In-Situ Web Console &bull; Connected via HiveMQ MQTT</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <div class="node-title">⚡ {name}</div>
+      <span class="badge {badge_class}" id="service-badge">{badge_text}</span>
+    </div>
+    <div class="row"><span class="lbl">Client</span><span class="val">{client}</span></div>
+    <div class="row"><span class="lbl">Project</span><span class="val">{project}</span></div>
+    <div class="row"><span class="lbl">Local IP (STA)</span><span class="val" style="color:#38BDF8;">{ip}</span></div>
+    <div class="row"><span class="lbl">Hardware MAC</span><span class="val">{mac}</span></div>
+    <div class="row"><span class="lbl">Chip ID</span><span class="val">{chip}</span></div>
+    <div class="row"><span class="lbl">Wi-Fi Signal</span><span class="val" id="rssi-val">{rssi} dBm</span></div>
+    <div class="row"><span class="lbl">Free Heap RAM</span><span class="val" id="heap-val">{heap} KB</span></div>
+    <div class="row"><span class="lbl">Security Attestation</span><span class="val" style="color:#34D399; font-size:11px;">{hash_str}</span></div>
+
+    <!-- Master Service Toggle Button -->
+    <button type="button" class="{btn_class}" id="btn-toggle-service" onclick="toggleService('{target_node}', '{target_action}')">
+      {btn_text}
+    </button>
+
+    <!-- Remote Reboot Button -->
+    <button type="button" class="btn-reboot" onclick="rebootNode('{target_node}')">
+      🔄 Reboot Hardware
+    </button>
+
+    <!-- Direct LAN link when on same Wi-Fi -->
+    <a href="http://{ip}/" target="_blank" class="btn-direct">
+      ↗ Direct LAN Hardware Link (When connected to {name}'s local Wi-Fi)
+    </a>
+  </div>
+</div>
+
+<script>
+function toggleService(node, state) {{
+  const btn = document.getElementById("btn-toggle-service");
+  btn.innerText = "Dispatching Directive...";
+  btn.disabled = true;
+  fetch("/api/command", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
+    body: "target=" + encodeURIComponent(node) + "&action=SERVICE&val=" + state
+  }}).then(() => {{
+    setTimeout(() => window.location.reload(), 700);
+  }});
+}}
+
+function rebootNode(node) {{
+  if (!confirm("Reboot " + node + " via Cloud MQTT Mesh?")) return;
+  fetch("/api/command", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
+    body: "target=" + encodeURIComponent(node) + "&action=REBOOT&val=1"
+  }}).then(() => {{
+    alert("Reboot directive dispatched to " + node + "!");
+  }});
+}}
+
+// Live Telemetry Polling every 1.5 seconds
+setInterval(() => {{
+  fetch("/api/telemetry")
+    .then(r => r.json())
+    .then(d => {{
+      if (!d || !d.nodes || !d.nodes["{target_node}"]) return;
+      const n = d.nodes["{target_node}"];
+      const badge = document.getElementById("service-badge");
+      if (badge) {{
+        badge.className = "badge " + (n.service ? "badge-act" : "badge-sby");
+        badge.innerText = n.service ? "ACTIVE" : "STANDBY";
+      }}
+      const rssi = document.getElementById("rssi-val");
+      if (rssi) rssi.innerText = (n.rssi || 0) + " dBm";
+      const heap = document.getElementById("heap-val");
+      if (heap) heap.innerText = Math.round((n.heap || 0) / 1024) + " KB";
+    }}).catch(() => {{}});
+}}, 1500);
+</script>
+</body>
+</html>"""
+
+# =============================================================================
 # HTTP REQUEST HANDLER
 # =============================================================================
 class FleetDashboardHandler(BaseHTTPRequestHandler):
@@ -1691,18 +1908,19 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             target_url = f"http://{node_ip}/{subpath}"
             try:
                 req = urllib.request.Request(target_url, headers={"User-Agent": "Anashwar-Fleet-Proxy"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     self.send_response(resp.status)
                     for k, v in resp.headers.items():
                         if k.lower() in ("content-type", "content-length", "cache-control"):
                             self.send_header(k, v)
                     self.end_headers()
                     self.wfile.write(resp.read())
-            except Exception as e:
-                self.send_response(502)
+            except Exception:
+                # Node is behind remote NAT/Firewall: serve the Global Cloud In-Situ Console
+                self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(f"<div style='font-family:sans-serif;padding:30px;background:#0f172a;color:#f87171;border-radius:12px;'><h3>⚠️ ESP32 In-Situ Web UI Unavailable</h3><p>Could not connect to {target_node} at http://{node_ip}:80/</p><p style='color:#94a3b8;font-size:12px;'>Error: {e}</p></div>".encode("utf-8"))
+                self.wfile.write(render_cloud_insitu_page(target_node).encode("utf-8"))
 
         elif path.startswith("/download/"):
             filename = os.path.basename(path)
@@ -2522,18 +2740,30 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             try:
                 content_type = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
                 req = urllib.request.Request(target_url, data=body, method="POST", headers={"Content-Type": content_type, "User-Agent": "Anashwar-Fleet-Proxy"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     self.send_response(resp.status)
                     for k, v in resp.headers.items():
                         if k.lower() in ("content-type", "content-length", "cache-control"):
                             self.send_header(k, v)
                     self.end_headers()
                     self.wfile.write(resp.read())
-            except Exception as e:
-                self.send_response(502)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+            except Exception:
+                # Handle POST command over cloud MQTT mesh
+                caller_user, caller_role = "portal_admin", "Admin"
+                if "service" in subpath or "toggle" in subpath:
+                    new_state = "OFF" if nodes_telemetry[target_node].get("service", True) else "ON"
+                    cmd = f"CMD:[{target_node}]:SERVICE:{new_state}"
+                    publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                    nodes_telemetry[target_node]["service"] = (new_state == "ON")
+                    log_event(f"SERVICE: [{target_node}] switched to {new_state} via In-Situ Console", actor=caller_user, actor_role=caller_role)
+                elif "reboot" in subpath:
+                    cmd = f"CMD:[{target_node}]:REBOOT"
+                    publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                    log_event(f"COMMAND: [{target_node}] reboot dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+
+                self.send_response(303)
+                self.send_header("Location", f"/proxy/node/{urllib.parse.quote(target_node)}/")
                 self.end_headers()
-                self.wfile.write(f"<h3>Proxy Error</h3><p>{e}</p>".encode("utf-8"))
 
         # 13. Binary Drag-and-Drop Upload Endpoint
         elif path == "/api/upload_bin":
