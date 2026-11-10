@@ -1385,6 +1385,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             user, token = get_authenticated_user(self.headers, parsed)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Permissions-Policy", "publickey-credentials-create=*, publickey-credentials-get=*")
             if token:
                 self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=604800")
             self.end_headers()
@@ -2184,10 +2185,30 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             }
             save_users()
             log_event(f"AUTH: User '{new_u}' ({role}) registered by '{user}'", actor=user, actor_role=caller_role)
+
+            resp_payload = {"success": True}
+            if data.get("enroll_bio", ["0"])[0] == "1":
+                challenge = secrets.token_urlsafe(32)
+                webauthn_challenges[new_u] = {"challenge": challenge, "ts": time.time()}
+                host_header = self.headers.get("Host", "localhost").split(":")[0]
+                resp_payload["bio_options"] = {
+                    "challenge": challenge,
+                    "rp": {"name": "Anashwar Technologies Fleet Portal", "id": host_header},
+                    "user": {"id": hashlib.sha256(new_u.encode("utf-8")).hexdigest()[:16], "name": new_u, "displayName": f"{new_u} ({role})"},
+                    "pubKeyCredParams": [{"type": "public-key", "alg": -7}, {"type": "public-key", "alg": -257}, {"type": "public-key", "alg": -8}],
+                    "authenticatorSelection": {
+                        "userVerification": "preferred",
+                        "residentKey": "preferred"
+                    },
+                    "timeout": 60000
+                }
+                resp_payload["challenge"] = challenge
+                resp_payload["target_user"] = new_u
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            self.wfile.write(json.dumps(resp_payload).encode("utf-8"))
 
         # 10. User Management: Delete User with Strict RBAC & Self-Deletion
         elif path == "/api/users/delete":
@@ -2732,6 +2753,10 @@ def render_login_html():
   </style>
 </head>
 <body>
+  <div id="iframe-breakout-banner" style="display: none; background: #B91C1C; color: #FFF; padding: 12px 16px; font-size: 13px; text-align: center; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; z-index: 99999; position: relative;">
+    <span>⚠️ You are viewing inside an embedded in-app frame. For Fingerprint & Face ID login, open directly in browser:</span>
+    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome ↗</button>
+  </div>
   <div class="ambient-glow-1"></div>
   <div class="ambient-glow-2"></div>
 
@@ -2951,7 +2976,9 @@ def render_login_html():
           bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
         }
       } catch (err) {
-        if (err.name === "NotAllowedError") {
+        if (window.self !== window.top) {
+          errBox.innerText = "Embedded in-app frame restriction: WebAuthn biometrics cannot run inside an embedded webview or iframe. Please tap the top button to open directly in Google Chrome / Safari.";
+        } else if (err.name === "NotAllowedError") {
           errBox.innerText = "Biometric prompt was dismissed or timed out.";
         } else {
           errBox.innerText = err.message || "Biometric scan was cancelled or timed out.";
@@ -2960,6 +2987,11 @@ def render_login_html():
         bioBtn.disabled = false;
         bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
       }
+    }
+
+    if (window.self !== window.top) {
+      const banner = document.getElementById("iframe-breakout-banner");
+      if (banner) banner.style.display = "flex";
     }
   </script>
 </body>
@@ -4070,6 +4102,10 @@ def render_fleet_html(current_user="admin", token=""):
   </style>
 </head>
 <body>
+  <div id="iframe-breakout-banner" style="display: none; background: #B91C1C; color: #FFF; padding: 12px 16px; font-size: 13px; text-align: center; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; z-index: 99999; position: relative;">
+    <span>⚠️ You are viewing inside an embedded in-app frame. For Fingerprint & Face ID biometrics, open directly in browser:</span>
+    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome ↗</button>
+  </div>
 
   <!-- Left Sidebar -->
   <aside class="sidebar">
@@ -5167,10 +5203,11 @@ def render_fleet_html(current_user="admin", token=""):
       }
 
       try {
+        const enrollBioFlag = enrollBiometricsAfter ? "1" : "0";
         const res = await authedFetch("/api/users/create", {
           method: "POST",
           headers: {"Content-Type": "application/x-www-form-urlencoded"},
-          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}`
+          body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}&enroll_bio=${enrollBioFlag}`
         });
         const data = await res.json();
         if (!data.success) {
@@ -5181,16 +5218,16 @@ def render_fleet_html(current_user="admin", token=""):
         document.getElementById("new-user-username").value = "";
         document.getElementById("new-user-password").value = "";
         document.getElementById("new-user-confirm-password").value = "";
-        await loadUsersList();
 
-        if (enrollBiometricsAfter) {
-          const bioOk = await enrollBiometricsForUser(u);
+        if (enrollBiometricsAfter && data.bio_options) {
+          // Immediately invoke navigator.credentials.create with fresh user gesture token!
+          const bioOk = await enrollBiometricsForUser(u, data.bio_options);
+          await loadUsersList();
           if (bioOk) {
-            alert(`✓ User '${u}' registered and device biometric authentication linked successfully!`);
-          } else {
-            alert(`✓ User '${u}' registered! (Biometric enrollment was skipped or timed out; you can enroll anytime under Users & Access)`);
+            alert(`✓ User '${u}' registered and device biometric authentication linked successfully!\nYou can now use Biometric Login.`);
           }
         } else {
+          await loadUsersList();
           alert(`✓ User '${u}' (${r}) registered successfully!`);
         }
       } catch(err) {
@@ -5236,7 +5273,7 @@ def render_fleet_html(current_user="admin", token=""):
       }
     }
 
-    async function enrollBiometricsForUser(targetUser) {
+    async function enrollBiometricsForUser(targetUser, preloadedOpts = null) {
       if (!window.isSecureContext && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
         alert("Biometric enrollment (WebAuthn) requires a secure HTTPS connection (or localhost). Please access the portal using HTTPS.");
         return false;
@@ -5246,16 +5283,19 @@ def render_fleet_html(current_user="admin", token=""):
         return false;
       }
       try {
-        const res = await authedFetch("/api/webauthn/register/options", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ username: targetUser })
-        });
-        const data = await res.json();
-        const opts = data.options || data;
-        if (!opts || !opts.challenge) {
-          alert("Failed to initialize biometric challenge from server: " + (data.error || "No challenge"));
-          return false;
+        let opts = preloadedOpts;
+        if (!opts) {
+          const res = await authedFetch("/api/webauthn/register/options", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username: targetUser })
+          });
+          const data = await res.json();
+          opts = data.options || data;
+          if (!opts || !opts.challenge) {
+            alert("Failed to initialize biometric challenge from server: " + (data.error || "No challenge"));
+            return false;
+          }
         }
 
         opts.rp = opts.rp || {};
@@ -5281,19 +5321,6 @@ def render_fleet_html(current_user="admin", token=""):
         opts.authenticatorSelection = opts.authenticatorSelection || {};
         opts.authenticatorSelection.userVerification = "preferred";
         opts.authenticatorSelection.residentKey = "preferred";
-
-        if (window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
-          try {
-            const hasPlatform = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-            if (hasPlatform) {
-              opts.authenticatorSelection.authenticatorAttachment = "platform";
-            } else {
-              delete opts.authenticatorSelection.authenticatorAttachment;
-            }
-          } catch(e) {
-            delete opts.authenticatorSelection.authenticatorAttachment;
-          }
-        }
 
         // Prompt native device fingerprint (Samsung S24 Ultra) or Face ID (Apple)
         const credential = await navigator.credentials.create({ publicKey: opts });
@@ -5327,11 +5354,13 @@ def render_fleet_html(current_user="admin", token=""):
         }
       } catch(e) {
         console.error("Biometrics error:", e);
-        if (e.name === "NotAllowedError") {
-          alert("Biometric scan was dismissed or timed out. Please try again when ready.");
-        } else {
-          alert("Biometric scanner notice: " + (e.message || e));
+        let detail = e.message || e.name || "Operation failed";
+        if (window.self !== window.top) {
+          detail = "Embedded in-app frame restriction: WebAuthn biometrics cannot run inside an embedded webview or iframe. Please tap 'Open in Browser' at the top of the screen to open directly in Google Chrome / Safari.";
+        } else if (e.name === "NotAllowedError") {
+          detail = "Biometric prompt was dismissed, timed out, or cancelled on the device. Please tap 'Enroll Biometrics' and scan your fingerprint when prompted.";
         }
+        alert("Biometric scanner notice: " + detail);
         return false;
       }
     }
@@ -6190,6 +6219,11 @@ def render_fleet_html(current_user="admin", token=""):
     // Polling interval (2s cadence prevents screen repainting/flickering)
     fetchTelemetry();
     setInterval(fetchTelemetry, 2000);
+
+    if (window.self !== window.top) {
+      const banner = document.getElementById("iframe-breakout-banner");
+      if (banner) banner.style.display = "flex";
+    }
   </script>
 </body>
 </html>
