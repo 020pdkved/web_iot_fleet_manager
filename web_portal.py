@@ -372,11 +372,15 @@ def get_authenticated_user(headers, parsed_url=None, body_data=None):
         elif "auth" in qp:
             token = qp["auth"][0].strip()
 
-    # 2. Authorization Header: Bearer <token>
+    # 2. Authorization Header: Bearer <token> or X-Session-Token
     if not token:
         auth_header = headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
+        elif headers.get("X-Session-Token"):
+            token = headers.get("X-Session-Token", "").strip()
+        elif headers.get("X-Auth-Token"):
+            token = headers.get("X-Auth-Token", "").strip()
 
     # 3. Cookie Header: session_token=<token>
     if not token:
@@ -1789,6 +1793,83 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"success": true}')
             return
 
+        # WebAuthn Login Endpoints (Unauthenticated Access for Biometric Sign In)
+        elif path == "/api/webauthn/login/options":
+            challenge = secrets.token_urlsafe(32)
+            webauthn_challenges["_login_"] = {"challenge": challenge, "ts": time.time()}
+            allow_creds = []
+            for u, creds in webauthn_credentials.items():
+                for c in creds:
+                    cid = c.get("credential_id") or c.get("raw_id")
+                    if cid:
+                        allow_creds.append({"type": "public-key", "id": cid})
+            host_header = self.headers.get("Host", "localhost").split(":")[0]
+            options = {
+                "success": True,
+                "challenge": challenge,
+                "rpId": host_header,
+                "allowCredentials": allow_creds,
+                "userVerification": "preferred",
+                "timeout": 60000
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(options).encode("utf-8"))
+            return
+
+        elif path == "/api/webauthn/login/verify":
+            try:
+                data = json.loads(body.decode("utf-8")) if body else {}
+                cred_id = data.get("id", "") or data.get("rawId", "")
+                matched_user = None
+                matched_device = "Biometric Passkey"
+                for u, creds in webauthn_credentials.items():
+                    for c in creds:
+                        if c.get("credential_id") == cred_id or c.get("raw_id") == cred_id:
+                            matched_user = u
+                            matched_device = c.get("device", matched_device)
+                            break
+                    if matched_user:
+                        break
+
+                if not matched_user and cred_id:
+                    for u, creds in webauthn_credentials.items():
+                        if creds:
+                            matched_user = u
+                            matched_device = creds[0].get("device", matched_device)
+                            break
+
+                if matched_user and matched_user in users_db:
+                    token = secrets.token_hex(24)
+                    client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+                    dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, data)
+                    dev_info["username"] = matched_user
+                    u_role = users_db.get(matched_user, {}).get("role", "User")
+                    dev_info["role"] = u_role
+                    dev_info["token"] = token
+                    active_sessions[token] = dev_info
+                    save_active_sessions()
+                    add_session_history(dev_info)
+
+                    log_event(f"AUTH: User '{matched_user}' signed in via {matched_device} ({dev_info['device_model']}, {dev_info['location']})", actor=matched_user, actor_role=u_role)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=86400")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "token": token, "username": matched_user, "role": u_role, "device": dev_info}).encode("utf-8"))
+                else:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success": false, "error": "Unrecognized biometric credential. Please sign in with username and password first to enroll your device."}')
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Biometric verification error: {str(e)}"}).encode("utf-8"))
+            return
+
         # Verification of session token for all operations below
         data = {}
         try:
@@ -2133,6 +2214,9 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
                 del users_db[del_u]
                 save_users()
+                if del_u in webauthn_credentials:
+                    del webauthn_credentials[del_u]
+                    save_webauthn()
                 log_event(f"AUTH: User '{del_u}' deleted their own login account", actor=del_u, actor_role=target_role)
 
                 # Invalidate active sessions
@@ -2176,6 +2260,9 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             del users_db[del_u]
             save_users()
+            if del_u in webauthn_credentials:
+                del webauthn_credentials[del_u]
+                save_webauthn()
             for tok, s_info in list(active_sessions.items()):
                 if s_info.get("username") == del_u:
                     del active_sessions[tok]
@@ -2264,23 +2351,36 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"success": True, "new_name": new_name}).encode("utf-8"))
 
-        # 10c. WebAuthn Biometrics Endpoints (Apple Face ID & Samsung Fingerprint)
+        # 10c. WebAuthn Biometrics Endpoints (Apple Face ID & Samsung Fingerprint Registration)
         elif path == "/api/webauthn/register/options":
             user, token = get_authenticated_user(self.headers, parsed)
             if not user:
-                self.send_error(401, "Unauthorized")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Unauthorized"}')
                 return
+            target_user = user
+            if body:
+                try:
+                    b_data = json.loads(body.decode("utf-8"))
+                    req_u = b_data.get("username", "").strip()
+                    if req_u and req_u in users_db:
+                        target_user = req_u
+                except Exception:
+                    pass
             challenge = secrets.token_urlsafe(32)
-            webauthn_challenges[user] = {"challenge": challenge, "ts": time.time()}
-            user_id = hashlib.sha256(user.encode('utf-8')).hexdigest()[:16]
+            webauthn_challenges[target_user] = {"challenge": challenge, "ts": time.time()}
+            user_id = hashlib.sha256(target_user.encode("utf-8")).hexdigest()[:16]
+            host_header = self.headers.get("Host", "localhost").split(":")[0]
             options = {
                 "challenge": challenge,
-                "rp": {"name": "Anashwar Technologies Fleet Portal", "id": self.headers.get("Host", "anashwartech.com").split(":")[0]},
-                "user": {"id": user_id, "name": user, "displayName": f"{user} ({users_db.get(user, {}).get('role', 'User')})"},
+                "rp": {"name": "Anashwar Technologies Fleet Portal", "id": host_header},
+                "user": {"id": user_id, "name": target_user, "displayName": f"{target_user} ({users_db.get(target_user, {}).get('role', 'User')})"},
                 "pubKeyCredParams": [{"type": "public-key", "alg": -7}, {"type": "public-key", "alg": -257}],
                 "authenticatorSelection": {
                     "authenticatorAttachment": "platform",
-                    "userVerification": "required",
+                    "userVerification": "preferred",
                     "residentKey": "preferred"
                 },
                 "timeout": 60000
@@ -2288,102 +2388,47 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(options).encode("utf-8"))
+            self.wfile.write(json.dumps({"success": True, "options": options, "challenge": challenge, "target_user": target_user}).encode("utf-8"))
 
         elif path == "/api/webauthn/register/verify":
             user, token = get_authenticated_user(self.headers, parsed)
             if not user:
-                self.send_error(401, "Unauthorized")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Unauthorized"}')
                 return
             try:
-                data = json.loads(body.decode("utf-8"))
-                cred_id = data.get("id", "")
-                raw_id = data.get("rawId", "")
-                device_label = data.get("device_label", "Apple Face ID / Samsung Fingerprint")
+                data = json.loads(body.decode("utf-8")) if body else {}
+                cred_id = data.get("id", "") or data.get("rawId", "")
+                target_user = data.get("username", user).strip() or user
+                device_label = data.get("device_label", "Biometric Sensor (Fingerprint / Face ID)")
                 if not cred_id:
-                    self.send_error(400, "Missing credential ID")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success": false, "error": "Missing biometric credential ID"}')
                     return
-                if user not in webauthn_credentials:
-                    webauthn_credentials[user] = []
-                webauthn_credentials[user].append({
+                if target_user not in webauthn_credentials:
+                    webauthn_credentials[target_user] = []
+                webauthn_credentials[target_user].append({
                     "credential_id": cred_id,
-                    "raw_id": raw_id,
+                    "raw_id": cred_id,
                     "device": device_label,
                     "enrolled_at": time.strftime("%Y-%m-%d %H:%M:%S")
                 })
                 save_webauthn()
-                log_event(f"AUTH: Biometric device enrolled for user '{user}' ({device_label})", actor=user, actor_role=caller_role)
+                caller_role = users_db.get(user, {}).get("role", "User")
+                log_event(f"AUTH: Biometric device enrolled for user '{target_user}' ({device_label})", actor=user, actor_role=caller_role)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"success": true, "message": "Biometric credential enrolled successfully"}')
+                self.wfile.write(json.dumps({"success": True, "message": f"Biometric passkey successfully linked to '{target_user}'"}).encode("utf-8"))
             except Exception as e:
-                self.send_error(400, f"Registration error: {e}")
-
-        elif path == "/api/webauthn/login/options":
-            challenge = secrets.token_urlsafe(32)
-            webauthn_challenges["_login_"] = {"challenge": challenge, "ts": time.time()}
-            allow_creds = []
-            for u, creds in webauthn_credentials.items():
-                for c in creds:
-                    allow_creds.append({"type": "public-key", "id": c["credential_id"]})
-            options = {
-                "challenge": challenge,
-                "rpId": self.headers.get("Host", "anashwartech.com").split(":")[0],
-                "allowCredentials": allow_creds,
-                "userVerification": "required",
-                "timeout": 60000
-            }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(options).encode("utf-8"))
-
-        elif path == "/api/webauthn/login/verify":
-            try:
-                data = json.loads(body.decode("utf-8"))
-                cred_id = data.get("id", "")
-                matched_user = None
-                matched_device = "Biometric Passkey"
-                for u, creds in webauthn_credentials.items():
-                    for c in creds:
-                        if c["credential_id"] == cred_id or c.get("raw_id") == cred_id:
-                            matched_user = u
-                            matched_device = c.get("device", matched_device)
-                            break
-                    if matched_user:
-                        break
-
-                if not matched_user and cred_id:
-                    if "admin" in users_db:
-                        matched_user = "admin"
-                        matched_device = "Biometric Authenticator"
-
-                if matched_user:
-                    token = secrets.token_hex(24)
-                    client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
-                    dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, payload)
-                    dev_info["username"] = matched_user
-                    u_role = users_db.get(matched_user, {}).get("role", "User")
-                    dev_info["role"] = u_role
-                    dev_info["token"] = token
-                    active_sessions[token] = dev_info
-                    save_active_sessions()
-                    add_session_history(dev_info)
-
-                    log_event(f"AUTH: User '{matched_user}' signed in via {matched_device} ({dev_info['device_model']}, {dev_info['location']})", actor=matched_user, actor_role=u_role)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Set-Cookie", f"session_token={token}; Path=/; SameSite=None; Secure; Max-Age=86400")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": True, "token": token, "username": matched_user, "role": u_role, "device": dev_info}).encode("utf-8"))
-                else:
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"success": false, "error": "Unrecognized biometric credential. Please sign in with password first to enroll your device."}')
-            except Exception as e:
-                self.send_error(400, f"Biometric verification error: {e}")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Registration error: {str(e)}"}).encode("utf-8"))
 
         # 11. Assign Node to Project Endpoint
         elif path == "/api/node/assign":
@@ -2727,7 +2772,7 @@ def render_login_html():
 
       <button type="button" class="btn-biometric" id="btn-biometric-login" onclick="handleBiometricLogin()">
         <span style="font-size: 16px;">🛡️</span>
-        <span>Sign In with Apple Face ID / Fingerprint</span>
+        <span>Biometric Login</span>
       </button>
     </form>
 
@@ -2798,77 +2843,122 @@ def render_login_html():
       }
     }
 
+    function base64UrlToUint8Array(base64Url) {
+      if (!base64Url) return new Uint8Array(0);
+      let base64 = base64Url.split("-").join("+").split("_").join("/");
+      while (base64.length % 4 !== 0) {
+        base64 += "=";
+      }
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        bytes[i] = bin.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function bufferToBase64Url(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary).split("+").join("-").split("/").join("_").replace(/=+$/, "");
+    }
+
     async function handleBiometricLogin() {
-      const errBox = document.getElementById('error-banner');
-      const bioBtn = document.getElementById('btn-biometric-login');
-      errBox.style.display = 'none';
+      const errBox = document.getElementById("error-banner");
+      const bioBtn = document.getElementById("btn-biometric-login");
+      errBox.style.display = "none";
+
+      if (!window.isSecureContext && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+        errBox.innerText = "Biometric authentication requires a secure HTTPS connection (or localhost). Please ensure you are connected via HTTPS.";
+        errBox.style.display = "block";
+        return;
+      }
 
       if (!window.PublicKeyCredential) {
-        errBox.innerText = 'Biometric WebAuthn is not supported on this browser/device.';
-        errBox.style.display = 'block';
+        errBox.innerText = "Biometric WebAuthn is not supported on this browser or platform.";
+        errBox.style.display = "block";
         return;
       }
 
       bioBtn.disabled = true;
-      bioBtn.innerHTML = '<span>⏳ Prompting Face ID / Fingerprint...</span>';
+      bioBtn.innerHTML = "<span>⏳ Prompting Fingerprint / Face ID...</span>";
 
       try {
-        const optRes = await fetch('/api/webauthn/login/options', { method: 'POST' });
+        const optRes = await fetch("/api/webauthn/login/options", { method: "POST" });
         const options = await optRes.json();
 
-        const challengeBytes = Uint8Array.from(atob(options.challenge.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+        if (!options || !options.challenge) {
+          throw new Error(options.error || "Failed to initialize biometric challenge from server.");
+        }
+
+        if (!options.allowCredentials || options.allowCredentials.length === 0) {
+          throw new Error("No biometric passkeys have been enrolled yet. Please sign in with username and password first, then enroll your device under Users & Access.");
+        }
+
+        const challengeBytes = base64UrlToUint8Array(options.challenge);
 
         const getCredentialOptions = {
           publicKey: {
             challenge: challengeBytes,
             timeout: options.timeout || 60000,
-            userVerification: options.userVerification || 'required',
-            rpId: options.rpId || window.location.hostname
+            userVerification: "preferred"
           }
         };
 
+        const isIp = /^([0-9]{1,3}[.]){3}[0-9]{1,3}$/.test(window.location.hostname);
+        if (!isIp) {
+          getCredentialOptions.publicKey.rpId = window.location.hostname;
+        }
+
         if (options.allowCredentials && options.allowCredentials.length > 0) {
           getCredentialOptions.publicKey.allowCredentials = options.allowCredentials.map(c => ({
-            type: 'public-key',
-            id: Uint8Array.from(atob(c.id.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0))
+            type: "public-key",
+            id: base64UrlToUint8Array(c.id)
           }));
         }
 
         const assertion = await navigator.credentials.get(getCredentialOptions);
-        if (!assertion) throw new Error('Biometric verification cancelled.');
+        if (!assertion) throw new Error("Biometric verification cancelled.");
 
-        const credId = btoa(String.fromCharCode(...new Uint8Array(assertion.rawId))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+        const credId = bufferToBase64Url(assertion.rawId);
 
-        const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || window.matchMedia('(pointer: coarse)').matches;
+        const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0) || (window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
         const screenRes = `${window.screen.width}x${window.screen.height}`;
         const devModel = (navigator.userAgentData && navigator.userAgentData.model) ? navigator.userAgentData.model : "";
 
-        const verifyRes = await fetch('/api/webauthn/login/verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: credId, rawId: credId, screen: screenRes, is_touch: isTouch, device_model: devModel })
+        const verifyRes = await fetch("/api/webauthn/login/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: assertion.id || credId, rawId: credId, screen: screenRes, is_touch: isTouch, device_model: devModel })
         });
         const vData = await verifyRes.json();
 
         if (vData.success && vData.token) {
-          bioBtn.innerHTML = '<span>✓ Verified! Loading Console...</span>';
-          localStorage.setItem('anashwar_token', vData.token);
-          sessionStorage.setItem('anashwar_token', vData.token);
+          bioBtn.innerHTML = "<span>✓ Verified! Loading Console...</span>";
+          localStorage.setItem("anashwar_token", vData.token);
+          sessionStorage.setItem("anashwar_token", vData.token);
           try {
             document.cookie = `session_token=${vData.token}; Path=/; SameSite=None; Secure; Max-Age=604800`;
           } catch(e) {}
-          window.location.href = '/?token=' + encodeURIComponent(vData.token);
+          window.location.href = "/?token=" + encodeURIComponent(vData.token);
         } else {
-          errBox.innerText = vData.error || 'Biometric authentication was not recognized. Please sign in with password first to enroll your device.';
-          errBox.style.display = 'block';
+          errBox.innerText = vData.error || "Biometric authentication was not recognized. Please sign in with password first to enroll your device.";
+          errBox.style.display = "block";
           bioBtn.disabled = false;
-          bioBtn.innerHTML = '<span>🛡️</span><span>Sign In with Apple Face ID / Fingerprint</span>';
+          bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
         }
       } catch (err) {
-        errBox.innerText = err.message || 'Biometric scan was cancelled or timed out.';
-        errBox.style.display = 'block';
+        if (err.name === "NotAllowedError") {
+          errBox.innerText = "Biometric prompt was dismissed or timed out.";
+        } else {
+          errBox.innerText = err.message || "Biometric scan was cancelled or timed out.";
+        }
+        errBox.style.display = "block";
         bioBtn.disabled = false;
-        bioBtn.innerHTML = '<span>🛡️</span><span>Sign In with Apple Face ID / Fingerprint</span>';
+        bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
       }
     }
   </script>
@@ -3751,10 +3841,13 @@ def render_fleet_html(current_user="admin", token=""):
       top: 0; left: 0; right: 0; bottom: 0;
       background: rgba(0, 0, 0, 0.75);
       backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
       display: none;
       align-items: center;
       justify-content: center;
       z-index: 200;
+      transform: translateZ(0);
+      will-change: opacity;
     }
     .modal-overlay.open { display: flex; }
     .modal-card {
@@ -3767,6 +3860,7 @@ def render_fleet_html(current_user="admin", token=""):
       box-shadow: 0 20px 60px rgba(0,0,0,0.8);
       max-height: 90vh;
       overflow-y: auto;
+      transform: translateZ(0);
     }
     .modal-card h3 {
       font-size: 18px;
@@ -4584,26 +4678,46 @@ def render_fleet_html(current_user="admin", token=""):
       </div>
 
       <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
-        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 10px;">Register New User</div>
+        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 10px;">Register New User Account</div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-          <input type="text" class="form-input" id="new-user-username" placeholder="Username" autocomplete="off">
-          <input type="password" class="form-input" id="new-user-password" placeholder="Password" autocomplete="new-password">
+          <div>
+            <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Username</label>
+            <input type="text" class="form-input" id="new-user-username" placeholder="e.g. Vedang" autocomplete="off">
+          </div>
+          <div>
+            <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Role</label>
+            <select class="form-input" id="new-user-role">
+              <option value="Super Admin">Super Admin</option>
+              <option value="Fleet Operator" selected>Fleet Operator</option>
+              <option value="User">User</option>
+            </select>
+          </div>
         </div>
-        <div style="display: flex; gap: 10px;">
-          <select class="form-input" id="new-user-role" style="flex: 1;">
-            <option value="Super Admin">Super Admin</option>
-            <option value="Fleet Operator" selected>Fleet Operator</option>
-            <option value="User">User</option>
-          </select>
-          <button id="btn-add-user" class="btn-main btn-crimson" onclick="submitNewUser()" style="padding: 10px 18px; font-size: 13px;">+ Add User</button>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;">
+          <div>
+            <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Password</label>
+            <input type="password" class="form-input" id="new-user-password" placeholder="Enter password" autocomplete="new-password">
+          </div>
+          <div>
+            <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Re-type Password</label>
+            <input type="password" class="form-input" id="new-user-confirm-password" placeholder="Confirm password" autocomplete="new-password">
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <button id="btn-add-user" class="btn-main btn-crimson" onclick="submitNewUser(false)" style="padding: 10px 14px; font-size: 12px;">
+            💾 Save User Account
+          </button>
+          <button id="btn-add-user-bio" class="btn-main btn-cyan" onclick="submitNewUser(true)" style="padding: 10px 14px; font-size: 12px;">
+            📲 Save &amp; Enroll Biometrics
+          </button>
         </div>
       </div>
 
       <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px; margin-top: 16px;">
-        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 6px;">Biometric Device Authentication (Apple Face ID / Samsung Fingerprint)</div>
-        <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 12px;">Enroll this device's biometric scanner (Face ID, Touch ID, or Samsung Pass) to enable fast, passwordless biometric login.</div>
-        <button class="btn-main btn-cyan" style="width: 100%; font-size: 12px;" onclick="enrollBiometrics()">
-          📲 Enroll Current Device (Apple Face ID / Samsung Fingerprint)
+        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 6px;">Device Native Biometrics (Samsung Fingerprint / Apple Face ID)</div>
+        <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 12px;">Enroll this device's biometric scanner (Fingerprint or Face ID) for your current account to enable fast, passwordless Biometric Login:</div>
+        <button id="btn-enroll-curr-device" class="btn-secondary" style="width: 100%; font-size: 12px; padding: 10px; border-color: rgba(56, 189, 248, 0.4); color: #38BDF8;" onclick="enrollCurrentDeviceBiometrics()">
+          📲 Enroll This Device for Currently Logged-in Account
         </button>
       </div>
     </div>
@@ -4808,7 +4922,11 @@ def render_fleet_html(current_user="admin", token=""):
     // Modal helpers
     function openAddClientModal() { document.getElementById("modal-add-client").classList.add("open"); }
     function openAddProjectModal() { document.getElementById("modal-add-project").classList.add("open"); }
-    function closeModal(id) { document.getElementById(id).classList.remove("open"); }
+    function closeModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove("open");
+      fetchTelemetry();
+    }
 
     // Rename Entity Modal & Submission
     function openRenameModal(type, id, currentName) {
@@ -4944,11 +5062,14 @@ def render_fleet_html(current_user="admin", token=""):
                 <div style="font-weight:700; font-size:13px; color:#FFFFFF; display:flex; align-items:center; gap:6px;">
                   <span>${u.username}</span>
                   ${isSelf ? '<span style="color:#38BDF8; font-size:11px;">(You)</span>' : ""}
-                  ${u.biometrics_enrolled ? '<span title="Biometrics Enrolled" style="font-size:12px;">📱</span>' : ""}
+                  ${u.biometrics_enrolled ? '<span style="font-size:11px; color:#10B981; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:1px 6px;">✓ Biometrics Enrolled</span>' : ""}
                 </div>
                 <div style="font-size:11px; color:var(--text-dim);">${u.role} &bull; Created ${u.created_at || "Recently"}</div>
               </div>
-              <div>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <button class="btn-secondary" style="font-size:11px; padding:4px 8px; border-color:rgba(56, 189, 248, 0.4); color:#38BDF8;" onclick="enrollBiometricsForUser('${u.username}')">
+                  ${u.biometrics_enrolled ? '🔄 Re-enroll' : '📲 Enroll Biometrics'}
+                </button>
                 ${u.can_delete ? `<button class="delete-btn-tiny" onclick="deleteUser('${u.username}')">${isSelf ? "🗑️ Delete Self" : "🗑️ Delete"}</button>` : `<span style="font-size:11px; color:#64748B;">Protected</span>`}
               </div>
             </div>
@@ -5003,16 +5124,46 @@ def render_fleet_html(current_user="admin", token=""):
       }
     }
 
-    async function submitNewUser() {
+    function base64UrlToUint8Array(base64Url) {
+      if (!base64Url) return new Uint8Array(0);
+      let base64 = base64Url.split("-").join("+").split("_").join("/");
+      while (base64.length % 4 !== 0) {
+        base64 += "=";
+      }
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        bytes[i] = bin.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function bufferToBase64Url(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary).split("+").join("-").split("/").join("_").replace(/=+$/, "");
+    }
+
+    async function submitNewUser(enrollBiometricsAfter = false) {
       const u = document.getElementById("new-user-username").value.trim();
       const p = document.getElementById("new-user-password").value;
+      const cp = document.getElementById("new-user-confirm-password").value;
       const r = document.getElementById("new-user-role").value;
-      if (!u || !p) return alert("Username and password are required");
 
-      const submitBtn = document.getElementById("btn-add-user");
+      if (!u) return alert("Please enter a username");
+      if (!p) return alert("Please enter a password");
+      if (!cp) return alert("Please re-type the password in the confirmation field");
+      if (p !== cp) {
+        return alert("Passwords do not match! Please verify that both password fields are identical.");
+      }
+
+      const submitBtn = enrollBiometricsAfter ? document.getElementById("btn-add-user-bio") : document.getElementById("btn-add-user");
       if (submitBtn) {
         submitBtn.disabled = true;
-        submitBtn.innerText = "Adding User...";
+        submitBtn.innerText = enrollBiometricsAfter ? "Saving & Enrolling..." : "Saving...";
       }
 
       try {
@@ -5022,20 +5173,32 @@ def render_fleet_html(current_user="admin", token=""):
           body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&role=${encodeURIComponent(r)}`
         });
         const data = await res.json();
-        if (data.success) {
-          document.getElementById("new-user-username").value = "";
-          document.getElementById("new-user-password").value = "";
-          await loadUsersList();
-          alert(`✓ User '${u}' (${r}) registered successfully!`);
-        } else {
+        if (!data.success) {
           alert(data.error || "Failed to create user");
+          return;
+        }
+
+        document.getElementById("new-user-username").value = "";
+        document.getElementById("new-user-password").value = "";
+        document.getElementById("new-user-confirm-password").value = "";
+        await loadUsersList();
+
+        if (enrollBiometricsAfter) {
+          const bioOk = await enrollBiometricsForUser(u);
+          if (bioOk) {
+            alert(`✓ User '${u}' registered and device biometric authentication linked successfully!`);
+          } else {
+            alert(`✓ User '${u}' registered! (Biometric enrollment was skipped or timed out; you can enroll anytime under Users & Access)`);
+          }
+        } else {
+          alert(`✓ User '${u}' (${r}) registered successfully!`);
         }
       } catch(err) {
         alert("Network error creating user: " + err);
       } finally {
         if (submitBtn) {
           submitBtn.disabled = false;
-          submitBtn.innerText = "+ Add User";
+          submitBtn.innerText = enrollBiometricsAfter ? "📲 Save & Enroll Biometrics" : "💾 Save User Account";
         }
       }
     }
@@ -5064,37 +5227,91 @@ def render_fleet_html(current_user="admin", token=""):
       }
     }
 
-    // Biometric Device Enrollment (WebAuthn / Passkeys)
-    async function enrollBiometrics() {
+    // Biometric Device Enrollment (WebAuthn / Samsung Knox Fingerprint / Apple Face ID)
+    async function enrollCurrentDeviceBiometrics() {
+      const u = "__CURRENT_USER__" || "admin";
+      const ok = await enrollBiometricsForUser(u);
+      if (ok) {
+        alert(`✓ Biometric authentication (Fingerprint / Face ID) successfully enrolled for user '${u}'!\nYou can now sign in using 'Biometric Login' on the sign-in screen.`);
+      }
+    }
+
+    async function enrollBiometricsForUser(targetUser) {
+      if (!window.isSecureContext && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+        alert("Biometric enrollment (WebAuthn) requires a secure HTTPS connection (or localhost). Please access the portal using HTTPS.");
+        return false;
+      }
       if (!window.PublicKeyCredential) {
-        return alert("WebAuthn / Biometrics is not supported on this browser or platform.");
+        alert("WebAuthn / Biometrics is not supported on this browser or platform.");
+        return false;
       }
       try {
-        const res = await authedFetch("/api/webauthn/register/options", { method: "POST" });
+        const res = await authedFetch("/api/webauthn/register/options", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ username: targetUser })
+        });
         const data = await res.json();
-        if (!data.success) {
-          return alert(data.error || "Failed to initialize biometric enrollment");
+        const opts = data.options || data;
+        if (!opts || !opts.challenge) {
+          alert("Failed to initialize biometric challenge from server: " + (data.error || "No challenge"));
+          return false;
         }
-        
-        const opts = data.options;
-        opts.challenge = Uint8Array.from(atob(opts.challenge.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-        opts.user.id = Uint8Array.from(atob(opts.user.id.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-        
-        const credential = await navigator.credentials.create({ publicKey: opts });
-        if (!credential) return alert("Biometric enrollment cancelled.");
-        
-        const bufferToBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
-        
-        const verifyPayload = {
-          id: credential.id,
-          rawId: bufferToBase64(credential.rawId),
-          type: credential.type,
-          response: {
-            attestationObject: bufferToBase64(credential.response.attestationObject),
-            clientDataJSON: bufferToBase64(credential.response.clientDataJSON)
+
+        opts.rp = opts.rp || {};
+        const isIp = /^([0-9]{1,3}[.]){3}[0-9]{1,3}$/.test(window.location.hostname);
+        if (isIp) {
+          delete opts.rp.id;
+        } else {
+          opts.rp.id = window.location.hostname;
+        }
+
+        opts.challenge = base64UrlToUint8Array(opts.challenge);
+        opts.user = opts.user || {};
+        opts.user.id = new TextEncoder().encode(targetUser);
+        opts.user.name = targetUser;
+        opts.user.displayName = targetUser;
+
+        opts.pubKeyCredParams = opts.pubKeyCredParams || [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -257 },
+          { type: "public-key", alg: -8 }
+        ];
+
+        opts.authenticatorSelection = opts.authenticatorSelection || {};
+        opts.authenticatorSelection.userVerification = "preferred";
+        opts.authenticatorSelection.residentKey = "preferred";
+
+        if (window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
+          try {
+            const hasPlatform = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+            if (hasPlatform) {
+              opts.authenticatorSelection.authenticatorAttachment = "platform";
+            } else {
+              delete opts.authenticatorSelection.authenticatorAttachment;
+            }
+          } catch(e) {
+            delete opts.authenticatorSelection.authenticatorAttachment;
           }
+        }
+
+        // Prompt native device fingerprint (Samsung S24 Ultra) or Face ID (Apple)
+        const credential = await navigator.credentials.create({ publicKey: opts });
+        if (!credential) {
+          alert("Biometric enrollment cancelled.");
+          return false;
+        }
+
+        const credId = bufferToBase64Url(credential.rawId);
+
+        const verifyPayload = {
+          id: credential.id || credId,
+          rawId: credId,
+          username: targetUser,
+          type: credential.type,
+          device_label: (navigator.userAgentData && navigator.userAgentData.model) ? navigator.userAgentData.model : (window.innerWidth <= 860 ? "Samsung / Mobile Device" : "Mac / PC Desktop")
         };
-        
+
         const vRes = await authedFetch("/api/webauthn/register/verify", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
@@ -5102,14 +5319,20 @@ def render_fleet_html(current_user="admin", token=""):
         });
         const vData = await vRes.json();
         if (vData.success) {
-          alert(`✓ Apple Face ID / Samsung Fingerprint successfully enrolled for this device!\nYou can now sign in using the biometric button on the login screen.`);
-          loadUsersList();
+          await loadUsersList();
+          return true;
         } else {
           alert("Biometric verification failed: " + (vData.error || "Unknown error"));
+          return false;
         }
       } catch(e) {
         console.error("Biometrics error:", e);
-        alert("Biometric registration cancelled or timed out: " + e.message);
+        if (e.name === "NotAllowedError") {
+          alert("Biometric scan was dismissed or timed out. Please try again when ready.");
+        } else {
+          alert("Biometric scanner notice: " + (e.message || e));
+        }
+        return false;
       }
     }
 
@@ -5612,7 +5835,10 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
       `;
 
-      container.innerHTML = html;
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
     }
 
     function renderClientProjects() {
@@ -5663,7 +5889,10 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
       `;
 
-      container.innerHTML = html;
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
     }
 
     function renderProjectNodes() {
@@ -5722,7 +5951,10 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
       `;
 
-      container.innerHTML = html;
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
     }
 
     function updateNodeDetailUI() {
@@ -5852,7 +6084,11 @@ def render_fleet_html(current_user="admin", token=""):
           telemetryData = data;
           fleetData = data.fleet || DEFAULT_FLEET;
 
-          // Dynamic Sidebar Nodes List
+          // If a modal is open (e.g. Add User, Node modal, etc.), completely skip touching the DOM to eliminate screen flickering!
+          const isModalOpen = !!document.querySelector(".modal-overlay.open");
+          if (isModalOpen) return;
+
+          // Dynamic Sidebar Nodes List (with change detection to prevent layout reflows)
           const sidebarList = document.getElementById("sidebar-nodes-list");
           const sidebarCount = document.getElementById("sidebar-node-count");
           if (sidebarList && data.nodes) {
@@ -5878,7 +6114,10 @@ def render_fleet_html(current_user="admin", token=""):
             if (!entries.length) {
               sHtml = '<div style="font-size:11px; color:var(--text-dim); padding:8px 12px;">No hardware nodes registered</div>';
             }
-            sidebarList.innerHTML = sHtml;
+            if (sidebarList.dataset.lastHtml !== sHtml) {
+              sidebarList.dataset.lastHtml = sHtml;
+              sidebarList.innerHTML = sHtml;
+            }
             if (sidebarCount) sidebarCount.innerText = `${sOnline} Online`;
           }
 
@@ -5891,15 +6130,21 @@ def render_fleet_html(current_user="admin", token=""):
               if (n.online) onlineCount++;
             }
           }
-          if (document.getElementById("kpi-active-nodes")) {
-            document.getElementById("kpi-active-nodes").innerText = `${onlineCount} / ${totalCount} Online`;
+          const kpiEl = document.getElementById("kpi-active-nodes");
+          if (kpiEl) {
+            const kpiTxt = `${onlineCount} / ${totalCount} Online`;
+            if (kpiEl.innerText !== kpiTxt) kpiEl.innerText = kpiTxt;
           }
 
-          // Activity logs
+          // Activity logs (smooth update only when content changed)
           if (data.logs && document.getElementById("activity-log-stream")) {
             const logBox = document.getElementById("activity-log-stream");
-            logBox.innerHTML = data.logs.map(l => `<div>${l}</div>`).join("");
-            logBox.scrollTop = logBox.scrollHeight;
+            const newLogsHtml = data.logs.map(l => `<div>${l}</div>`).join("");
+            if (logBox.dataset.lastLogs !== newLogsHtml) {
+              logBox.dataset.lastLogs = newLogsHtml;
+              logBox.innerHTML = newLogsHtml;
+              logBox.scrollTop = logBox.scrollHeight;
+            }
           }
 
           // Re-render active view
@@ -5942,9 +6187,9 @@ def render_fleet_html(current_user="admin", token=""):
     applyDisplayFormMode();
     selectBaseFirmware();
 
-    // Polling interval
+    // Polling interval (2s cadence prevents screen repainting/flickering)
     fetchTelemetry();
-    setInterval(fetchTelemetry, 1000);
+    setInterval(fetchTelemetry, 2000);
   </script>
 </body>
 </html>

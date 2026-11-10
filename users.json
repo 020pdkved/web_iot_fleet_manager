@@ -4,17 +4,5 @@
     "password_hash": "2849d59175eabc8e9ba31d1f68864c47a61ff800f540865ba25f861a0b1d7eaf",
     "role": "Super Admin",
     "created_at": "2026-11-09"
-  },
-  "Vedang": {
-    "username": "Vedang",
-    "password_hash": "0f4c075a72d3bb02b23e94ebbceecedd7d1b8518e65f53fc8cb0647a6679ffdd",
-    "role": "Fleet Operator",
-    "created_at": "2026-11-09"
-  },
-  "Karan": {
-    "username": "Karan",
-    "password_hash": "46ed260db5a4cb33871f0b308aae3e899602cd7f20c6841677e4079d8b9e5ec3",
-    "role": "Super Admin",
-    "created_at": "2026-11-09"
   }
 }
