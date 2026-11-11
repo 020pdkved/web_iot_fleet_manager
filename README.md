@@ -138,11 +138,8 @@ The portal dispatches directives to the fleet on topic `anashwar/poc/commands`:
 
 ```text
 ESP32_WEB_OTA/
-├── Anashwar_ESP32_Fleet_Node.ino   # Standalone Arduino reference firmware (Clean production)
-├── examples/
-│   └── Anashwar_ESP32_Fleet_Node/
-│       └── Anashwar_ESP32_Fleet_Node.ino # Arduino IDE ready sketch
-├── web_portal.py                   # Complete Python Enterprise Fleet Server
+├── Anashwar_Fleet_Reference.ino    # Single multi-platform reference (ESP32, ESP8266, Pico W/2W, BW16, RPi Python)
+├── web_portal.py                   # Complete Python Enterprise Fleet Server + MQTT HTTP-Proxy Relay
 ├── src/
 │   └── main.cpp                    # PlatformIO C++ firmware implementation
 ├── include/
@@ -156,16 +153,15 @@ ESP32_WEB_OTA/
 
 ---
 
-## 7. How to Deploy to an ESP32
+## 7. How to Deploy / Attach Any Existing Node (ESP32, ESP8266, Pico W/2W, BW16, RPi)
 
-### Option 1: Arduino IDE (Easiest)
-1. Open Arduino IDE.
-2. Open [`Anashwar_ESP32_Fleet_Node.ino`](Anashwar_ESP32_Fleet_Node.ino) or `examples/Anashwar_ESP32_Fleet_Node/Anashwar_ESP32_Fleet_Node.ino`.
-3. In Library Manager, install **PubSubClient** by Nick O'Leary.
-4. Update `WIFI_SSID`, `WIFI_PASSWORD`, `nodeName`, `nodeClient`, and `nodeProject` at the top of the file.
-5. Select your ESP32 board (e.g., `ESP32 Dev Module`) and USB port.
-6. Click **Upload**.
-7. Open Serial Monitor at `115200` baud. Within 5 seconds, your node will connect, publish telemetry, and appear live on [https://manage.anashwartech.com](https://manage.anashwartech.com)!
+### Option 1: Arduino IDE / Existing Project Merge (Recommended)
+1. Open [`Anashwar_Fleet_Reference.ino`](Anashwar_Fleet_Reference.ino) — the **single unified reference** for all workspaces.
+2. In Library Manager, install **PubSubClient** by Nick O'Leary.
+3. Update `DEFAULT_NODE_NAME`, `DEFAULT_CLIENT_NAME`, `DEFAULT_PROJECT_NAME`, and keep `VED-FI` / `AnashwarTech2` Wi-Fi profiles + `broker.hivemq.com:1883` MQTT credentials.
+4. To view your device's **full embedded Port-80 Web UI globally** when clicking **Web UI** on `https://manage.anashwartech.com` (even behind phone hotspots / NAT), include **Step 2C (`pumpFleetHttpProxy()`)** and subscribe to `anashwar/proxy/req/<chip_id>` from `Anashwar_Fleet_Reference.ino`.
+5. For **Raspberry Pi 3 / 4B / Zero 2 W / Linux SBCs**, use the standalone Python 3 daemon included at the bottom of [`Anashwar_Fleet_Reference.ino`](Anashwar_Fleet_Reference.ino).
+6. Select your target board and click **Upload**. Open Serial Monitor at `115200` baud and watch your node appear live on [https://manage.anashwartech.com](https://manage.anashwartech.com)!
 
 ### Option 2: PlatformIO
 ```bash

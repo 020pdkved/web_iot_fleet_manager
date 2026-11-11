@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
 Anashwar Technologies - Enterprise Fleet Management Console
-Multi-Page Cloud & USB Firmware Management System for ESP32 Nodes
-
-Hierarchical Architecture:
-  Dashboard (Overview) -> Clients -> Projects -> Nodes -> Node Detail / Control Center
-
-Hardware Identities:
-  - Node: A | MAC: EC:C9:FF:FF:08:94 | Chip ID: 9408FFFFC9EC | Port: /dev/cu.usbserial-0001
-  - Node: B | MAC: 70:4B:CA:48:E6:BC | Chip ID: BCE648CA4B70 | Port: /dev/cu.usbserial-3
+Multi-Page Cloud & USB Firmware Management System for Multi-MCU Edge Nodes
 """
 
 import os
@@ -23,8 +16,12 @@ import hashlib
 import subprocess
 import atexit
 import secrets
+import uuid
+import base64
+import ipaddress
 import urllib.request
 import urllib.parse
+import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
@@ -33,7 +30,14 @@ DEFAULT_MQTT_BROKER = "broker.hivemq.com"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_TOPIC_COMMANDS = "anashwar/poc/commands"
 DEFAULT_MQTT_TOPIC_STATUS = "anashwar/poc/status"
+PROXY_TOPIC_REQ_PREFIX = "anashwar/proxy/req/"
+PROXY_TOPIC_RES = "anashwar/proxy/res"
 SECURITY_SALT = "AnashwarEnterprise2026SecureSalt"
+
+_mqtt_pub_lock = threading.Lock()
+_mqtt_pub_sock = None
+_proxy_lock = threading.Lock()
+pending_proxy_requests = {}
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 BINARIES_DIR = os.path.join(PROJECT_ROOT, "binaries")
@@ -1128,11 +1132,62 @@ def sync_node_identity_from_device(old_key, new_node_name, new_client_name, new_
     return new_node_clean
 
 # =============================================================================
-# ZERO-DEPENDENCY MQTT CLIENT (SOCKET IMPLEMENTATION)
+# ZERO-DEPENDENCY MQTT CLIENT & HTTP-PROXY RELAY (SOCKET IMPLEMENTATION)
 # =============================================================================
+def _mqtt_encode_rem_len(n):
+    out = bytearray()
+    while True:
+        d = n % 128
+        n //= 128
+        if n > 0:
+            d |= 0x80
+        out.append(d)
+        if n == 0:
+            return bytes(out)
+
+def _mqtt_recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("MQTT socket closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def _handle_proxy_res_chunk(msg_str):
+    try:
+        pdata = json.loads(msg_str)
+    except Exception:
+        return
+    if not isinstance(pdata, dict):
+        return
+    rid = str(pdata.get("rid", "")).strip()
+    if not rid:
+        return
+    with _proxy_lock:
+        entry = pending_proxy_requests.get(rid)
+        if entry is None:
+            return
+        idx = int(pdata.get("i", 0))
+        total = max(1, int(pdata.get("n", 1)))
+        entry["total"] = total
+        if "st" in pdata:
+            entry["status"] = int(pdata["st"])
+        if pdata.get("ct"):
+            entry["ct"] = str(pdata["ct"])
+        if pdata.get("loc"):
+            entry["loc"] = str(pdata["loc"])
+        if pdata.get("err"):
+            entry["err"] = str(pdata["err"])
+        entry["chunks"][idx] = str(pdata.get("d", ""))
+        if len(entry["chunks"]) >= total and all(k in entry["chunks"] for k in range(total)):
+            entry["event"].set()
+
 def start_mqtt_client():
     def mqtt_listener():
+        global _mqtt_pub_sock
         while True:
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(10)
@@ -1141,26 +1196,45 @@ def start_mqtt_client():
                 proto = b"MQTT"
                 vh = len(proto).to_bytes(2, 'big') + proto + b'\x04\x02\x00\x3c'
                 payload = len(client_id).to_bytes(2, 'big') + client_id
-                s.sendall(b'\x10' + bytes([len(vh)+len(payload)]) + vh + payload)
-                ack = s.recv(4)
+                s.sendall(b'\x10' + _mqtt_encode_rem_len(len(vh) + len(payload)) + vh + payload)
+                ack = _mqtt_recv_exact(s, 4)
                 if len(ack) < 4 or ack[3] != 0:
                     time.sleep(3)
                     continue
 
-                sub_topic = DEFAULT_MQTT_TOPIC_STATUS.encode('utf-8')
+                t1 = DEFAULT_MQTT_TOPIC_STATUS.encode('utf-8')
+                t2 = PROXY_TOPIC_RES.encode('utf-8')
                 sub_vh = b'\x00\x01'
-                sub_payload = len(sub_topic).to_bytes(2, 'big') + sub_topic + b'\x00'
-                sub_rem = len(sub_vh) + len(sub_payload)
-                s.sendall(b'\x82' + bytes([sub_rem]) + sub_vh + sub_payload)
-                s.recv(5)
-                log_event(f"MQTT Connected & Subscribed to '{DEFAULT_MQTT_TOPIC_STATUS}' on {DEFAULT_MQTT_BROKER}")
+                sub_payload = (
+                    len(t1).to_bytes(2, 'big') + t1 + b'\x00' +
+                    len(t2).to_bytes(2, 'big') + t2 + b'\x00'
+                )
+                s.sendall(b'\x82' + _mqtt_encode_rem_len(len(sub_vh) + len(sub_payload)) + sub_vh + sub_payload)
+
+                # Read exact SUBACK frame
+                _mqtt_recv_exact(s, 1)
+                sub_rem = 0
+                sub_mult = 1
+                while True:
+                    db = _mqtt_recv_exact(s, 1)[0]
+                    sub_rem += (db & 127) * sub_mult
+                    sub_mult *= 128
+                    if not (db & 128):
+                        break
+                if sub_rem > 0:
+                    _mqtt_recv_exact(s, sub_rem)
+
+                with _mqtt_pub_lock:
+                    _mqtt_pub_sock = s
+                log_event(f"MQTT Connected & Subscribed to '{DEFAULT_MQTT_TOPIC_STATUS}' + '{PROXY_TOPIC_RES}' on {DEFAULT_MQTT_BROKER}")
 
                 last_ping = time.time()
                 while True:
                     now = time.time()
                     if now - last_ping >= 20:
                         try:
-                            s.sendall(b'\xc0\x00')
+                            with _mqtt_pub_lock:
+                                s.sendall(b'\xc0\x00')
                             last_ping = now
                         except Exception:
                             break
@@ -1175,24 +1249,33 @@ def start_mqtt_client():
                     if not b1:
                         break
                     pkt_type = b1[0] >> 4
+                    qos = (b1[0] >> 1) & 0x03
                     multiplier = 1
                     rem_len = 0
                     while True:
-                        d_byte = s.recv(1)[0]
+                        d_byte = _mqtt_recv_exact(s, 1)[0]
                         rem_len += (d_byte & 127) * multiplier
                         multiplier *= 128
                         if not (d_byte & 128):
                             break
-                    data = b""
-                    while len(data) < rem_len:
-                        chunk = s.recv(min(rem_len - len(data), 4096))
-                        if not chunk:
-                            break
-                        data += chunk
+                    data = _mqtt_recv_exact(s, rem_len) if rem_len > 0 else b""
 
                     if pkt_type == 3: # PUBLISH
+                        if len(data) < 2:
+                            continue
                         topic_len = int.from_bytes(data[0:2], 'big')
-                        msg = data[2+topic_len:].decode('utf-8', errors='ignore')
+                        topic_name = data[2:2+topic_len].decode('utf-8', errors='ignore')
+                        payload_offset = 2 + topic_len + (2 if qos > 0 else 0)
+                        if qos == 1 and len(data) >= 4 + topic_len:
+                            try:
+                                with _mqtt_pub_lock:
+                                    s.sendall(b'\x40\x02' + data[2+topic_len:4+topic_len])
+                            except Exception:
+                                pass
+                        msg = data[payload_offset:].decode('utf-8', errors='ignore')
+                        if topic_name == PROXY_TOPIC_RES:
+                            _handle_proxy_res_chunk(msg)
+                            continue
                         try:
                             tdata = json.loads(msg)
                             raw_id = tdata.get("id", "")
@@ -1371,11 +1454,38 @@ def start_mqtt_client():
 
                         except Exception as e:
                             log_event(f"Telemetry parse error: {e}")
-            except Exception as e:
-                time.sleep(3)
+            except Exception:
+                pass
+            finally:
+                with _mqtt_pub_lock:
+                    if _mqtt_pub_sock is s:
+                        _mqtt_pub_sock = None
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                time.sleep(2)
 
     t = threading.Thread(target=mqtt_listener, daemon=True)
     t.start()
+
+def publish_fast_mqtt(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DEFAULT_MQTT_PORT):
+    """Low-latency PUBLISH over persistent MQTT socket, falling back cleanly to one-shot TCP."""
+    global _mqtt_pub_sock
+    t_bytes = topic.encode('utf-8')
+    p_bytes = payload_str.encode('utf-8')
+    var_header = len(t_bytes).to_bytes(2, 'big') + t_bytes
+    pkt = b'\x30' + _mqtt_encode_rem_len(len(var_header) + len(p_bytes)) + var_header + p_bytes
+    with _mqtt_pub_lock:
+        sock = _mqtt_pub_sock
+        if sock is not None and broker == DEFAULT_MQTT_BROKER and port == DEFAULT_MQTT_PORT:
+            try:
+                sock.sendall(pkt)
+                return True
+            except Exception:
+                _mqtt_pub_sock = None
+    return publish_mqtt_command(topic, payload_str, broker=broker, port=port, silent=True)
 
 def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DEFAULT_MQTT_PORT, silent=False):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1386,7 +1496,7 @@ def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DE
         proto = b"MQTT"
         vh = len(proto).to_bytes(2, 'big') + proto + b'\x04\x02\x00\x3c'
         payload = len(client_id).to_bytes(2, 'big') + client_id
-        s.sendall(b'\x10' + bytes([len(vh)+len(payload)]) + vh + payload)
+        s.sendall(b'\x10' + _mqtt_encode_rem_len(len(vh) + len(payload)) + vh + payload)
         ack = s.recv(4)
         if len(ack) < 4 or ack[3] != 0:
             return False
@@ -1394,18 +1504,7 @@ def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DE
         t_bytes = topic.encode('utf-8')
         p_bytes = payload_str.encode('utf-8')
         var_header = len(t_bytes).to_bytes(2, 'big') + t_bytes
-        total_len = len(var_header) + len(p_bytes)
-
-        header = bytearray([0x30]) # PUBLISH QoS 0
-        rem = total_len
-        while True:
-            d = rem % 128
-            rem = rem // 128
-            if rem > 0:
-                d |= 0x80
-            header.append(d)
-            if rem == 0:
-                break
+        header = b'\x30' + _mqtt_encode_rem_len(len(var_header) + len(p_bytes))
 
         s.sendall(header + var_header + p_bytes)
         if not silent and not _is_ping_noise(payload_str):
@@ -1486,9 +1585,172 @@ def run_usb_flash_task(target_node, filename, mode_num):
         log_event(f"USB FLASH EXCEPTION: {e}")
 
 # =============================================================================
-# GLOBAL CLOUD IN-SITU LIVE CONSOLE (WORLDWIDE TRAVERSAL)
+# GLOBAL CLOUD IN-SITU LIVE CONSOLE & MQTT HTTP-PROXY RELAY
 # =============================================================================
-def render_cloud_insitu_page(target_node):
+_PROXY_SHIM_TEMPLATE = r"""<script data-anashwar-proxy="1">
+(function(){
+  if (window.__anashwarProxyHooked) return;
+  window.__anashwarProxyHooked = true;
+  var BASE = __BASE_JSON__;
+  var TOK = __TOK_JSON__;
+  var NODE_IP = __IP_JSON__;
+  function addTok(u){
+    if (!TOK || typeof u !== "string") return u;
+    if (u.indexOf(BASE) !== 0 && u.indexOf(window.location.origin + BASE) !== 0) return u;
+    if (u.indexOf("token=") !== -1) return u;
+    var h = u.indexOf("#");
+    var bp = h >= 0 ? u.slice(0, h) : u;
+    var hp = h >= 0 ? u.slice(h) : "";
+    return bp + (bp.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOK) + hp;
+  }
+  function mapUrl(u){
+    if (typeof u !== "string" || !u) return u;
+    if (/^(#|data:|blob:|javascript:|mailto:|tel:|ws:|wss:)/i.test(u)) return u;
+    if (NODE_IP && u.indexOf("http://" + NODE_IP) === 0){
+      var rest = u.slice(7 + NODE_IP.length);
+      return addTok(BASE + (rest.charAt(0) === "/" || !rest ? (rest || "/") : "/" + rest));
+    }
+    if (/^https?:\/\//i.test(u) || u.indexOf("//") === 0) return u;
+    if (u.indexOf("/proxy/node/") === 0) return addTok(u);
+    if (u.charAt(0) === "/") return addTok(BASE + u);
+    return u;
+  }
+  if (window.fetch){
+    var origFetch = window.fetch.bind(window);
+    window.fetch = function(input, init){
+      try {
+        if (typeof input === "string"){
+          input = mapUrl(input);
+        } else if (input && typeof input.url === "string" && typeof Request !== "undefined" && input instanceof Request){
+          var mapped = mapUrl(input.url);
+          if (mapped !== input.url) input = new Request(mapped, input);
+        }
+      } catch(e){}
+      return origFetch(input, init);
+    };
+  }
+  if (window.XMLHttpRequest && XMLHttpRequest.prototype){
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url){
+      var args = Array.prototype.slice.call(arguments);
+      try {
+        if (typeof url === "string") args[1] = mapUrl(url);
+      } catch(e){}
+      return origOpen.apply(this, args);
+    };
+  }
+  if (window.EventSource){
+    var OrigES = window.EventSource;
+    window.EventSource = function(url, cfg){
+      return new OrigES(mapUrl(url), cfg);
+    };
+  }
+  document.addEventListener("click", function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest("a[href]") : null;
+    if (!a) return;
+    var raw = a.getAttribute("href");
+    var mapped = mapUrl(raw);
+    if (mapped && mapped !== raw) a.setAttribute("href", mapped);
+  }, true);
+  document.addEventListener("submit", function(ev){
+    var f = ev.target;
+    if (!f || !f.getAttribute) return;
+    var raw = f.getAttribute("action") || window.location.pathname;
+    var mapped = mapUrl(raw);
+    if (mapped && mapped !== raw) f.setAttribute("action", mapped);
+  }, true);
+})();
+</script>"""
+
+def _rewrite_proxied_html(raw_bytes, target_node, token="", node_ip=""):
+    proxy_base = f"/proxy/node/{urllib.parse.quote(target_node, safe='')}"
+    html = raw_bytes.decode("utf-8", errors="replace")
+    # Rewrite root-relative HTML attributes (/foo -> /proxy/node/<node>/foo)
+    html = re.sub(
+        r'(?i)(\b(?:href|src|action)\s*=\s*)(["\'])/(?!/|proxy/node/)([^"\']*)\2',
+        lambda m: f"{m.group(1)}{m.group(2)}{proxy_base}/{m.group(3)}{m.group(2)}",
+        html,
+    )
+    # Rewrite common inline JS navigation (location.href='/foo', window.open('/foo'))
+    html = re.sub(
+        r'(?i)(\blocation(?:\.href)?\s*=\s*|window\.open\(\s*)(["\'])/(?!/|proxy/node/)([^"\']*)\2',
+        lambda m: f"{m.group(1)}{m.group(2)}{proxy_base}/{m.group(3)}{m.group(2)}",
+        html,
+    )
+    shim = (
+        f'<base href="{proxy_base}/">'
+        + _PROXY_SHIM_TEMPLATE
+            .replace("__BASE_JSON__", json.dumps(proxy_base))
+            .replace("__TOK_JSON__", json.dumps(token or ""))
+            .replace("__IP_JSON__", json.dumps(node_ip or ""))
+    )
+    head_match = re.search(r'(?i)<head(?:\s[^>]*)?>', html)
+    if head_match:
+        idx = head_match.end()
+        html = html[:idx] + "\n" + shim + html[idx:]
+    else:
+        html = shim + "\n" + html
+    return html.encode("utf-8")
+
+def _tunnel_http_via_mqtt(target_node, method, forward_path, body=b"", content_type="", timeout_sec=4.5):
+    """Stream an HTTP request over MQTT to the node's loopback WebServer (global NAT traversal)."""
+    node = nodes_telemetry.get(target_node, {})
+    chip_id = str(node.get("chip_id", "")).strip()
+    topic_key = chip_id or urllib.parse.quote(target_node, safe="")
+    req_topic = f"{PROXY_TOPIC_REQ_PREFIX}{topic_key}"
+
+    rid = uuid.uuid4().hex[:10]
+    ev = threading.Event()
+    entry = {
+        "event": ev,
+        "chunks": {},
+        "total": 1,
+        "status": 200,
+        "ct": "text/html; charset=utf-8",
+        "loc": "",
+        "err": "",
+        "ts": time.time(),
+    }
+    with _proxy_lock:
+        now_ts = time.time()
+        for k in [k for k, v in pending_proxy_requests.items() if now_ts - v["ts"] > 30]:
+            pending_proxy_requests.pop(k, None)
+        pending_proxy_requests[rid] = entry
+
+    req_payload = {
+        "rid": rid,
+        "m": method.upper(),
+        "p": forward_path,
+    }
+    if body:
+        if content_type:
+            req_payload["ct"] = content_type
+        req_payload["b"] = base64.b64encode(body).decode("ascii")
+
+    try:
+        ok = publish_fast_mqtt(req_topic, json.dumps(req_payload, separators=(",", ":")))
+        if not ok:
+            return None
+        if not ev.wait(timeout=timeout_sec):
+            return None
+        ordered = [entry["chunks"][i] for i in range(entry["total"])]
+        joined = "".join(ordered)
+        try:
+            raw_bytes = base64.b64decode(joined) if joined else b""
+        except Exception:
+            raw_bytes = b"".join(base64.b64decode(c) for c in ordered if c)
+        return (
+            entry.get("status", 200),
+            entry.get("ct", "text/html; charset=utf-8"),
+            entry.get("loc", ""),
+            raw_bytes,
+            entry.get("err", ""),
+        )
+    finally:
+        with _proxy_lock:
+            pending_proxy_requests.pop(rid, None)
+
+def render_cloud_insitu_page(target_node, tunnel_timeout=False):
     node = nodes_telemetry.get(target_node, {})
     name = node.get("name", target_node)
     client = node.get("client", "Unassigned Client")
@@ -1506,6 +1768,13 @@ def render_cloud_insitu_page(target_node):
     btn_class = "btn-off" if service else "btn-on"
     btn_text = "Put Node into STANDBY" if service else "Put Node into ACTIVE"
     target_action = "OFF" if service else "ON"
+
+    timeout_banner = ""
+    if tunnel_timeout:
+        timeout_banner = f"""
+  <div class="banner-nat">
+    <strong>On-Board Port-80 Web UI Tunnel Timed Out:</strong> {name} ({ip}) is on a private NAT/hotspot and did not reply on MQTT proxy topic <code>anashwar/proxy/req/{chip}</code>. Merge the <strong>MQTT HTTP-Proxy Relay</strong> snippet from <code>Anashwar_Fleet_Reference.ino</code> into {name}'s firmware to stream its full embedded web app globally here.
+  </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1532,25 +1801,25 @@ body {{
   padding: 18px 16px;
   min-height: 100vh;
 }}
-.container {{ max-width: 520px; margin: 0 auto; }}
+.container {{ max-width: 560px; margin: 0 auto; }}
 .header {{
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }}
 .logo {{
-  width: 40px;
-  height: 40px;
+  width: 38px;
+  height: 38px;
   border-radius: 10px;
   background: linear-gradient(135deg, #E11D48, #9F1239);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 900;
-  font-size: 19px;
+  font-size: 18px;
   color: #fff;
   box-shadow: 0 4px 14px rgba(225, 29, 72, 0.4);
 }}
@@ -1560,11 +1829,27 @@ body {{
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--border);
   border-radius: 16px;
-  padding: 20px;
+  padding: 18px;
   margin-bottom: 14px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
 }}
-.node-title {{ font-size: 20px; font-weight: 800; color: #fff; }}
+.banner-nat {{
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: #FCD34D;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-bottom: 12px;
+}}
+.banner-nat code {{
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: #FDE68A;
+}}
+.node-title {{ font-size: 19px; font-weight: 800; color: #fff; }}
 .badge {{
   padding: 4px 10px;
   border-radius: 20px;
@@ -1578,7 +1863,7 @@ body {{
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 9px 0;
+  padding: 8px 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   font-size: 13px;
 }}
@@ -1587,9 +1872,9 @@ body {{
 .val {{ font-family: monospace; font-weight: 600; }}
 button {{
   width: 100%;
-  padding: 12px;
+  padding: 11px;
   border-radius: 10px;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
   margin-top: 10px;
   cursor: pointer;
@@ -1617,13 +1902,13 @@ button {{
     <div class="logo">at</div>
     <div style="flex:1;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h1 style="font-size:16px; font-weight:700;">Anashwar Technologies</h1>
-        <span class="cloud-pill">● Cloud Edge Relay (Global)</span>
+        <h1 style="font-size:15px; font-weight:700;">Anashwar Technologies</h1>
+        <span class="cloud-pill">Cloud Edge Relay (Fallback)</span>
       </div>
-      <p style="font-size:11px; color:var(--muted); margin-top:2px;">In-Situ Web Console &bull; Connected via HiveMQ MQTT</p>
+      <p style="font-size:11px; color:var(--muted); margin-top:2px;">In-Situ Web Console &bull; broker.hivemq.com:1883</p>
     </div>
   </div>
-
+  {timeout_banner}
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
       <div class="node-title">{name}</div>
@@ -1650,7 +1935,7 @@ button {{
 
     <!-- Direct LAN link when on same Wi-Fi -->
     <a href="http://{ip}/" target="_blank" class="btn-direct">
-      &nearr; Direct LAN Hardware Link (When connected to {name}'s local Wi-Fi)
+      Direct LAN Hardware Link (Same Wi-Fi: {ip})
     </a>
   </div>
 </div>
@@ -1713,6 +1998,170 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
+
+    def _send_proxied_response(self, target_node, node_ip, token, status, ctype, loc, raw_bytes):
+        proxy_base = f"/proxy/node/{urllib.parse.quote(target_node, safe='')}"
+        is_html = "text/html" in (ctype or "").lower()
+        out_bytes = _rewrite_proxied_html(raw_bytes, target_node, token=token, node_ip=node_ip) if is_html else raw_bytes
+
+        self.send_response(status)
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        if loc:
+            loc_out = f"{proxy_base}{loc}" if loc.startswith("/") and not loc.startswith("/proxy/node/") else loc
+            self.send_header("Location", loc_out)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(out_bytes)))
+        if token:
+            proto_hdr = (self.headers.get("X-Forwarded-Proto") or "").lower()
+            c_flags = "; SameSite=None; Secure" if proto_hdr == "https" else "; SameSite=Lax"
+            self.send_header("Set-Cookie", f"session_token={token}; Path=/; Max-Age=86400{c_flags}")
+        self.end_headers()
+        self.wfile.write(out_bytes)
+
+    def _handle_node_proxy(self, method, path, parsed, body=b"", token="", user=""):
+        rest = path[len("/proxy/node/"):]
+        parts = rest.split("/", 1)
+        target_node_raw = urllib.parse.unquote(parts[0])
+        subpath = parts[1] if len(parts) > 1 else ""
+
+        qs_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if parsed.query else []
+        clean_qs = [(k, v) for k, v in qs_pairs if k != "token"]
+        clean_query = urllib.parse.urlencode(clean_qs)
+        clean_subpath = subpath.split("?", 1)[0]
+        forward_path = "/" + clean_subpath.lstrip("/")
+        if clean_query:
+            forward_path += "?" + clean_query
+
+        target_node = resolve_target_node(target_node_raw)
+        if not target_node or target_node not in nodes_telemetry:
+            self.send_error(404, "Node not found")
+            return
+
+        node_info = nodes_telemetry[target_node]
+        node_ip = str(node_info.get("ip") or "").strip()
+        content_type_in = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
+
+        is_private_ip = False
+        if node_ip:
+            try:
+                is_private_ip = ipaddress.ip_address(node_ip).is_private
+            except Exception:
+                is_private_ip = False
+        on_cloud = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
+        try_direct = bool(node_ip) and not (on_cloud and is_private_ip)
+
+        if try_direct:
+            try:
+                target_url = f"http://{node_ip}{forward_path}"
+                req_data = body if method in ("POST", "PUT", "PATCH") else None
+                req = urllib.request.Request(
+                    target_url,
+                    data=req_data,
+                    method=method,
+                    headers={"Content-Type": content_type_in, "User-Agent": "Anashwar-Fleet-Proxy"},
+                )
+                with urllib.request.urlopen(req, timeout=0.6) as resp:
+                    self._send_proxied_response(
+                        target_node,
+                        node_ip,
+                        token,
+                        resp.status,
+                        resp.headers.get("Content-Type", ""),
+                        resp.headers.get("Location", ""),
+                        resp.read(),
+                    )
+                    return
+            except urllib.error.HTTPError as he:
+                self._send_proxied_response(
+                    target_node,
+                    node_ip,
+                    token,
+                    he.code,
+                    he.headers.get("Content-Type", "text/plain") if he.headers else "text/plain",
+                    he.headers.get("Location", "") if he.headers else "",
+                    he.read(),
+                )
+                return
+            except Exception:
+                pass
+
+        # Global NAT Traversal: Tunnel the HTTP request through HiveMQ MQTT to port 80 on device
+        is_online = (time.time() - node_info.get("last_seen", 0)) < 20
+        tun_timeout = 1.5 if (clean_subpath == "favicon.ico" or not is_online) else 4.5
+        tun = _tunnel_http_via_mqtt(
+            target_node,
+            method,
+            forward_path,
+            body=body,
+            content_type=content_type_in,
+            timeout_sec=tun_timeout,
+        )
+        if tun is not None and not (tun[0] == 502 and tun[4]):
+            self._send_proxied_response(target_node, node_ip, token, tun[0], tun[1], tun[2], tun[3])
+            return
+
+        # Fallback when device does not yet implement the MQTT HTTP-Proxy Relay
+        if method == "GET" and clean_subpath in ("", "index.html", "index.htm"):
+            out_html = render_cloud_insitu_page(target_node, tunnel_timeout=True).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(out_html)))
+            if token:
+                proto_hdr = (self.headers.get("X-Forwarded-Proto") or "").lower()
+                c_flags = "; SameSite=None; Secure" if proto_hdr == "https" else "; SameSite=Lax"
+                self.send_header("Set-Cookie", f"session_token={token}; Path=/; Max-Age=86400{c_flags}")
+            self.end_headers()
+            self.wfile.write(out_html)
+            return
+
+        if method == "POST" and any(k in forward_path for k in ("service", "toggle", "reboot")):
+            caller_user = user or "portal_admin"
+            caller_role = users_db.get(caller_user, {}).get("role", "Admin")
+            if "service" in forward_path or "toggle" in forward_path:
+                new_state = "OFF" if node_info.get("service", True) else "ON"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:SERVICE:{new_state}")
+                node_info["service"] = (new_state == "ON")
+                log_event(f"SERVICE: [{target_node}] switched to {new_state} via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "reboot" in forward_path:
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:REBOOT")
+                log_event(f"COMMAND: [{target_node}] reboot dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            self.send_response(303)
+            self.send_header("Location", f"/proxy/node/{urllib.parse.quote(target_node, safe='')}/")
+            self.end_headers()
+            return
+
+        err_msg = tun[4] if (tun and tun[4]) else "Hardware MQTT HTTP-Proxy Relay timed out"
+        err_bytes = json.dumps({"error": err_msg, "path": forward_path}).encode("utf-8")
+        self.send_response(504)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(err_bytes)))
+        self.end_headers()
+        self.wfile.write(err_bytes)
+
+    def _dispatch_rest_proxy(self, method):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+        user, token = get_authenticated_user(self.headers, parsed)
+        if not user:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Unauthorized", "authenticated": false}')
+            return
+        if path.startswith("/proxy/node/"):
+            self._handle_node_proxy(method, path, parsed, body=body, token=token, user=user)
+            return
+        self.send_error(404, "Endpoint not found")
+
+    def do_PUT(self):
+        self._dispatch_rest_proxy("PUT")
+
+    def do_DELETE(self):
+        self._dispatch_rest_proxy("DELETE")
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -2005,40 +2454,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             if not user:
                 self.send_error(401, "Unauthorized")
                 return
-
-            rest = path[len("/proxy/node/"):]
-            parts = rest.split("/", 1)
-            target_node_raw = urllib.parse.unquote(parts[0])
-            subpath = parts[1] if len(parts) > 1 else ""
-            if parsed.query:
-                subpath += "?" + parsed.query
-
-            target_node = resolve_target_node(target_node_raw)
-            if not target_node or target_node not in nodes_telemetry:
-                self.send_error(404, "Node not found")
-                return
-
-            node_ip = nodes_telemetry[target_node].get("ip")
-            if not node_ip:
-                self.send_error(502, "Node has no valid IP address")
-                return
-
-            target_url = f"http://{node_ip}/{subpath}"
-            try:
-                req = urllib.request.Request(target_url, headers={"User-Agent": "Anashwar-Fleet-Proxy"})
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    self.send_response(resp.status)
-                    for k, v in resp.headers.items():
-                        if k.lower() in ("content-type", "content-length", "cache-control"):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    self.wfile.write(resp.read())
-            except Exception:
-                # Node is behind remote NAT/Firewall: serve the Global Cloud In-Situ Console
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(render_cloud_insitu_page(target_node).encode("utf-8"))
+            self._handle_node_proxy("GET", path, parsed, token=token, user=user)
 
         elif path.startswith("/download/"):
             filename = os.path.basename(path)
@@ -2966,48 +3382,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
         # 12. Reverse Proxy for Node In-Situ Web UI (POST Support)
         elif path.startswith("/proxy/node/"):
-            rest = path[len("/proxy/node/"):]
-            parts = rest.split("/", 1)
-            target_node_raw = urllib.parse.unquote(parts[0])
-            subpath = parts[1] if len(parts) > 1 else ""
-            if parsed.query:
-                subpath += "?" + parsed.query
-            target_node = resolve_target_node(target_node_raw)
-            if not target_node or target_node not in nodes_telemetry:
-                self.send_error(404, "Node not found")
-                return
-            node_ip = nodes_telemetry[target_node].get("ip")
-            if not node_ip:
-                self.send_error(502, "Node has no valid IP address")
-                return
-            target_url = f"http://{node_ip}/{subpath}"
-            try:
-                content_type = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
-                req = urllib.request.Request(target_url, data=body, method="POST", headers={"Content-Type": content_type, "User-Agent": "Anashwar-Fleet-Proxy"})
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    self.send_response(resp.status)
-                    for k, v in resp.headers.items():
-                        if k.lower() in ("content-type", "content-length", "cache-control"):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    self.wfile.write(resp.read())
-            except Exception:
-                # Handle POST command over cloud MQTT mesh
-                caller_user, caller_role = "portal_admin", "Admin"
-                if "service" in subpath or "toggle" in subpath:
-                    new_state = "OFF" if nodes_telemetry[target_node].get("service", True) else "ON"
-                    cmd = f"CMD:[{target_node}]:SERVICE:{new_state}"
-                    publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
-                    nodes_telemetry[target_node]["service"] = (new_state == "ON")
-                    log_event(f"SERVICE: [{target_node}] switched to {new_state} via In-Situ Console", actor=caller_user, actor_role=caller_role)
-                elif "reboot" in subpath:
-                    cmd = f"CMD:[{target_node}]:REBOOT"
-                    publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
-                    log_event(f"COMMAND: [{target_node}] reboot dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
-
-                self.send_response(303)
-                self.send_header("Location", f"/proxy/node/{urllib.parse.quote(target_node)}/")
-                self.end_headers()
+            self._handle_node_proxy("POST", path, parsed, body=body, token=token, user=user)
 
         # 13. Binary Drag-and-Drop Upload Endpoint
         elif path == "/api/upload_bin":
@@ -3736,13 +4111,13 @@ def render_fleet_html(current_user="admin", token=""):
       vertical-align: middle;
     }
     .esp32-hw-frame {
-      width: 54px;
-      height: 54px;
-      border-radius: 12px;
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
       background: #FFFFFF;
-      padding: 4px;
+      padding: 3px;
       border: 1px solid var(--card-border);
-      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.14);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -3756,13 +4131,13 @@ def render_fleet_html(current_user="admin", token=""):
       object-fit: contain;
     }
     .esp32-hero-frame {
-      width: 72px;
-      height: 72px;
-      border-radius: 16px;
+      width: 60px;
+      height: 60px;
+      border-radius: 14px;
       background: #FFFFFF;
-      padding: 6px;
+      padding: 5px;
       border: 1px solid var(--card-border);
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+      box-shadow: 0 5px 16px rgba(0, 0, 0, 0.18);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -3780,12 +4155,12 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border-radius: 14px;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
       background: var(--surface-2);
       border: 1px solid var(--card-border);
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       transition: all 0.22s cubic-bezier(0.22, 1, 0.36, 1);
     }
     .active-node-row:hover {
@@ -3808,8 +4183,8 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Left Sidebar */
     .sidebar {
-      width: 270px;
-      min-width: 270px;
+      width: 204px;
+      min-width: 204px;
       background: var(--sidebar);
       backdrop-filter: blur(22px);
       -webkit-backdrop-filter: blur(22px);
@@ -3824,22 +4199,23 @@ def render_fleet_html(current_user="admin", token=""):
     }
 
     .brand-header {
-      padding: 24px 20px;
+      padding: 14px 12px;
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 10px;
       border-bottom: 1px solid var(--card-border);
     }
     .brand-logo {
-      width: 44px;
-      height: 44px;
-      border-radius: 12px;
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
       background: #FFFFFF;
       padding: 3px;
-      box-shadow: 0 4px 18px var(--crimson-glow);
+      box-shadow: 0 3px 12px var(--crimson-glow);
       display: flex;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
     }
     .brand-logo img {
       width: 100%;
@@ -3849,44 +4225,51 @@ def render_fleet_html(current_user="admin", token=""):
     .brand-title {
       display: flex;
       flex-direction: column;
+      min-width: 0;
     }
     .brand-name {
-      font-size: 16px;
+      font-size: 14px;
       font-weight: 800;
       color: var(--text-strong);
-      letter-spacing: -0.3px;
+      letter-spacing: -0.2px;
+      line-height: 1.2;
     }
     .brand-subtitle {
-      font-size: 11px;
+      font-size: 10px;
       color: var(--text-muted);
       font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .nav-section {
-      padding: 20px 14px 10px 14px;
+      padding: 10px 10px 4px 10px;
     }
     .nav-section-title {
-      font-size: 11px;
+      font-size: 10px;
       text-transform: uppercase;
-      letter-spacing: 0.8px;
+      letter-spacing: 0.7px;
       color: var(--text-dim);
       font-weight: 700;
-      padding-left: 10px;
-      margin-bottom: 8px;
+      padding-left: 8px;
+      margin-bottom: 5px;
     }
     .nav-item {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 10px 14px;
-      border-radius: 10px;
+      gap: 8px;
+      padding: 7px 9px;
+      border-radius: 8px;
       color: var(--text-muted);
       text-decoration: none;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.2s ease;
-      margin-bottom: 4px;
+      margin-bottom: 2px;
+      white-space: nowrap;
+      overflow: hidden;
     }
     .nav-item:hover {
       color: var(--text-strong);
@@ -3895,19 +4278,20 @@ def render_fleet_html(current_user="admin", token=""):
     .nav-item.active {
       background: var(--crimson);
       color: #FFFFFF;
-      box-shadow: 0 4px 16px var(--crimson-glow);
+      box-shadow: 0 4px 14px var(--crimson-glow);
     }
     .nav-icon {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 20px;
-      height: 20px;
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
     }
 
     .sidebar-footer {
       margin-top: auto;
-      padding: 18px;
+      padding: 10px 12px;
       border-top: 1px solid var(--card-border);
       background: var(--surface-2);
     }
@@ -3915,16 +4299,17 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 8px;
-      font-size: 12px;
+      margin-bottom: 5px;
+      font-size: 11px;
+      gap: 6px;
     }
     .status-pill {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
+      gap: 4px;
+      padding: 2px 7px;
       border-radius: 20px;
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 700;
     }
     .pill-green {
@@ -4035,8 +4420,8 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Top Navigation Bar */
     .topbar {
-      height: 72px;
-      padding: 0 32px;
+      height: 56px;
+      padding: 0 22px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -4114,7 +4499,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Content Area */
     .content-area {
-      padding: 28px 32px;
+      padding: 20px 22px;
       flex: 1;
     }
 
@@ -4122,12 +4507,12 @@ def render_fleet_html(current_user="admin", token=""):
     .kpi-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 20px;
-      margin-bottom: 28px;
+      gap: 14px;
+      margin-bottom: 20px;
     }
     .kpi-card {
-      border-radius: 18px;
-      padding: 22px 24px;
+      border-radius: 14px;
+      padding: 15px 18px;
       color: #FFFFFF;
       position: relative;
       overflow: hidden;
@@ -4148,21 +4533,21 @@ def render_fleet_html(current_user="admin", token=""):
       background: linear-gradient(135deg, #06B6D4 0%, #0369A1 100%);
     }
     .kpi-title {
-      font-size: 12px;
+      font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.8px;
+      letter-spacing: 0.7px;
       opacity: 0.9;
       font-weight: 700;
-      margin-bottom: 8px;
+      margin-bottom: 5px;
     }
     .kpi-value {
-      font-size: 24px;
+      font-size: 20px;
       font-weight: 800;
-      letter-spacing: -0.5px;
-      margin-bottom: 6px;
+      letter-spacing: -0.4px;
+      margin-bottom: 4px;
     }
     .kpi-subtitle {
-      font-size: 12px;
+      font-size: 11px;
       opacity: 0.9;
       font-weight: 500;
     }
@@ -4173,8 +4558,8 @@ def render_fleet_html(current_user="admin", token=""):
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border: 1px solid var(--card-border);
-      border-radius: 18px;
-      padding: 24px;
+      border-radius: 15px;
+      padding: 18px;
       box-shadow: var(--shadow-card);
       transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
       position: relative;
@@ -4189,20 +4574,20 @@ def render_fleet_html(current_user="admin", token=""):
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 20px;
+      gap: 10px;
+      margin-bottom: 14px;
     }
     .section-heading {
-      font-size: 18px;
+      font-size: 16px;
       font-weight: 800;
       color: var(--text-strong);
       letter-spacing: -0.3px;
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
     }
     .section-desc {
-      font-size: 13px;
+      font-size: 12px;
       color: var(--text-muted);
       margin-top: 2px;
     }
@@ -4210,9 +4595,9 @@ def render_fleet_html(current_user="admin", token=""):
     /* Client Tiles Grid */
     .client-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 22px;
-      margin-bottom: 34px;
+      grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
     }
     .client-tile {
       cursor: pointer;
@@ -4221,18 +4606,18 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }
     .client-avatar {
-      width: 48px;
-      height: 48px;
-      border-radius: 14px;
+      width: 40px;
+      height: 40px;
+      border-radius: 11px;
       background: linear-gradient(135deg, rgba(225, 29, 72, 0.2), rgba(225, 29, 72, 0.05));
       border: 1px solid rgba(225, 29, 72, 0.3);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 18px;
+      font-size: 15px;
       font-weight: 800;
       color: #FB7185;
     }
@@ -4317,9 +4702,9 @@ def render_fleet_html(current_user="admin", token=""):
     /* Projects Grid */
     .projects-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-      gap: 22px;
-      margin-bottom: 34px;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
     }
     .project-card {
       cursor: pointer;
@@ -4328,9 +4713,9 @@ def render_fleet_html(current_user="admin", token=""):
     /* Node Cards Grid */
     .nodes-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 22px;
-      margin-bottom: 34px;
+      grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
     }
     .node-card {
       cursor: pointer;
@@ -4339,7 +4724,7 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }
     .node-title-group {
       display: flex;
@@ -4347,7 +4732,7 @@ def render_fleet_html(current_user="admin", token=""):
       gap: 10px;
     }
     .node-name {
-      font-size: 18px;
+      font-size: 16px;
       font-weight: 800;
       color: var(--text-strong);
     }
@@ -4914,7 +5299,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     body.mode-desktop-pc .sidebar { display: flex !important; }
     body.mode-desktop-pc .mobile-bottom-nav { display: none !important; }
-    body.mode-desktop-pc .content-area { padding: 28px 32px !important; }
+    body.mode-desktop-pc .content-area { padding: 20px 22px !important; }
     body.mode-desktop-pc .kpi-grid { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; }
     body.mode-desktop-pc .node-detail-layout { display: grid !important; grid-template-columns: 1.1fr 0.9fr !important; }
     body.mode-desktop-pc .modal-overlay { align-items: center !important; }
@@ -4939,62 +5324,62 @@ def render_fleet_html(current_user="admin", token=""):
       </div>
       <div class="brand-title">
         <span class="brand-name">Anashwar</span>
-        <span class="brand-subtitle">Enterprise Edge Fleet</span>
+        <span class="brand-subtitle">Edge Fleet OS</span>
       </div>
     </div>
 
     <div class="nav-section">
-      <div class="nav-section-title">Operations</div>
+      <div class="nav-section-title">Ops</div>
       <div class="nav-item active" id="nav-dashboard" onclick="navigateTo('dashboard')">
-        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
+        <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
         <span>Live Fleet</span>
       </div>
       <div class="nav-item" id="nav-history" onclick="navigateTo('history-clients')" style="justify-content: space-between;">
-        <span style="display:flex; align-items:center; gap:10px;">
-          <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></span>
-          <span>Fleet History</span>
+        <span style="display:flex; align-items:center; gap:8px;">
+          <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></span>
+          <span>History</span>
         </span>
-        <span class="status-pill pill-cyan" id="sidebar-history-count" style="font-size: 10px; padding: 1px 6px;">0</span>
+        <span class="status-pill pill-cyan" id="sidebar-history-count" style="font-size: 9px; padding: 1px 5px;">0</span>
       </div>
       <div class="nav-item" id="nav-registry" onclick="navigateTo('registry')">
-        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span>
-        <span>Operations Registry</span>
+        <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span>
+        <span>Registry</span>
       </div>
     </div>
 
     <div class="nav-section">
       <div class="nav-section-title" style="display: flex; justify-content: space-between; align-items: center;">
-        <span>Hardware Nodes</span>
-        <span class="status-pill pill-cyan" id="sidebar-node-count" style="font-size: 10px; padding: 1px 6px;">0 Online</span>
+        <span>Nodes</span>
+        <span class="status-pill pill-cyan" id="sidebar-node-count" style="font-size: 9px; padding: 1px 5px;">0 On</span>
       </div>
-      <div id="sidebar-nodes-list" style="display: flex; flex-direction: column; gap: 3px; max-height: 220px; overflow-y: auto;">
+      <div id="sidebar-nodes-list" style="display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto;">
         <!-- Populated live by fetchTelemetry() -->
       </div>
     </div>
 
     <div class="nav-section">
-      <div class="nav-section-title">Administration</div>
+      <div class="nav-section-title">Admin</div>
       <div class="nav-item" onclick="openUserModal()">
-        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
-        <span>Users & Access</span>
+        <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+        <span>Users</span>
       </div>
       <div class="nav-item" onclick="toggleTheme()">
-        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg></span>
-        <span>Switch Theme</span>
+        <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg></span>
+        <span>Theme</span>
       </div>
     </div>
 
     <div class="sidebar-footer">
       <div class="status-badge-row">
-        <span>MQTT Broker</span>
-        <span class="status-pill pill-green"><span class="pulsing-dot"></span> Online</span>
+        <span>MQTT</span>
+        <span class="status-pill pill-green"><span class="pulsing-dot"></span> Live</span>
       </div>
       <div class="status-badge-row">
-        <span style="font-family:var(--font-mono); font-size:11px;">broker.hivemq.com</span>
+        <span style="font-family:var(--font-mono); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">broker.hivemq.com</span>
         <span class="status-pill pill-cyan">1883</span>
       </div>
-      <div style="font-size: 10px; color: var(--text-dim); text-align: center; margin-top: 10px;">
-        Anashwar Fleet OS v4.2 &bull; Edge Fleet
+      <div style="font-size: 9px; color: var(--text-dim); text-align: center; margin-top: 6px;">
+        Anashwar Fleet OS v4.2
       </div>
     </div>
   </aside>
@@ -5738,22 +6123,23 @@ def render_fleet_html(current_user="admin", token=""):
 
   <!-- Modal: In-Situ Web UI Viewer -->
   <div class="modal-overlay" id="modal-insitu-webui">
-    <div class="modal-card" style="max-width: 960px; width: 95vw; padding: 20px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; border-bottom: 1px solid var(--card-border); padding-bottom: 12px; flex-wrap: wrap; gap: 10px;">
+    <div class="modal-card" style="max-width: 1120px; width: 96vw; padding: 14px 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid var(--card-border); padding-bottom: 10px; flex-wrap: wrap; gap: 8px;">
         <div>
-          <h3 style="margin: 0;" id="insitu-modal-title">In-Situ On-Board Web UI</h3>
-          <div style="font-size: 11px; color: #10B981; margin-top: 2px;">Connected via Anashwar Hardware Reverse Proxy Tunnel</div>
+          <h3 style="margin: 0; font-size: 16px;" id="insitu-modal-title">In-Situ On-Board Web UI</h3>
+          <div style="font-size: 11px; color: #10B981; margin-top: 2px;">Connected via Anashwar Global Hardware Proxy</div>
         </div>
-        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="refreshInsituIframe()">
+        <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+          <button class="btn-secondary" style="padding: 6px 10px; font-size: 12px;" onclick="refreshInsituIframe()">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
             <span>Reload</span>
           </button>
-          <a id="insitu-modal-direct-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 12px; font-size: 12px; text-decoration: none;">Direct LAN &rarr;</a>
-          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">&times; Close</button>
+          <a id="insitu-modal-fulltab-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 10px; font-size: 12px; text-decoration: none; border-color: rgba(16,185,129,0.4); color: #10B981;">Open Full Tab &rarr;</a>
+          <a id="insitu-modal-direct-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 10px; font-size: 12px; text-decoration: none;">Direct LAN &rarr;</a>
+          <button class="btn-secondary" style="padding: 6px 10px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">&times; Close</button>
         </div>
       </div>
-      <div style="width: 100%; height: 580px; border-radius: 14px; overflow: hidden; background: var(--log-bg); border: 1px solid var(--card-border);">
+      <div style="width: 100%; height: 72vh; min-height: 520px; border-radius: 12px; overflow: hidden; background: var(--log-bg); border: 1px solid var(--card-border);">
         <iframe id="insitu-iframe" style="width: 100%; height: 100%; border: none;" src="about:blank"></iframe>
       </div>
     </div>
@@ -6595,13 +6981,16 @@ def render_fleet_html(current_user="admin", token=""):
       const iframe = document.getElementById("insitu-iframe");
       const title = document.getElementById("insitu-modal-title");
       const directLink = document.getElementById("insitu-modal-direct-link");
+      const fullTabLink = document.getElementById("insitu-modal-fulltab-link");
       
       const node = telemetryData.nodes ? telemetryData.nodes[selectedNodeName] : null;
       const ip = node ? node.ip : "0.0.0.0";
       const tok = CURRENT_AUTH_TOKEN || localStorage.getItem("anashwar_token") || sessionStorage.getItem("anashwar_token") || "";
+      const proxyUrl = `/proxy/node/${encodeURIComponent(selectedNodeName)}/?token=${encodeURIComponent(tok)}`;
       
       title.innerText = `In-Situ On-Board Web UI: ${selectedNodeName}`;
-      iframe.src = `/proxy/node/${encodeURIComponent(selectedNodeName)}/?token=${encodeURIComponent(tok)}`;
+      iframe.src = proxyUrl;
+      if (fullTabLink) fullTabLink.href = proxyUrl;
       directLink.href = `http://${ip}/`;
       modal.classList.add("open");
     }
@@ -7648,23 +8037,23 @@ def render_fleet_html(current_user="admin", token=""):
               const mcu = nInfo.mcu_family || nInfo.mcu_type || "ESP32";
               const isActive = (currentView === "node-detail" && selectedNodeName === nName) ? "active" : "";
               sHtml += `
-                <div class="nav-item ${isActive}" onclick="openNodeDetail('${escJs(nName)}')" style="font-size:12px; padding:7px 12px; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
-                  <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
-                    <span class="status-dot ${dotClass}" style="width:7px; height:7px; flex-shrink:0;"></span>
+                <div class="nav-item ${isActive}" onclick="openNodeDetail('${escJs(nName)}')" style="font-size:11.5px; padding:6px 8px; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
+                  <div style="display:flex; align-items:center; gap:6px; overflow:hidden; min-width:0;">
+                    <span class="status-dot ${dotClass}" style="width:6px; height:6px; flex-shrink:0;"></span>
                     <span style="font-weight:600; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${escHtml(nName)}</span>
                   </div>
-                  <span class="status-pill pill-cyan" style="font-size:9px; padding:1px 5px; flex-shrink:0;">${escHtml(mcu)}</span>
+                  <span class="status-pill pill-cyan" style="font-size:8.5px; padding:1px 4px; flex-shrink:0;">${escHtml(mcu)}</span>
                 </div>
               `;
             }
             if (!entries.length) {
-              sHtml = '<div style="font-size:11px; color:var(--text-dim); padding:8px 12px;">No hardware nodes registered</div>';
+              sHtml = '<div style="font-size:11px; color:var(--text-dim); padding:6px 8px;">No nodes</div>';
             }
             if (sidebarList.dataset.lastHtml !== sHtml) {
               sidebarList.dataset.lastHtml = sHtml;
               sidebarList.innerHTML = sHtml;
             }
-            if (sidebarCount) sidebarCount.innerText = `${sOnline} Online`;
+            if (sidebarCount) sidebarCount.innerText = `${sOnline} On`;
           }
 
           // KPI Active live nodes, clients & projects
