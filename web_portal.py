@@ -465,183 +465,202 @@ public_tunnel_url = ""
 # HIERARCHICAL FLEET REGISTRY & PERSISTENCE
 # =============================================================================
 DEFAULT_FLEET = {
-    "clients": {
-        "client_1": {
-            "id": "client_1",
-            "name": "Client 1: Alpha Enterprise Corp",
-            "code": "ALPH-CORP",
-            "description": "Autonomous Industrial Edge IoT Operations & Real-time Fleet",
-            "tier": "Tier-1 Enterprise SLA",
-            "contact": "ops@alphaenterprise.com",
-            "created_at": "2026-01-15",
-            "projects": ["proj_1"]
-        }
-    },
-    "projects": {
-        "proj_1": {
-            "id": "proj_1",
-            "client_id": "client_1",
-            "name": "Project 1: Enterprise OTA Fleet",
-            "code": "OTA-FLEET-POC",
-            "description": "Dual ESP32 Wireless & USB Hardware Control Architecture",
-            "created_at": "2026-02-01",
-            "nodes": ["Node: A", "Node: B"]
-        }
-    },
-    "registered_nodes": {
-        "Node: A": {
-            "name": "Node: A",
-            "mac": "EC:C9:FF:FF:08:94",
-            "chip_id": "9408FFFFC9EC",
-            "client_id": "client_1",
-            "project_id": "proj_1",
-            "port": "/dev/cu.usbserial-0001",
-            "expected_hash": "0647df22dceea927a2fe279cdb6fe999fc873a2d1d8f0cfca79934833eb5ed7d"
-        },
-        "Node: B": {
-            "name": "Node: B",
-            "mac": "70:4B:CA:48:E6:BC",
-            "chip_id": "BCE648CA4B70",
-            "client_id": "client_1",
-            "project_id": "proj_1",
-            "port": "/dev/cu.usbserial-3",
-            "expected_hash": "d56ab3dfed28a8a361a0b323be53b3abbd43dbfc16a1eb040a23c940cefbe703"
-        }
+    "clients": {},
+    "projects": {},
+    "registered_nodes": {},
+    "history": {
+        "clients": {},
+        "projects": {},
+        "nodes": {}
     }
 }
 
-fleet_registry = DEFAULT_FLEET
+fleet_registry = {
+    "clients": {},
+    "projects": {},
+    "registered_nodes": {},
+    "history": {
+        "clients": {},
+        "projects": {},
+        "nodes": {}
+    }
+}
+
+_last_history_save_ts = 0.0
+
+def norm_name(s):
+    if not s:
+        return ""
+    s = str(s).replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    return re.sub(r"\s+", " ", s).strip()
+
+def norm_key(s):
+    return norm_name(s).lower()
+
+def ensure_history_schema():
+    if "history" not in fleet_registry or not isinstance(fleet_registry["history"], dict):
+        fleet_registry["history"] = {"clients": {}, "projects": {}, "nodes": {}}
+    for k in ("clients", "projects", "nodes"):
+        if k not in fleet_registry["history"] or not isinstance(fleet_registry["history"][k], dict):
+            fleet_registry["history"][k] = {}
 
 def load_fleet_registry():
     global fleet_registry
+    dirty = False
     if os.path.isfile(REGISTRY_FILE):
         try:
-            with open(REGISTRY_FILE, "r") as f:
+            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if "clients" in data and "projects" in data and "registered_nodes" in data:
                     fleet_registry = data
-                    return
         except Exception as e:
             print(f"[REGISTRY] Error reading {REGISTRY_FILE}: {e}")
-    save_fleet_registry()
+            dirty = True
+    else:
+        dirty = True
+
+    ensure_history_schema()
+
+    # Remove legacy hardcoded POC dummy clients/nodes if lingering from old files
+    stale_client_ids = [
+        cid for cid, c in list(fleet_registry.get("clients", {}).items())
+        if cid in ("client_1", "client_1793973495")
+        or norm_key(c.get("name", "")) in ("client 1: alpha enterprise corp", "hamley's x cadbury milkinis")
+    ]
+    for cid in stale_client_ids:
+        c_obj = fleet_registry["clients"].pop(cid, None)
+        if c_obj:
+            for pid in list(c_obj.get("projects", [])):
+                fleet_registry["projects"].pop(pid, None)
+        dirty = True
+
+    for pid, p_obj in list(fleet_registry.get("projects", {}).items()):
+        if p_obj.get("client_id") in stale_client_ids or pid == "proj_1":
+            fleet_registry["projects"].pop(pid, None)
+            dirty = True
+
+    for n_name, n_obj in list(fleet_registry.get("registered_nodes", {}).items()):
+        if n_obj.get("client_id") in stale_client_ids or n_name in ("Node: A", "Node: B"):
+            fleet_registry["registered_nodes"].pop(n_name, None)
+            dirty = True
+
+    if dirty:
+        save_fleet_registry()
 
 def save_fleet_registry():
     try:
-        with open(REGISTRY_FILE, "w") as f:
+        ensure_history_schema()
+        with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
             json.dump(fleet_registry, f, indent=2)
     except Exception as e:
         print(f"[REGISTRY] Error saving {REGISTRY_FILE}: {e}")
+
+def record_history_online(node_name, client_name, project_name, tdata):
+    """Upsert deduplicated client/project/node records whenever a hardware node is online."""
+    global _last_history_save_ts
+    ensure_history_schema()
+    h = fleet_registry["history"]
+    c_clean = norm_name(client_name) or "Unassigned Client"
+    p_clean = norm_name(project_name) or "Connected Edge Fleet"
+    n_clean = norm_name(node_name) or "ESP32-Node"
+    c_k = norm_key(c_clean)
+    p_k = f"{c_k}::{norm_key(p_clean)}"
+    mac_raw = (tdata.get("mac") or "").strip().upper()
+    chip_raw = (tdata.get("chip_id") or "").strip().upper()
+    n_k = mac_raw or chip_raw or norm_key(n_clean)
+
+    now_ts = time.time()
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    is_new = False
+
+    if c_k not in h["clients"]:
+        is_new = True
+        code = "".join([w[0] for w in c_clean.split() if w and w[0].isalnum()])[:4].upper() or "ENT"
+        h["clients"][c_k] = {
+            "key": c_k,
+            "name": c_clean,
+            "code": code,
+            "first_seen": now_str,
+            "last_seen": now_str,
+            "last_seen_ts": now_ts
+        }
+    else:
+        h["clients"][c_k]["name"] = c_clean
+        h["clients"][c_k]["last_seen"] = now_str
+        h["clients"][c_k]["last_seen_ts"] = now_ts
+
+    if p_k not in h["projects"]:
+        is_new = True
+        p_code = "".join([w[0] for w in p_clean.split() if w and w[0].isalnum()])[:4].upper() or "PRJ"
+        h["projects"][p_k] = {
+            "key": p_k,
+            "client_key": c_k,
+            "client_name": c_clean,
+            "name": p_clean,
+            "code": p_code,
+            "first_seen": now_str,
+            "last_seen": now_str,
+            "last_seen_ts": now_ts
+        }
+    else:
+        h["projects"][p_k]["name"] = p_clean
+        h["projects"][p_k]["client_key"] = c_k
+        h["projects"][p_k]["client_name"] = c_clean
+        h["projects"][p_k]["last_seen"] = now_str
+        h["projects"][p_k]["last_seen_ts"] = now_ts
+
+    if n_k not in h["nodes"]:
+        is_new = True
+        h["nodes"][n_k] = {
+            "key": n_k,
+            "project_key": p_k,
+            "client_key": c_k,
+            "client_name": c_clean,
+            "project_name": p_clean,
+            "name": n_clean,
+            "mac": mac_raw,
+            "chip_id": chip_raw,
+            "ip": tdata.get("ip", "0.0.0.0"),
+            "mcu_family": tdata.get("mcu") or tdata.get("mcu_family") or "ESP32",
+            "first_seen": now_str,
+            "last_seen": now_str,
+            "last_seen_ts": now_ts
+        }
+    else:
+        node_h = h["nodes"][n_k]
+        node_h["name"] = n_clean
+        node_h["project_key"] = p_k
+        node_h["client_key"] = c_k
+        node_h["client_name"] = c_clean
+        node_h["project_name"] = p_clean
+        if mac_raw: node_h["mac"] = mac_raw
+        if chip_raw: node_h["chip_id"] = chip_raw
+        if tdata.get("ip"): node_h["ip"] = tdata.get("ip")
+        if tdata.get("mcu") or tdata.get("mcu_family"):
+            node_h["mcu_family"] = tdata.get("mcu") or tdata.get("mcu_family")
+        node_h["last_seen"] = now_str
+        node_h["last_seen_ts"] = now_ts
+
+    if is_new or (now_ts - _last_history_save_ts >= 60.0):
+        _last_history_save_ts = now_ts
+        save_fleet_registry()
 
 load_fleet_registry()
 
 # Dynamic auto-discovered hardware devices not yet assigned to a project
 auto_discovered_nodes = {}
 
-# Live Hardware Telemetry
-nodes_telemetry = {
-    "Node: A": {
-        "name": "Node: A",
-        "mac": "EC:C9:FF:FF:08:94",
-        "chip_id": "9408FFFFC9EC",
-        "port": "/dev/cu.usbserial-0001",
-        "client": "Client 1: Alpha Enterprise Corp",
-        "project": "Project 1: Enterprise OTA Fleet",
-        "sec_hash": "0647df22dceea927a2fe279cdb6fe999fc873a2d1d8f0cfca79934833eb5ed7d",
-        "trust_score": 100,
-        "trust_level": "Verified (High Trust)",
-        "ip": "10.94.142.79",
-        "mode": 1,
-        "service": True,
-        "offline": False,
-        "state": "online",
-        "delay": 0.0,
-        "btn": 0,
-        "led": 0,
-        "rssi": -45,
-        "heap": 242000,
-        "uptime": 0,
-        "mcu_family": "ESP32",
-        "mcu_arch": "Xtensa LX6 Dual-Core @ 240MHz",
-        "flash_mb": 4.0,
-        "ram_total_kb": 320,
-        "wireless_bands": "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)",
-        "last_seen": 0,
-        "online": False
-    },
-    "Node: B": {
-        "name": "Node: B",
-        "mac": "70:4B:CA:48:E6:BC",
-        "chip_id": "BCE648CA4B70",
-        "port": "/dev/cu.usbserial-3",
-        "client": "Client 1: Alpha Enterprise Corp",
-        "project": "Project 1: Enterprise OTA Fleet",
-        "sec_hash": "d56ab3dfed28a8a361a0b323be53b3abbd43dbfc16a1eb040a23c940cefbe703",
-        "trust_score": 100,
-        "trust_level": "Verified (High Trust)",
-        "ip": "10.94.142.111",
-        "mode": 1,
-        "service": True,
-        "offline": False,
-        "state": "online",
-        "delay": 0.0,
-        "btn": 0,
-        "led": 0,
-        "rssi": -42,
-        "heap": 241000,
-        "uptime": 0,
-        "mcu_family": "ESP32",
-        "mcu_arch": "Xtensa LX6 Dual-Core @ 240MHz",
-        "flash_mb": 4.0,
-        "ram_total_kb": 320,
-        "wireless_bands": "2.4 GHz 802.11 b/g/n + BLE 4.2 (PCB Trace Antenna)",
-        "last_seen": 0,
-        "online": False
-    }
-}
-
-# Update state tracking per node
-node_updates = {
-    "Node: A": {
-        "active": False,
-        "route": "cloud",
-        "filename": "Base_firmware.bin",
-        "total_bytes": 0,
-        "sent_bytes": 0,
-        "percent": 0,
-        "speed_kbps": 0.0,
-        "stage": "idle",
-        "stage_text": "Ready",
-        "target_mode": 1,
-        "start_time": 0,
-        "reboot_start_time": 0,
-        "verified_time": 0,
-        "error_message": ""
-    },
-    "Node: B": {
-        "active": False,
-        "route": "cloud",
-        "filename": "Base_firmware.bin",
-        "total_bytes": 0,
-        "sent_bytes": 0,
-        "percent": 0,
-        "speed_kbps": 0.0,
-        "stage": "idle",
-        "stage_text": "Ready",
-        "target_mode": 1,
-        "start_time": 0,
-        "reboot_start_time": 0,
-        "verified_time": 0,
-        "error_message": ""
-    }
-}
+# Live Hardware Telemetry (starts clean; populated from registered/live MQTT hardware)
+nodes_telemetry = {}
+node_updates = {}
 
 def sync_telemetry_with_registry():
     global nodes_telemetry, node_updates, fleet_registry
     for n_name, r_node in fleet_registry.get("registered_nodes", {}).items():
-        c_id = r_node.get("client_id", "client_1")
-        p_id = r_node.get("project_id", "proj_1")
-        c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "Alpha Enterprise Corp")
-        p_name = fleet_registry.get("projects", {}).get(p_id, {}).get("name", "Enterprise OTA Fleet")
+        c_id = r_node.get("client_id", "")
+        p_id = r_node.get("project_id", "")
+        c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "Unassigned Client")
+        p_name = fleet_registry.get("projects", {}).get(p_id, {}).get("name", "Connected Edge Fleet")
         if n_name not in nodes_telemetry:
             nodes_telemetry[n_name] = {
                 "name": n_name,
@@ -696,7 +715,13 @@ def sync_telemetry_with_registry():
 
 sync_telemetry_with_registry()
 
+def _is_ping_noise(text):
+    u = str(text or "").upper()
+    return (":PING" in u) or ("MANUAL PRESENCE PING" in u)
+
 def log_event(msg, actor="SYSTEM", actor_role="SYSTEM"):
+    if _is_ping_noise(msg):
+        return
     now = time.localtime()
     day_str = time.strftime("%Y-%m-%d", now)
     ts = time.strftime("[%H:%M:%S]", now)
@@ -993,27 +1018,114 @@ def inspect_esp32_binary(file_path):
 def resolve_target_node(val):
     if not val:
         return None
-    val_clean = str(val).strip()
+    val_clean = norm_name(val)
     if val_clean in nodes_telemetry:
         return val_clean
 
     v = val_clean.lower()
     for name, node in nodes_telemetry.items():
-        if v == name.lower():
+        if v == norm_key(name):
             return name
-        if v == node.get("mac", "").lower():
+        if node.get("mac") and v == node.get("mac", "").lower():
             return name
-        if v == node.get("chip_id", "").lower():
+        if node.get("chip_id") and v == node.get("chip_id", "").lower():
             return name
-        if v == node.get("port", "").lower():
+        if node.get("port") and v == node.get("port", "").lower() and "usb" in v:
             return name
-        if v == node.get("ip", "").lower():
+        if node.get("ip") and node.get("ip") not in ("", "0.0.0.0") and v == node.get("ip", "").lower():
             return name
-    if "node: a" in v or v in ("node a", "a", "alpha", "node alpha"):
+    if ("node: a" in v or v in ("node a", "a", "alpha", "node alpha")) and "Node: A" in nodes_telemetry:
         return "Node: A"
-    if "node: b" in v or v in ("node b", "b", "beta", "node beta"):
+    if ("node: b" in v or v in ("node b", "b", "beta", "node beta")) and "Node: B" in nodes_telemetry:
         return "Node: B"
     return None
+
+def match_or_create_client_project(client_name, project_name):
+    c_clean = norm_name(client_name) or "Enterprise Client"
+    p_clean = norm_name(project_name) or "Connected Edge Fleet"
+
+    client_id = None
+    for cid, c in fleet_registry["clients"].items():
+        if norm_key(c.get("name", "")) == norm_key(c_clean):
+            client_id = cid
+            break
+    if not client_id:
+        clean_code = "".join([w[0] for w in c_clean.split() if w and w[0].isalnum()])[:4].upper() or "ENT"
+        client_id = f"client_{int(time.time())}_{abs(hash(c_clean)) % 1000}"
+        fleet_registry["clients"][client_id] = {
+            "id": client_id,
+            "name": c_clean,
+            "code": clean_code,
+            "description": f"Auto-discovered Enterprise Client: {c_clean}",
+            "tier": "Tier-1 Enterprise SLA",
+            "contact": "ops@anashwartech.com",
+            "created_at": time.strftime("%Y-%m-%d"),
+            "projects": []
+        }
+
+    project_id = None
+    for pid, p in fleet_registry["projects"].items():
+        if p.get("client_id") == client_id and norm_key(p.get("name", "")) == norm_key(p_clean):
+            project_id = pid
+            break
+    if not project_id:
+        proj_code = "".join([w[0] for w in p_clean.split() if w and w[0].isalnum()])[:4].upper() or "PRJ"
+        project_id = f"proj_{int(time.time())}_{abs(hash(p_clean)) % 1000}"
+        fleet_registry["projects"][project_id] = {
+            "id": project_id,
+            "client_id": client_id,
+            "name": p_clean,
+            "code": proj_code,
+            "description": f"Autonomous Edge Project: {p_clean}",
+            "created_at": time.strftime("%Y-%m-%d"),
+            "nodes": []
+        }
+    if project_id not in fleet_registry["clients"][client_id]["projects"]:
+        fleet_registry["clients"][client_id]["projects"].append(project_id)
+
+    return client_id, c_clean, project_id, p_clean
+
+def sync_node_identity_from_device(old_key, new_node_name, new_client_name, new_project_name, tdata):
+    """Apply node-initiated identity revert (e.g. NVS reset on ESP32 UI) back onto Portal registry."""
+    new_node_clean = norm_name(new_node_name) or old_key
+    cid, c_clean, pid, p_clean = match_or_create_client_project(new_client_name, new_project_name)
+
+    reg_node = fleet_registry["registered_nodes"].pop(old_key, None) or {
+        "mac": tdata.get("mac", ""),
+        "chip_id": tdata.get("chip_id", ""),
+        "port": tdata.get("port", "WiFi Wireless"),
+        "expected_hash": tdata.get("sec_hash", "")
+    }
+    old_pid = reg_node.get("project_id")
+    if old_pid and old_pid in fleet_registry["projects"]:
+        old_nodes = fleet_registry["projects"][old_pid].get("nodes", [])
+        fleet_registry["projects"][old_pid]["nodes"] = [n for n in old_nodes if n != old_key]
+
+    reg_node["name"] = new_node_clean
+    reg_node["client_id"] = cid
+    reg_node["project_id"] = pid
+    if "reset_seq" in tdata:
+        reg_node["last_reset_seq"] = int(tdata.get("reset_seq", 0))
+    fleet_registry["registered_nodes"][new_node_clean] = reg_node
+
+    if new_node_clean not in fleet_registry["projects"][pid]["nodes"]:
+        fleet_registry["projects"][pid]["nodes"].append(new_node_clean)
+
+    if old_key != new_node_clean:
+        t_val = nodes_telemetry.pop(old_key, {})
+        t_val["name"] = new_node_clean
+        nodes_telemetry[new_node_clean] = t_val
+        if old_key in node_updates:
+            node_updates[new_node_clean] = node_updates.pop(old_key)
+
+    nodes_telemetry[new_node_clean]["client"] = c_clean
+    nodes_telemetry[new_node_clean]["project"] = p_clean
+    nodes_telemetry[new_node_clean]["pending_portal_sync"] = False
+    nodes_telemetry[new_node_clean]["portal_rename_ts"] = 0
+
+    save_fleet_registry()
+    log_event(f"NVS RESET SYNC: Hardware [{new_node_clean}] reverted identity to Client '{c_clean}' / Project '{p_clean}'")
+    return new_node_clean
 
 # =============================================================================
 # ZERO-DEPENDENCY MQTT CLIENT (SOCKET IMPLEMENTATION)
@@ -1084,65 +1196,27 @@ def start_mqtt_client():
                         try:
                             tdata = json.loads(msg)
                             raw_id = tdata.get("id", "")
-                            raw_name = tdata.get("name", "")
-                            raw_mac = tdata.get("mac", "")
-                            raw_chip = tdata.get("chip_id", "")
+                            raw_name = norm_name(tdata.get("name", ""))
+                            raw_mac = tdata.get("mac", "").strip()
+                            raw_chip = tdata.get("chip_id", "").strip()
+                            raw_client = norm_name(tdata.get("client", ""))
+                            raw_project = norm_name(tdata.get("project", ""))
 
-                            target_key = resolve_target_node(raw_name) or resolve_target_node(raw_id) or resolve_target_node(raw_mac)
+                            # Prioritize immutable silicon MAC / Chip ID first so renames/resets resolve accurately
+                            target_key = (
+                                resolve_target_node(raw_mac)
+                                or resolve_target_node(raw_chip)
+                                or resolve_target_node(raw_name)
+                                or resolve_target_node(raw_id)
+                            )
+
                             if not target_key:
-                                ip = tdata.get("ip", "")
-                                if ip == "10.94.142.79": target_key = "Node: A"
-                                elif ip == "10.94.142.111": target_key = "Node: B"
+                                # ZERO-TOUCH FLEET AUTO-ONBOARDING (Deduplicated & Normalized)
+                                target_name = raw_name or f"Node-{raw_mac[-5:].replace(':','').upper() if len(raw_mac)>=5 else str(int(time.time()))[-4:]}"
+                                c_in = raw_client or "Enterprise Client"
+                                p_in = raw_project or "Connected Edge Fleet"
+                                client_id, client_name, project_id, project_name = match_or_create_client_project(c_in, p_in)
 
-                            if not target_key:
-                                # ZERO-TOUCH FLEET AUTO-ONBOARDING:
-                                # Automatically register Client, Project, and Node dynamically!
-                                target_name = (raw_name.strip() if raw_name else "") or f"Node-{raw_mac[-5:].replace(':','').upper() if len(raw_mac)>=5 else str(int(time.time()))[-4:]}"
-                                client_name = (tdata.get("client") or "").strip() or "Alpha Enterprise Corp"
-                                project_name = (tdata.get("project") or "").strip() or "Connected Edge Fleet"
-
-                                # 1. Match or Create Client
-                                client_id = None
-                                for cid, c in fleet_registry["clients"].items():
-                                    if c.get("name", "").strip().lower() == client_name.lower():
-                                        client_id = cid
-                                        break
-                                if not client_id:
-                                    clean_code = "".join([w[0] for w in client_name.split() if w.isalnum()])[:4].upper() or "ENT"
-                                    client_id = f"client_{int(time.time())}_{abs(hash(client_name)) % 1000}"
-                                    fleet_registry["clients"][client_id] = {
-                                        "id": client_id,
-                                        "name": client_name,
-                                        "code": clean_code,
-                                        "description": f"Auto-discovered Enterprise Client: {client_name}",
-                                        "tier": "Tier-1 Enterprise SLA",
-                                        "contact": "ops@anashwartech.com",
-                                        "created_at": time.strftime("%Y-%m-%d"),
-                                        "projects": []
-                                    }
-
-                                # 2. Match or Create Project
-                                project_id = None
-                                for pid, p in fleet_registry["projects"].items():
-                                    if p.get("client_id") == client_id and p.get("name", "").strip().lower() == project_name.lower():
-                                        project_id = pid
-                                        break
-                                if not project_id:
-                                    proj_code = "".join([w[0] for w in project_name.split() if w.isalnum()])[:4].upper() or "PRJ"
-                                    project_id = f"proj_{int(time.time())}_{abs(hash(project_name)) % 1000}"
-                                    fleet_registry["projects"][project_id] = {
-                                        "id": project_id,
-                                        "client_id": client_id,
-                                        "name": project_name,
-                                        "code": proj_code,
-                                        "description": f"Autonomous Edge Project: {project_name}",
-                                        "created_at": time.strftime("%Y-%m-%d"),
-                                        "nodes": []
-                                    }
-                                    if project_id not in fleet_registry["clients"][client_id]["projects"]:
-                                        fleet_registry["clients"][client_id]["projects"].append(project_id)
-
-                                # 3. Register Node under Project & Registry
                                 if target_name not in fleet_registry["projects"][project_id]["nodes"]:
                                     fleet_registry["projects"][project_id]["nodes"].append(target_name)
 
@@ -1153,11 +1227,11 @@ def start_mqtt_client():
                                     "client_id": client_id,
                                     "project_id": project_id,
                                     "port": tdata.get("port", "WiFi Wireless"),
-                                    "expected_hash": tdata.get("sec_hash", "")
+                                    "expected_hash": tdata.get("sec_hash", ""),
+                                    "last_reset_seq": int(tdata.get("reset_seq", 0))
                                 }
                                 save_fleet_registry()
 
-                                # 4. Initialize in-memory telemetry & update tracking
                                 nodes_telemetry[target_name] = {
                                     "name": target_name,
                                     "mac": raw_mac,
@@ -1205,10 +1279,50 @@ def start_mqtt_client():
                                 }
                                 target_key = target_name
                                 log_event(f"AUTO-DISCOVERY: Node '{target_name}' onboarded into Client '{client_name}' & Project '{project_name}'")
+                            else:
+                                # Detect if the ESP32 executed a local NVS Reset to coded defaults
+                                cur_node = nodes_telemetry[target_key]
+                                reg_entry = fleet_registry["registered_nodes"].get(target_key, {})
+                                rep_rst_seq = int(tdata.get("reset_seq", 0)) if "reset_seq" in tdata else 0
+                                prev_rst_seq = int(reg_entry.get("last_reset_seq", 0))
+                                id_custom = tdata.get("identity_custom", None)
+
+                                names_differ = (
+                                    (raw_name and norm_key(raw_name) != norm_key(target_key))
+                                    or (raw_client and norm_key(raw_client) != norm_key(cur_node.get("client", "")))
+                                    or (raw_project and norm_key(raw_project) != norm_key(cur_node.get("project", "")))
+                                )
+
+                                if rep_rst_seq > prev_rst_seq:
+                                    target_key = sync_node_identity_from_device(
+                                        target_key, raw_name or target_key,
+                                        raw_client or cur_node.get("client", ""),
+                                        raw_project or cur_node.get("project", ""),
+                                        tdata
+                                    )
+                                elif cur_node.get("pending_portal_sync"):
+                                    # Wait for ESP32 echo matching new portal names or 8s grace period
+                                    if not names_differ:
+                                        cur_node["pending_portal_sync"] = False
+                                    elif time.time() - cur_node.get("portal_rename_ts", 0) > 8.0 and id_custom is False and names_differ:
+                                        target_key = sync_node_identity_from_device(
+                                            target_key, raw_name or target_key,
+                                            raw_client or cur_node.get("client", ""),
+                                            raw_project or cur_node.get("project", ""),
+                                            tdata
+                                        )
+                                elif id_custom is False and names_differ:
+                                    target_key = sync_node_identity_from_device(
+                                        target_key, raw_name or target_key,
+                                        raw_client or cur_node.get("client", ""),
+                                        raw_project or cur_node.get("project", ""),
+                                        tdata
+                                    )
 
                             node = nodes_telemetry[target_key]
-                            if tdata.get("client"): node["client"] = tdata["client"]
-                            if tdata.get("project"): node["project"] = tdata["project"]
+                            if not node.get("pending_portal_sync"):
+                                if raw_client: node["client"] = raw_client
+                                if raw_project: node["project"] = raw_project
                             node["mode"] = tdata.get("mode", node["mode"])
                             node["service"] = bool(tdata.get("service", True))
                             node["state"] = tdata.get("state", "online")
@@ -1228,6 +1342,9 @@ def start_mqtt_client():
                             if "offline" in tdata: node["offline"] = bool(tdata["offline"])
                             node["last_seen"] = time.time()
                             node["online"] = True
+
+                            # Record unique seen-online entity into persistent History
+                            record_history_online(target_key, node.get("client", ""), node.get("project", ""), node)
 
                             # Verify 4-point majority security
                             reg_node = fleet_registry["registered_nodes"].get(target_key, {})
@@ -1260,7 +1377,7 @@ def start_mqtt_client():
     t = threading.Thread(target=mqtt_listener, daemon=True)
     t.start()
 
-def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DEFAULT_MQTT_PORT):
+def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DEFAULT_MQTT_PORT, silent=False):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(6)
     try:
@@ -1291,7 +1408,8 @@ def publish_mqtt_command(topic, payload_str, broker=DEFAULT_MQTT_BROKER, port=DE
                 break
 
         s.sendall(header + var_header + p_bytes)
-        log_event(f"MQTT Command Dispatched: '{payload_str}' -> '{topic}'")
+        if not silent and not _is_ping_noise(payload_str):
+            log_event(f"MQTT Command Dispatched: '{payload_str}' -> '{topic}'")
         return True
     except Exception as e:
         log_event(f"MQTT Publish Error: {e}")
@@ -1386,7 +1504,7 @@ def render_cloud_insitu_page(target_node):
     badge_class = "badge-act" if service else "badge-sby"
     badge_text = "ACTIVE" if service else "STANDBY"
     btn_class = "btn-off" if service else "btn-on"
-    btn_text = "⏸ Put Node into STANDBY" if service else "▶ Put Node into ACTIVE"
+    btn_text = "Put Node into STANDBY" if service else "Put Node into ACTIVE"
     target_action = "OFF" if service else "ON"
 
     return f"""<!DOCTYPE html>
@@ -1508,7 +1626,7 @@ button {{
 
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-      <div class="node-title">⚡ {name}</div>
+      <div class="node-title">{name}</div>
       <span class="badge {badge_class}" id="service-badge">{badge_text}</span>
     </div>
     <div class="row"><span class="lbl">Client</span><span class="val">{client}</span></div>
@@ -1527,12 +1645,12 @@ button {{
 
     <!-- Remote Reboot Button -->
     <button type="button" class="btn-reboot" onclick="rebootNode('{target_node}')">
-      🔄 Reboot Hardware
+      Reboot Hardware
     </button>
 
     <!-- Direct LAN link when on same Wi-Fi -->
     <a href="http://{ip}/" target="_blank" class="btn-direct">
-      ↗ Direct LAN Hardware Link (When connected to {name}'s local Wi-Fi)
+      &nearr; Direct LAN Hardware Link (When connected to {name}'s local Wi-Fi)
     </a>
   </div>
 </div>
@@ -1650,12 +1768,12 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
 
-            # Active Operator Presence Ping: Broadcast PING to ESP32 fleet via MQTT
+            # Active Operator Presence Ping: Broadcast PING silently on backend
             global last_presence_ping_time
             now = time.time()
             if now - last_presence_ping_time >= 3.0:
                 last_presence_ping_time = now
-                threading.Thread(target=publish_mqtt_command, args=(DEFAULT_MQTT_TOPIC_COMMANDS, "CMD:[*]:PING"), daemon=True).start()
+                threading.Thread(target=publish_mqtt_command, args=(DEFAULT_MQTT_TOPIC_COMMANDS, "CMD:[*]:PING", DEFAULT_MQTT_BROKER, DEFAULT_MQTT_PORT, True), daemon=True).start()
 
             # Ping/ACK presence evaluation (ACK received within 15s = Online Green, otherwise Offline Red)
             for key, node in nodes_telemetry.items():
@@ -1673,7 +1791,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     u["stage_text"] = f"Rebooting & establishing connection... {elapsed}s elapsed (est. 15-25s)"
 
             caller_role = users_db.get(user, {}).get("role", "User")
-            filtered_logs = [format_log_display(l, caller_role) for l in activity_logs if can_user_view_log(l, user, caller_role)]
+            filtered_logs = [format_log_display(l, caller_role) for l in activity_logs if (not _is_ping_noise(l)) and can_user_view_log(l, user, caller_role)]
 
             payload = {
                 "nodes": nodes_telemetry,
@@ -1775,15 +1893,15 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 if os.path.isfile(log_file):
                     try:
                         with open(log_file, "r", encoding="utf-8") as f:
-                            lines = f.readlines()
+                            lines = [ln for ln in f if not _is_ping_noise(ln)]
                             count = len(lines)
                             has_events = (count > 0)
                     except Exception:
                         pass
                 today_str = time.strftime("%Y-%m-%d")
                 if date_str == today_str and len(activity_logs) > 0 and count == 0:
-                    count = len(activity_logs)
-                    has_events = True
+                    count = len([ln for ln in activity_logs if not _is_ping_noise(ln)])
+                    has_events = (count > 0)
 
                 days_list.append({
                     "date": date_str,
@@ -1823,12 +1941,12 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     with open(log_file, "r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
-                            if line:
+                            if line and not _is_ping_noise(line):
                                 events.append(line)
                 except Exception as e:
                     events.append(f"[ERROR] Could not read log file: {e}")
             elif date_str == time.strftime("%Y-%m-%d"):
-                events = list(activity_logs)
+                events = [l for l in activity_logs if not _is_ping_noise(l)]
 
             caller_role = users_db.get(user, {}).get("role", "User")
             filtered_events = [format_log_display(line, caller_role) for line in events if can_user_view_log(line, user, caller_role)]
@@ -1862,7 +1980,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 return
 
             caller_role = users_db.get(user, {}).get("role", "User")
-            download_lines = [format_log_display(l.strip(), caller_role) + "\n" for l in raw_lines if can_user_view_log(l.strip(), user, caller_role)]
+            download_lines = [format_log_display(l.strip(), caller_role) + "\n" for l in raw_lines if (not _is_ping_noise(l)) and can_user_view_log(l.strip(), user, caller_role)]
             content_bytes = "".join(download_lines).encode("utf-8")
 
             self.send_response(200)
@@ -2155,14 +2273,15 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
             elif action == "PING":
                 cmd = f"CMD:[{target_node}]:PING"
-                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
-                log_event(f"COMMAND: [{target_node}] manual presence ping dispatched", actor=user, actor_role=caller_role)
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd, silent=True)
 
             elif action == "RAW_CMD":
                 clean_cmd = str(val).strip()
                 cmd = f"CMD:[{target_node}]:{clean_cmd}"
-                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
-                log_event(f"DIRECTIVE: [{target_node}] custom command dispatched: '{clean_cmd}'", actor=user, actor_role=caller_role)
+                is_ping = _is_ping_noise(cmd) or clean_cmd.upper() == "PING"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd, silent=is_ping)
+                if not is_ping:
+                    log_event(f"DIRECTIVE: [{target_node}] custom command dispatched: '{clean_cmd}'", actor=user, actor_role=caller_role)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2229,7 +2348,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         # 3. Create Client Endpoint
         elif path == "/api/client/create":
             data = parse_qs(body.decode("utf-8"))
-            name = data.get("name", [""])[0].strip()
+            name = norm_name(data.get("name", [""])[0])
             code = data.get("code", [""])[0].strip()
             desc = data.get("description", [""])[0].strip()
 
@@ -2243,7 +2362,8 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                     "tier": "Tier-1 Enterprise SLA",
                     "contact": "admin@enterprise.com",
                     "created_at": time.strftime("%Y-%m-%d"),
-                    "projects": []
+                    "projects": [],
+                    "manual_pending": True
                 }
                 save_fleet_registry()
                 log_event(f"REGISTRY: Created Client '{name}' ({c_id})", actor=user, actor_role=caller_role)
@@ -2254,19 +2374,49 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(400, "Client name is required")
 
-        # 4. Delete Client Endpoint
+        # 4. Delete Client Endpoint (cascade deletes projects, nodes, telemetry & history entry)
         elif path == "/api/client/delete":
             data = parse_qs(body.decode("utf-8"))
             c_id = data.get("client_id", [""])[0].strip()
+            deleted = False
+            ensure_history_schema()
             if c_id in fleet_registry["clients"]:
                 c_name = fleet_registry["clients"][c_id]["name"]
                 proj_ids = list(fleet_registry["clients"][c_id].get("projects", []))
                 for p_id in proj_ids:
-                    if p_id in fleet_registry["projects"]:
-                        del fleet_registry["projects"][p_id]
+                    p_obj = fleet_registry["projects"].pop(p_id, None)
+                    if p_obj:
+                        for n_name in list(p_obj.get("nodes", [])):
+                            fleet_registry["registered_nodes"].pop(n_name, None)
+                            nodes_telemetry.pop(n_name, None)
+                            node_updates.pop(n_name, None)
+                # Remove any remaining registered nodes tied to this client_id
+                for n_name in [k for k, v in list(fleet_registry["registered_nodes"].items()) if v.get("client_id") == c_id]:
+                    fleet_registry["registered_nodes"].pop(n_name, None)
+                    nodes_telemetry.pop(n_name, None)
+                    node_updates.pop(n_name, None)
                 del fleet_registry["clients"][c_id]
+                c_k = norm_key(c_name)
+                fleet_registry["history"]["clients"].pop(c_k, None)
+                for pk in [k for k, v in list(fleet_registry["history"]["projects"].items()) if v.get("client_key") == c_k]:
+                    fleet_registry["history"]["projects"].pop(pk, None)
+                for nk in [k for k, v in list(fleet_registry["history"]["nodes"].items()) if v.get("client_key") == c_k]:
+                    fleet_registry["history"]["nodes"].pop(nk, None)
                 save_fleet_registry()
                 log_event(f"REGISTRY: Client '{c_name}' ({c_id}) deleted by '{user}'", actor=user, actor_role=caller_role)
+                deleted = True
+            elif c_id in fleet_registry["history"]["clients"]:
+                c_name = fleet_registry["history"]["clients"][c_id].get("name", c_id)
+                fleet_registry["history"]["clients"].pop(c_id, None)
+                for pk in [k for k, v in list(fleet_registry["history"]["projects"].items()) if v.get("client_key") == c_id]:
+                    fleet_registry["history"]["projects"].pop(pk, None)
+                for nk in [k for k, v in list(fleet_registry["history"]["nodes"].items()) if v.get("client_key") == c_id]:
+                    fleet_registry["history"]["nodes"].pop(nk, None)
+                save_fleet_registry()
+                log_event(f"HISTORY: Client '{c_name}' removed by '{user}'", actor=user, actor_role=caller_role)
+                deleted = True
+
+            if deleted:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2278,7 +2428,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/project/create":
             data = parse_qs(body.decode("utf-8"))
             client_id = data.get("client_id", [""])[0].strip()
-            name = data.get("name", [""])[0].strip()
+            name = norm_name(data.get("name", [""])[0])
             code = data.get("code", [""])[0].strip()
             desc = data.get("description", [""])[0].strip()
 
@@ -2303,18 +2453,41 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(400, "Invalid client ID or project name")
 
-        # 6. Delete Project Endpoint
+        # 6. Delete Project Endpoint (cascade deletes nodes & telemetry)
         elif path == "/api/project/delete":
             data = parse_qs(body.decode("utf-8"))
             p_id = data.get("project_id", [""])[0].strip()
+            ensure_history_schema()
+            deleted = False
             if p_id in fleet_registry["projects"]:
-                p_name = fleet_registry["projects"][p_id]["name"]
-                c_id = fleet_registry["projects"][p_id].get("client_id")
+                p_obj = fleet_registry["projects"][p_id]
+                p_name = p_obj["name"]
+                c_id = p_obj.get("client_id")
+                c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "")
+                for n_name in list(p_obj.get("nodes", [])):
+                    fleet_registry["registered_nodes"].pop(n_name, None)
+                    nodes_telemetry.pop(n_name, None)
+                    node_updates.pop(n_name, None)
                 if c_id and c_id in fleet_registry["clients"] and p_id in fleet_registry["clients"][c_id]["projects"]:
                     fleet_registry["clients"][c_id]["projects"].remove(p_id)
                 del fleet_registry["projects"][p_id]
+                p_k = f"{norm_key(c_name)}::{norm_key(p_name)}"
+                fleet_registry["history"]["projects"].pop(p_k, None)
+                for nk in [k for k, v in list(fleet_registry["history"]["nodes"].items()) if v.get("project_key") == p_k]:
+                    fleet_registry["history"]["nodes"].pop(nk, None)
                 save_fleet_registry()
                 log_event(f"REGISTRY: Project '{p_name}' ({p_id}) deleted by '{user}'", actor=user, actor_role=caller_role)
+                deleted = True
+            elif p_id in fleet_registry["history"]["projects"]:
+                p_name = fleet_registry["history"]["projects"][p_id].get("name", p_id)
+                fleet_registry["history"]["projects"].pop(p_id, None)
+                for nk in [k for k, v in list(fleet_registry["history"]["nodes"].items()) if v.get("project_key") == p_id]:
+                    fleet_registry["history"]["nodes"].pop(nk, None)
+                save_fleet_registry()
+                log_event(f"HISTORY: Project '{p_name}' removed by '{user}'", actor=user, actor_role=caller_role)
+                deleted = True
+
+            if deleted:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2325,7 +2498,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         # 7. Create/Register Node Endpoint
         elif path == "/api/node/create":
             data = parse_qs(body.decode("utf-8"))
-            n_name = data.get("name", [""])[0].strip()
+            n_name = norm_name(data.get("name", [""])[0])
             mac = data.get("mac", [""])[0].strip()
             chip_id = data.get("chip_id", [""])[0].strip()
             port = data.get("port", ["WiFi Wireless"])[0].strip()
@@ -2358,19 +2531,30 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         # 8. Delete Node Endpoint
         elif path == "/api/node/delete":
             data = parse_qs(body.decode("utf-8"))
-            n_name = data.get("node_name", [""])[0].strip()
+            n_name = norm_name(data.get("node_name", [""])[0])
             target_node = resolve_target_node(n_name) or n_name
+            ensure_history_schema()
+            deleted = False
             if target_node in fleet_registry["registered_nodes"]:
                 p_id = fleet_registry["registered_nodes"][target_node].get("project_id")
+                mac_u = fleet_registry["registered_nodes"][target_node].get("mac", "").upper()
                 if p_id and p_id in fleet_registry["projects"] and target_node in fleet_registry["projects"][p_id]["nodes"]:
                     fleet_registry["projects"][p_id]["nodes"].remove(target_node)
                 del fleet_registry["registered_nodes"][target_node]
-                if target_node in nodes_telemetry:
-                    del nodes_telemetry[target_node]
-                if target_node in node_updates:
-                    del node_updates[target_node]
+                nodes_telemetry.pop(target_node, None)
+                node_updates.pop(target_node, None)
+                if mac_u and mac_u in fleet_registry["history"]["nodes"]:
+                    fleet_registry["history"]["nodes"].pop(mac_u, None)
+                fleet_registry["history"]["nodes"].pop(norm_key(target_node), None)
                 save_fleet_registry()
                 log_event(f"REGISTRY: Node [{target_node}] removed from registry by '{user}'", actor=user, actor_role=caller_role)
+                deleted = True
+            elif n_name in fleet_registry["history"]["nodes"]:
+                fleet_registry["history"]["nodes"].pop(n_name, None)
+                save_fleet_registry()
+                deleted = True
+
+            if deleted:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2529,19 +2713,47 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/client/rename":
             data = parse_qs(body.decode("utf-8"))
             cid = data.get("client_id", [""])[0].strip()
-            new_name = data.get("new_name", [""])[0].strip()
+            new_name = norm_name(data.get("new_name", [""])[0])
             if not cid or not new_name or cid not in fleet_registry["clients"]:
                 self.send_error(400, "Invalid client ID or new name")
                 return
             old_name = fleet_registry["clients"][cid]["name"]
             fleet_registry["clients"][cid]["name"] = new_name
+
+            # Re-key history entry cleanly in place (no duplicate)
+            ensure_history_schema()
+            old_ck, new_ck = norm_key(old_name), norm_key(new_name)
+            h_clients = fleet_registry["history"]["clients"]
+            if old_ck in h_clients:
+                c_hist = h_clients.pop(old_ck)
+                c_hist["key"] = new_ck
+                c_hist["name"] = new_name
+                h_clients[new_ck] = c_hist
+                for pk, pv in list(fleet_registry["history"]["projects"].items()):
+                    if pv.get("client_key") == old_ck:
+                        fleet_registry["history"]["projects"].pop(pk)
+                        new_pk = f"{new_ck}::{norm_key(pv['name'])}"
+                        pv["key"] = new_pk
+                        pv["client_key"] = new_ck
+                        pv["client_name"] = new_name
+                        fleet_registry["history"]["projects"][new_pk] = pv
+                for nk, nv in fleet_registry["history"]["nodes"].items():
+                    if nv.get("client_key") == old_ck:
+                        nv["client_key"] = new_ck
+                        nv["client_name"] = new_name
+                        nv["project_key"] = f"{new_ck}::{norm_key(nv.get('project_name', ''))}"
+
             save_fleet_registry()
-            # Synchronize memory telemetry and publish to all nodes
-            for n_key, n in nodes_telemetry.items():
-                if n.get("client") == old_name:
-                    n["client"] = new_name
-            publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[*]:SETCLIENT:{new_name}")
-            log_event(f"REGISTRY: Client '{old_name}' renamed to '{new_name}' (Synchronized to nodes)", actor=user, actor_role=caller_role)
+            now_ts = time.time()
+            # Synchronize telemetry and push targeted MQTT directive ONLY to this client's nodes
+            for n_key, reg_n in fleet_registry.get("registered_nodes", {}).items():
+                if reg_n.get("client_id") == cid or (n_key in nodes_telemetry and norm_key(nodes_telemetry[n_key].get("client", "")) == old_ck):
+                    if n_key in nodes_telemetry:
+                        nodes_telemetry[n_key]["client"] = new_name
+                        nodes_telemetry[n_key]["pending_portal_sync"] = True
+                        nodes_telemetry[n_key]["portal_rename_ts"] = now_ts
+                    publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{n_key}]:SETCLIENT:{new_name}")
+            log_event(f"REGISTRY: Client '{old_name}' renamed to '{new_name}' (Synchronized to nodes NVS)", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2550,18 +2762,40 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/project/rename":
             data = parse_qs(body.decode("utf-8"))
             pid = data.get("project_id", [""])[0].strip()
-            new_name = data.get("new_name", [""])[0].strip()
+            new_name = norm_name(data.get("new_name", [""])[0])
             if not pid or not new_name or pid not in fleet_registry["projects"]:
                 self.send_error(400, "Invalid project ID or new name")
                 return
             old_name = fleet_registry["projects"][pid]["name"]
+            c_id = fleet_registry["projects"][pid].get("client_id", "")
+            c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "")
             fleet_registry["projects"][pid]["name"] = new_name
+
+            ensure_history_schema()
+            ck = norm_key(c_name)
+            old_pk = f"{ck}::{norm_key(old_name)}"
+            new_pk = f"{ck}::{norm_key(new_name)}"
+            h_proj = fleet_registry["history"]["projects"]
+            if old_pk in h_proj:
+                p_hist = h_proj.pop(old_pk)
+                p_hist["key"] = new_pk
+                p_hist["name"] = new_name
+                h_proj[new_pk] = p_hist
+                for nk, nv in fleet_registry["history"]["nodes"].items():
+                    if nv.get("project_key") == old_pk:
+                        nv["project_key"] = new_pk
+                        nv["project_name"] = new_name
+
             save_fleet_registry()
-            for n_key, n in nodes_telemetry.items():
-                if n.get("project") == old_name:
-                    n["project"] = new_name
-            publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[*]:SETPROJECT:{new_name}")
-            log_event(f"REGISTRY: Project '{old_name}' renamed to '{new_name}' (Synchronized to nodes)", actor=user, actor_role=caller_role)
+            now_ts = time.time()
+            target_nodes = list(fleet_registry["projects"][pid].get("nodes", []))
+            for n_key in target_nodes:
+                if n_key in nodes_telemetry:
+                    nodes_telemetry[n_key]["project"] = new_name
+                    nodes_telemetry[n_key]["pending_portal_sync"] = True
+                    nodes_telemetry[n_key]["portal_rename_ts"] = now_ts
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{n_key}]:SETPROJECT:{new_name}")
+            log_event(f"REGISTRY: Project '{old_name}' renamed to '{new_name}' (Synchronized to nodes NVS)", actor=user, actor_role=caller_role)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2569,27 +2803,37 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/node/rename":
             data = parse_qs(body.decode("utf-8"))
-            old_name = data.get("old_name", [""])[0].strip()
-            new_name = data.get("new_name", [""])[0].strip()
+            old_name = norm_name(data.get("old_name", [""])[0])
+            new_name = norm_name(data.get("new_name", [""])[0])
             if not old_name or not new_name:
                 self.send_error(400, "Invalid node names")
                 return
             target_key = resolve_target_node(old_name) or old_name
+            mac_u = ""
 
             # 1. Update registry
             if target_key in fleet_registry["registered_nodes"]:
                 node_data = fleet_registry["registered_nodes"].pop(target_key)
+                mac_u = (node_data.get("mac") or "").upper()
                 node_data["name"] = new_name
                 fleet_registry["registered_nodes"][new_name] = node_data
                 for pid, p in fleet_registry["projects"].items():
                     if target_key in p.get("nodes", []):
                         p["nodes"] = [new_name if x == target_key else x for x in p["nodes"]]
-                save_fleet_registry()
+
+            # Update history in place
+            ensure_history_schema()
+            for nk, nv in fleet_registry["history"]["nodes"].items():
+                if (mac_u and nk == mac_u) or norm_key(nv.get("name", "")) == norm_key(target_key):
+                    nv["name"] = new_name
+            save_fleet_registry()
 
             # 2. Update memory telemetry & update tracking
             if target_key in nodes_telemetry:
                 t_val = nodes_telemetry.pop(target_key)
                 t_val["name"] = new_name
+                t_val["pending_portal_sync"] = True
+                t_val["portal_rename_ts"] = time.time()
                 nodes_telemetry[new_name] = t_val
             if target_key in node_updates:
                 u_val = node_updates.pop(target_key)
@@ -2802,20 +3046,52 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 # =============================================================================
 def render_login_html():
     return """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Anashwar Technologies - Operations Console Login</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+  <script>
+    (function(){
+      try {
+        var t = localStorage.getItem('anashwar_theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch(e){}
+    })();
+  </script>
   <style>
+    :root {
+      --l-bg: #070B14;
+      --l-card: rgba(15, 23, 42, 0.72);
+      --l-border: rgba(255, 255, 255, 0.12);
+      --l-text: #F8FAFC;
+      --l-muted: #94A3B8;
+      --l-dim: #64748B;
+      --l-input-bg: rgba(30, 41, 59, 0.65);
+      --l-bio-bg: rgba(255, 255, 255, 0.05);
+      --l-divider: rgba(255, 255, 255, 0.1);
+      --l-shadow: 0 25px 60px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    }
+    html[data-theme="light"] {
+      --l-bg: #EEF2F7;
+      --l-card: rgba(255, 255, 255, 0.86);
+      --l-border: rgba(15, 23, 42, 0.10);
+      --l-text: #0F172A;
+      --l-muted: #475569;
+      --l-dim: #64748B;
+      --l-input-bg: #FFFFFF;
+      --l-bio-bg: rgba(15, 23, 42, 0.04);
+      --l-divider: rgba(15, 23, 42, 0.1);
+      --l-shadow: 0 24px 54px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-      background: #080C15;
-      color: #F8FAFC;
+      background: var(--l-bg);
+      color: var(--l-text);
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -2823,114 +3099,134 @@ def render_login_html():
       position: relative;
       overflow: hidden;
       padding: 20px;
+      transition: background-color 0.35s ease, color 0.35s ease;
+    }
+    #login-mesh-bg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 0;
+      pointer-events: none;
     }
     .ambient-glow-1 {
-      position: absolute;
-      top: -150px;
-      left: -150px;
-      width: 500px;
-      height: 500px;
+      position: fixed;
+      top: -160px;
+      left: -140px;
+      width: 520px;
+      height: 520px;
       background: radial-gradient(circle, rgba(225, 29, 72, 0.22) 0%, rgba(225, 29, 72, 0) 70%);
       filter: blur(80px);
       pointer-events: none;
+      animation: driftGlowA 14s ease-in-out infinite alternate;
+      z-index: 1;
     }
     .ambient-glow-2 {
-      position: absolute;
-      bottom: -150px;
-      right: -150px;
-      width: 550px;
-      height: 550px;
+      position: fixed;
+      bottom: -160px;
+      right: -140px;
+      width: 560px;
+      height: 560px;
       background: radial-gradient(circle, rgba(14, 165, 233, 0.20) 0%, rgba(14, 165, 233, 0) 70%);
       filter: blur(90px);
       pointer-events: none;
+      animation: driftGlowB 16s ease-in-out infinite alternate;
+      z-index: 1;
+    }
+    @keyframes driftGlowA {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(60px, 45px) scale(1.12); }
+    }
+    @keyframes driftGlowB {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(-55px, -40px) scale(1.15); }
+    }
+    @keyframes cardFloatIn {
+      from { opacity: 0; transform: translateY(18px) scale(0.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .theme-fab {
+      position: fixed;
+      top: 18px;
+      right: 18px;
+      z-index: 20;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 14px;
+      border-radius: 100px;
+      background: var(--l-card);
+      backdrop-filter: blur(18px);
+      border: 1px solid var(--l-border);
+      color: var(--l-text);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.22s ease;
+      font-family: inherit;
+    }
+    .theme-fab:hover {
+      border-color: #E11D48;
+      transform: translateY(-1px);
     }
     .login-card {
       position: relative;
       z-index: 10;
       width: 100%;
       max-width: 420px;
-      background: rgba(15, 23, 42, 0.65);
+      background: var(--l-card);
       backdrop-filter: blur(28px);
       -webkit-backdrop-filter: blur(28px);
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      border: 1px solid var(--l-border);
       border-radius: 24px;
       padding: 40px 32px;
-      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+      box-shadow: var(--l-shadow);
+      animation: cardFloatIn 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards;
     }
-    .login-brand {
-      text-align: center;
-      margin-bottom: 28px;
-    }
-    .login-logo {
-      height: 44px;
-      width: auto;
-      margin-bottom: 14px;
-      filter: drop-shadow(0 4px 12px rgba(225, 29, 72, 0.3));
-    }
-    .login-title {
-      font-size: 22px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-      color: #FFFFFF;
-    }
-    .login-subtitle {
-      font-size: 13px;
-      color: #94A3B8;
-      margin-top: 4px;
-    }
+    .login-brand { text-align: center; margin-bottom: 28px; }
+    .login-logo { height: 44px; width: auto; margin-bottom: 14px; filter: drop-shadow(0 4px 12px rgba(225, 29, 72, 0.28)); }
+    .login-title { font-size: 22px; font-weight: 800; letter-spacing: -0.5px; color: var(--l-text); }
+    .login-subtitle { font-size: 13px; color: var(--l-muted); margin-top: 4px; }
     .badge-pill {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       background: rgba(225, 29, 72, 0.12);
       border: 1px solid rgba(225, 29, 72, 0.3);
-      color: #FB7185;
+      color: #E11D48;
       font-size: 11px;
       font-weight: 700;
-      padding: 4px 10px;
+      padding: 5px 12px;
       border-radius: 100px;
-      margin-top: 10px;
+      margin-top: 12px;
     }
-    .form-group {
-      margin-bottom: 20px;
-      text-align: left;
-    }
-    .form-label {
-      display: block;
-      font-size: 12px;
-      font-weight: 600;
-      color: #CBD5E1;
-      margin-bottom: 8px;
-      letter-spacing: 0.2px;
-    }
-    .input-wrapper {
-      position: relative;
-      display: flex;
-      align-items: center;
-    }
+    html[data-theme="dark"] .badge-pill { color: #FB7185; }
+    .form-group { margin-bottom: 20px; text-align: left; }
+    .form-label { display: block; font-size: 12px; font-weight: 600; color: var(--l-muted); margin-bottom: 8px; letter-spacing: 0.2px; }
+    .input-wrapper { position: relative; display: flex; align-items: center; }
     .input-icon {
       position: absolute;
       left: 14px;
-      font-size: 16px;
-      color: #64748B;
+      display: flex;
+      align-items: center;
+      color: var(--l-dim);
       pointer-events: none;
     }
     .form-input {
       width: 100%;
-      background: rgba(30, 41, 59, 0.6);
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: var(--l-input-bg);
+      border: 1px solid var(--l-border);
       border-radius: 12px;
       padding: 12px 14px 12px 42px;
       font-size: 14px;
-      color: #FFFFFF;
+      color: var(--l-text);
       outline: none;
       transition: all 0.2s ease;
       font-family: inherit;
     }
     .form-input:focus {
       border-color: #E11D48;
-      background: rgba(30, 41, 59, 0.9);
-      box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.25);
+      box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.22);
     }
     .btn-submit {
       width: 100%;
@@ -2946,16 +3242,13 @@ def render_login_html():
       box-shadow: 0 10px 25px rgba(225, 29, 72, 0.35);
       margin-top: 8px;
     }
-    .btn-submit:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 14px 30px rgba(225, 29, 72, 0.45);
-      background: linear-gradient(135deg, #F43F5E 0%, #E11D48 100%);
-    }
+    .btn-submit:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(225, 29, 72, 0.45); background: linear-gradient(135deg, #F43F5E 0%, #E11D48 100%); }
+    .btn-submit:active, .btn-biometric:active { transform: scale(0.985); }
     .error-box {
       display: none;
-      background: rgba(239, 68, 68, 0.15);
+      background: rgba(239, 68, 68, 0.14);
       border: 1px solid rgba(239, 68, 68, 0.4);
-      color: #FCA5A5;
+      color: #EF4444;
       padding: 10px 14px;
       border-radius: 10px;
       font-size: 12px;
@@ -2963,20 +3256,14 @@ def render_login_html():
       text-align: center;
       font-weight: 600;
     }
-    .login-footer {
-      text-align: center;
-      margin-top: 24px;
-      font-size: 11px;
-      color: #64748B;
-      line-height: 1.5;
-    }
+    .login-footer { text-align: center; margin-top: 24px; font-size: 11px; color: var(--l-dim); line-height: 1.5; }
     .btn-biometric {
       width: 100%;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: var(--l-bio-bg);
+      border: 1px solid var(--l-border);
       border-radius: 12px;
       padding: 12px;
-      color: #FFFFFF;
+      color: var(--l-text);
       font-size: 13px;
       font-weight: 700;
       cursor: pointer;
@@ -2988,17 +3275,21 @@ def render_login_html():
       font-family: inherit;
     }
     .btn-biometric:hover {
-      background: rgba(225, 29, 72, 0.18);
-      border-color: rgba(225, 29, 72, 0.4);
-      box-shadow: 0 4px 16px rgba(225, 29, 72, 0.25);
+      background: rgba(225, 29, 72, 0.14);
+      border-color: rgba(225, 29, 72, 0.45);
       transform: translateY(-1px);
     }
   </style>
 </head>
 <body>
-  <div id="iframe-breakout-banner" style="display: none; background: #B91C1C; color: #FFF; padding: 12px 16px; font-size: 13px; text-align: center; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; z-index: 99999; position: relative;">
-    <span>⚠️ You are viewing inside an embedded in-app frame. For Fingerprint & Face ID login, open directly in browser:</span>
-    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome ↗</button>
+  <canvas id="login-mesh-bg"></canvas>
+  <button type="button" class="theme-fab" id="theme-toggle-login" onclick="toggleLoginTheme()">
+    <svg id="login-theme-svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+    <span id="login-theme-lbl">Light Mode</span>
+  </button>
+  <div id="iframe-breakout-banner" style="display: none; background: #B91C1C; color: #FFF; padding: 12px 16px; font-size: 13px; text-align: center; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; z-index: 99999; position: fixed; top: 0; left: 0;">
+    <span>Notice: Viewing inside an embedded frame. For Biometric login, open directly in browser:</span>
+    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome &nearr;</button>
   </div>
   <div class="ambient-glow-1"></div>
   <div class="ambient-glow-2"></div>
@@ -3008,7 +3299,10 @@ def render_login_html():
       <img src="/static/logo.png" alt="Anashwar Technologies" class="login-logo" onerror="this.style.display='none'">
       <div class="login-title">Anashwar Technologies</div>
       <div class="login-subtitle">Enterprise Edge Fleet Management Portal</div>
-      <div class="badge-pill">🔒 Encrypted Operations Console</div>
+      <div class="badge-pill">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span>Encrypted Operations Console</span>
+      </div>
     </div>
 
     <div class="error-box" id="error-banner"></div>
@@ -3017,7 +3311,7 @@ def render_login_html():
       <div class="form-group">
         <label class="form-label">Username</label>
         <div class="input-wrapper">
-          <span class="input-icon">👤</span>
+          <span class="input-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
           <input type="text" id="login-username" class="form-input" placeholder="Enter username" required autofocus autocomplete="username">
         </div>
       </div>
@@ -3025,7 +3319,7 @@ def render_login_html():
       <div class="form-group">
         <label class="form-label">Password</label>
         <div class="input-wrapper">
-          <span class="input-icon">🔑</span>
+          <span class="input-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg></span>
           <input type="password" id="login-password" class="form-input" placeholder="Enter password" required autocomplete="current-password">
         </div>
       </div>
@@ -3033,13 +3327,13 @@ def render_login_html():
       <button type="submit" class="btn-submit" id="login-btn">Sign In to Fleet Console &rarr;</button>
 
       <div style="margin: 18px 0 14px 0; display: flex; align-items: center; gap: 10px;">
-        <div style="flex: 1; height: 1px; background: rgba(255, 255, 255, 0.1);"></div>
-        <span style="font-size: 11px; color: #64748B; font-weight: 600; text-transform: uppercase;">Or Authenticate With</span>
-        <div style="flex: 1; height: 1px; background: rgba(255, 255, 255, 0.1);"></div>
+        <div style="flex: 1; height: 1px; background: var(--l-divider);"></div>
+        <span style="font-size: 11px; color: var(--l-dim); font-weight: 600; text-transform: uppercase;">Or Authenticate With</span>
+        <div style="flex: 1; height: 1px; background: var(--l-divider);"></div>
       </div>
 
       <button type="button" class="btn-biometric" id="btn-biometric-login" onclick="handleBiometricLogin()">
-        <span style="font-size: 16px;">🛡️</span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         <span>Biometric Login</span>
       </button>
     </form>
@@ -3051,6 +3345,70 @@ def render_login_html():
   </div>
 
   <script>
+    const BIO_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    function updateLoginThemeBtn() {
+      const t = document.documentElement.getAttribute('data-theme') || 'dark';
+      const lbl = document.getElementById('login-theme-lbl');
+      const svg = document.getElementById('login-theme-svg');
+      if (lbl) lbl.innerText = (t === 'dark') ? 'Light Mode' : 'Dark Mode';
+      if (svg) svg.innerHTML = (t === 'dark')
+        ? '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>'
+        : '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+    }
+    function toggleLoginTheme() {
+      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      const nxt = (cur === 'dark') ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', nxt);
+      try { localStorage.setItem('anashwar_theme', nxt); } catch(e) {}
+      updateLoginThemeBtn();
+    }
+    updateLoginThemeBtn();
+
+    (function initLoginCanvas(){
+      const cv = document.getElementById('login-mesh-bg');
+      if (!cv) return;
+      const ctx = cv.getContext('2d');
+      let w = 0, h = 0, pts = [];
+      function resize(){
+        w = cv.width = window.innerWidth;
+        h = cv.height = window.innerHeight;
+        const cnt = Math.min(48, Math.max(20, Math.floor((w * h) / 30000)));
+        pts = Array.from({length: cnt}, () => ({
+          x: Math.random() * w, y: Math.random() * h,
+          vx: (Math.random() - 0.5) * 0.45, vy: (Math.random() - 0.5) * 0.45,
+          r: 1.5 + Math.random() * 1.8
+        }));
+      }
+      resize();
+      window.addEventListener('resize', resize);
+      function tick(){
+        if (!document.hidden) {
+          ctx.clearRect(0, 0, w, h);
+          const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+          const dotCol = isLight ? 'rgba(15, 23, 42, 0.25)' : 'rgba(56, 189, 248, 0.35)';
+          const lineRgb = isLight ? '225, 29, 72' : '56, 189, 248';
+          for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            p.x += p.vx; p.y += p.vy;
+            if (p.x < 0 || p.x > w) p.vx *= -1;
+            if (p.y < 0 || p.y > h) p.vy *= -1;
+            ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+            ctx.fillStyle = dotCol; ctx.fill();
+            for (let j = i + 1; j < pts.length; j++) {
+              const q = pts[j], dx = p.x - q.x, dy = p.y - q.y, d = Math.hypot(dx, dy);
+              if (d < 135) {
+                ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
+                ctx.strokeStyle = `rgba(${lineRgb}, ${(1 - d / 135) * (isLight ? 0.14 : 0.16)})`;
+                ctx.lineWidth = 1; ctx.stroke();
+              }
+            }
+          }
+        }
+        requestAnimationFrame(tick);
+      }
+      tick();
+    })();
+
     // Check if session token already exists in localStorage / sessionStorage
     (function checkExistingSession() {
       const urlParams = new URLSearchParams(window.location.search);
@@ -3090,7 +3448,7 @@ def render_login_html():
         });
         const data = await resp.json();
         if (data.success && data.token) {
-          btn.innerText = '✓ Authenticated! Loading Console...';
+          btn.innerText = 'Authenticated! Loading Console...';
           localStorage.setItem('anashwar_token', data.token);
           sessionStorage.setItem('anashwar_token', data.token);
           try {
@@ -3152,7 +3510,7 @@ def render_login_html():
       }
 
       bioBtn.disabled = true;
-      bioBtn.innerHTML = "<span>⏳ Prompting Fingerprint / Face ID...</span>";
+      bioBtn.innerHTML = BIO_ICON_SVG + "<span>Prompting Fingerprint / Face ID...</span>";
 
       try {
         const optRes = await fetch("/api/webauthn/login/options", { method: "POST" });
@@ -3205,7 +3563,7 @@ def render_login_html():
         const vData = await verifyRes.json();
 
         if (vData.success && vData.token) {
-          bioBtn.innerHTML = "<span>✓ Verified! Loading Console...</span>";
+          bioBtn.innerHTML = "<span>Verified! Loading Console...</span>";
           localStorage.setItem("anashwar_token", vData.token);
           sessionStorage.setItem("anashwar_token", vData.token);
           try {
@@ -3216,7 +3574,7 @@ def render_login_html():
           errBox.innerText = vData.error || "Biometric authentication was not recognized. Please sign in with password first to enroll your device.";
           errBox.style.display = "block";
           bioBtn.disabled = false;
-          bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
+          bioBtn.innerHTML = BIO_ICON_SVG + "<span>Biometric Login</span>";
         }
       } catch (err) {
         if (window.self !== window.top) {
@@ -3228,7 +3586,7 @@ def render_login_html():
         }
         errBox.style.display = "block";
         bioBtn.disabled = false;
-        bioBtn.innerHTML = "<span>🛡️</span><span>Biometric Login</span>";
+        bioBtn.innerHTML = BIO_ICON_SVG + "<span>Biometric Login</span>";
       }
     }
 
@@ -3243,7 +3601,7 @@ def render_login_html():
 
 def render_fleet_html(current_user="admin", token=""):
     html_content = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -3251,13 +3609,24 @@ def render_fleet_html(current_user="admin", token=""):
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    (function(){
+      try {
+        var t = localStorage.getItem('anashwar_theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch(e){}
+    })();
+  </script>
   <style>
     :root {
-      --bg: #090D16;
-      --sidebar: #0D111A;
-      --card-bg: rgba(22, 27, 34, 0.65);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --card-border-hover: rgba(225, 29, 72, 0.45);
+      --bg: #070B14;
+      --sidebar: rgba(11, 16, 28, 0.88);
+      --topbar-bg: rgba(9, 13, 22, 0.78);
+      --card-bg: rgba(18, 25, 38, 0.74);
+      --surface-2: rgba(0, 0, 0, 0.28);
+      --surface-3: rgba(255, 255, 255, 0.04);
+      --card-border: rgba(148, 163, 184, 0.14);
+      --card-border-hover: rgba(225, 29, 72, 0.50);
       --crimson: #E11D48;
       --crimson-hover: #BE123C;
       --crimson-glow: rgba(225, 29, 72, 0.35);
@@ -3266,36 +3635,184 @@ def render_fleet_html(current_user="admin", token=""):
       --info: #06B6D4;
       --blue: #3B82F6;
       --text: #F8FAFC;
+      --text-strong: #FFFFFF;
       --text-muted: #94A3B8;
       --text-dim: #64748B;
+      --modal-bg: #0E131F;
+      --input-bg: rgba(0, 0, 0, 0.32);
+      --log-bg: #05080E;
+      --log-text: #94A3B8;
+      --bnav-bg: rgba(13, 17, 26, 0.94);
+      --shadow-card: 0 10px 32px rgba(0, 0, 0, 0.38);
       --font: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
       --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    html[data-theme="light"] {
+      --bg: #EEF2F7;
+      --sidebar: rgba(255, 255, 255, 0.90);
+      --topbar-bg: rgba(255, 255, 255, 0.84);
+      --card-bg: rgba(255, 255, 255, 0.86);
+      --surface-2: rgba(241, 245, 249, 0.90);
+      --surface-3: rgba(15, 23, 42, 0.04);
+      --card-border: rgba(15, 23, 42, 0.10);
+      --card-border-hover: rgba(225, 29, 72, 0.45);
+      --text: #0F172A;
+      --text-strong: #020617;
+      --text-muted: #475569;
+      --text-dim: #64748B;
+      --modal-bg: #FFFFFF;
+      --input-bg: #FFFFFF;
+      --log-bg: #F8FAFC;
+      --log-text: #334155;
+      --bnav-bg: rgba(255, 255, 255, 0.94);
+      --shadow-card: 0 10px 28px rgba(15, 23, 42, 0.08);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background-color: var(--bg);
-      background-image: 
-        radial-gradient(at 0% 0%, rgba(225, 29, 72, 0.08) 0px, transparent 50%),
-        radial-gradient(at 100% 100%, rgba(59, 130, 246, 0.06) 0px, transparent 50%);
       color: var(--text);
       font-family: var(--font);
       min-height: 100vh;
       display: flex;
       overflow-x: hidden;
+      transition: background-color 0.35s ease, color 0.35s ease;
+    }
+
+    /* Live Animated Background Canvas & Orbs */
+    #live-mesh-bg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 0;
+      pointer-events: none;
+    }
+    .bg-orb-1, .bg-orb-2 {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(110px);
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.55;
+    }
+    .bg-orb-1 {
+      top: -180px;
+      left: 120px;
+      width: 520px;
+      height: 520px;
+      background: radial-gradient(circle, rgba(225, 29, 72, 0.16) 0%, transparent 70%);
+      animation: orbDrift1 18s ease-in-out infinite alternate;
+    }
+    .bg-orb-2 {
+      bottom: -200px;
+      right: -120px;
+      width: 580px;
+      height: 580px;
+      background: radial-gradient(circle, rgba(6, 182, 212, 0.15) 0%, transparent 70%);
+      animation: orbDrift2 22s ease-in-out infinite alternate;
+    }
+    @keyframes orbDrift1 {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(65px, 45px) scale(1.12); }
+    }
+    @keyframes orbDrift2 {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(-70px, -50px) scale(1.14); }
+    }
+    @keyframes viewFadeSlide {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .view-animate-in {
+      animation: viewFadeSlide 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    }
+    .svg-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      vertical-align: middle;
+    }
+    .esp32-hw-frame {
+      width: 54px;
+      height: 54px;
+      border-radius: 12px;
+      background: #FFFFFF;
+      padding: 4px;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      flex-shrink: 0;
+      transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .esp32-hw-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .esp32-hero-frame {
+      width: 72px;
+      height: 72px;
+      border-radius: 16px;
+      background: #FFFFFF;
+      padding: 6px;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      flex-shrink: 0;
+      transition: transform 0.3s ease;
+    }
+    .esp32-hero-frame:hover { transform: scale(1.05); }
+    .esp32-hero-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .active-node-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: var(--surface-2);
+      border: 1px solid var(--card-border);
+      margin-bottom: 10px;
+      transition: all 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .active-node-row:hover {
+      border-color: rgba(16, 185, 129, 0.45);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+    }
+    .active-node-row:hover .esp32-hw-frame, .node-card:hover .esp32-hw-frame {
+      transform: scale(1.06) rotate(-1.5deg);
+    }
+    .btn-main:active, .btn-secondary:active, .preset-pill:active, .theme-toggle-btn:active {
+      transform: scale(0.975);
     }
 
     /* Scrollbars */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+    ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.25); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.45); }
 
     /* Left Sidebar */
     .sidebar {
       width: 270px;
       min-width: 270px;
       background: var(--sidebar);
+      backdrop-filter: blur(22px);
+      -webkit-backdrop-filter: blur(22px);
       border-right: 1px solid var(--card-border);
       display: flex;
       flex-direction: column;
@@ -3303,6 +3820,7 @@ def render_fleet_html(current_user="admin", token=""):
       top: 0;
       height: 100vh;
       z-index: 100;
+      transition: background-color 0.3s ease, border-color 0.3s ease;
     }
 
     .brand-header {
@@ -3335,7 +3853,7 @@ def render_fleet_html(current_user="admin", token=""):
     .brand-name {
       font-size: 16px;
       font-weight: 800;
-      color: #FFFFFF;
+      color: var(--text-strong);
       letter-spacing: -0.3px;
     }
     .brand-subtitle {
@@ -3371,8 +3889,8 @@ def render_fleet_html(current_user="admin", token=""):
       margin-bottom: 4px;
     }
     .nav-item:hover {
-      color: #FFFFFF;
-      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-strong);
+      background: var(--surface-3);
     }
     .nav-item.active {
       background: var(--crimson);
@@ -3380,16 +3898,18 @@ def render_fleet_html(current_user="admin", token=""):
       box-shadow: 0 4px 16px var(--crimson-glow);
     }
     .nav-icon {
-      font-size: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       width: 20px;
-      text-align: center;
+      height: 20px;
     }
 
     .sidebar-footer {
       margin-top: auto;
       padding: 18px;
       border-top: 1px solid var(--card-border);
-      background: rgba(0, 0, 0, 0.2);
+      background: var(--surface-2);
     }
     .status-badge-row {
       display: flex;
@@ -3408,50 +3928,77 @@ def render_fleet_html(current_user="admin", token=""):
       font-weight: 700;
     }
     .pill-green {
-      background: rgba(16, 185, 129, 0.15);
-      color: #34D399;
-      border: 1px solid rgba(16, 185, 129, 0.3);
+      background: rgba(16, 185, 129, 0.14);
+      color: #10B981;
+      border: 1px solid rgba(16, 185, 129, 0.35);
     }
     .pill-crimson {
-      background: rgba(225, 29, 72, 0.15);
+      background: rgba(225, 29, 72, 0.14);
       color: #FB7185;
-      border: 1px solid rgba(225, 29, 72, 0.3);
+      border: 1px solid rgba(225, 29, 72, 0.35);
     }
     .pill-cyan {
-      background: rgba(6, 182, 212, 0.15);
+      background: rgba(6, 182, 212, 0.14);
       color: #38BDF8;
-      border: 1px solid rgba(6, 182, 212, 0.3);
+      border: 1px solid rgba(6, 182, 212, 0.35);
     }
+    html[data-theme="light"] .pill-green { color: #047857; background: rgba(16, 185, 129, 0.12); }
+    html[data-theme="light"] .pill-crimson { color: #BE123C; background: rgba(225, 29, 72, 0.10); }
+    html[data-theme="light"] .pill-cyan { color: #0369A1; background: rgba(14, 165, 233, 0.12); }
     .delete-btn-tiny {
-      background: rgba(239, 68, 68, 0.15);
+      background: rgba(239, 68, 68, 0.12);
       border: 1px solid rgba(239, 68, 68, 0.3);
-      color: #F87171;
+      color: #EF4444;
       border-radius: 8px;
-      padding: 4px 8px;
+      padding: 5px 8px;
       font-size: 11px;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
       transition: all 0.2s ease;
       line-height: 1;
     }
     .delete-btn-tiny:hover {
-      background: rgba(239, 68, 68, 0.35);
-      color: #FFFFFF;
+      background: rgba(239, 68, 68, 0.28);
+      color: var(--text-strong);
       transform: scale(1.05);
     }
     .user-pill-btn {
       display: flex;
       align-items: center;
       gap: 6px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: var(--surface-3);
+      border: 1px solid var(--card-border);
+      color: var(--text);
       padding: 5px 12px;
       border-radius: 100px;
       cursor: pointer;
       transition: all 0.2s;
     }
     .user-pill-btn:hover {
-      background: rgba(255, 255, 255, 0.12);
-      border-color: rgba(255, 255, 255, 0.2);
+      border-color: var(--crimson);
+    }
+    .theme-toggle-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface-3);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: 100px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.22s ease;
+    }
+    .theme-toggle-btn:hover {
+      border-color: var(--info);
+      color: var(--text-strong);
+      transform: translateY(-1px);
     }
     .btn-cyan {
       background: linear-gradient(135deg, #0EA5E9 0%, #0284C7 100%);
@@ -3482,6 +4029,8 @@ def render_fleet_html(current_user="admin", token=""):
       flex-direction: column;
       overflow-y: auto;
       height: 100vh;
+      position: relative;
+      z-index: 10;
     }
 
     /* Top Navigation Bar */
@@ -3492,12 +4041,13 @@ def render_fleet_html(current_user="admin", token=""):
       align-items: center;
       justify-content: space-between;
       border-bottom: 1px solid var(--card-border);
-      background: rgba(9, 13, 22, 0.7);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
+      background: var(--topbar-bg);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
       position: sticky;
       top: 0;
       z-index: 90;
+      transition: background-color 0.3s ease, border-color 0.3s ease;
     }
     .breadcrumb-row {
       display: flex;
@@ -3509,14 +4059,20 @@ def render_fleet_html(current_user="admin", token=""):
     }
     .breadcrumb-item {
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       transition: color 0.2s;
     }
     .breadcrumb-item:hover {
-      color: #FFFFFF;
+      color: var(--text-strong);
     }
     .breadcrumb-active {
-      color: #FFFFFF;
+      color: var(--text-strong);
       font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }
     .breadcrumb-sep {
       color: var(--text-dim);
@@ -3526,13 +4082,13 @@ def render_fleet_html(current_user="admin", token=""):
     .topbar-actions {
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 12px;
     }
     .search-box {
       display: flex;
       align-items: center;
       gap: 8px;
-      background: rgba(255, 255, 255, 0.04);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
       border-radius: 10px;
       padding: 8px 14px;
@@ -3543,12 +4099,13 @@ def render_fleet_html(current_user="admin", token=""):
       background: transparent;
       border: none;
       outline: none;
-      color: #FFFFFF;
+      color: var(--text-strong);
       font-size: 13px;
       width: 180px;
     }
     .kbd-shortcut {
-      background: rgba(255, 255, 255, 0.1);
+      background: var(--surface-3);
+      border: 1px solid var(--card-border);
       padding: 2px 6px;
       border-radius: 4px;
       font-size: 10px;
@@ -3561,10 +4118,10 @@ def render_fleet_html(current_user="admin", token=""):
       flex: 1;
     }
 
-    /* Top KPI Summary Gradient Cards (DashTail Style) */
+    /* Top KPI Summary Gradient Cards (3 Cards) */
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(3, 1fr);
       gap: 20px;
       margin-bottom: 28px;
     }
@@ -3574,20 +4131,18 @@ def render_fleet_html(current_user="admin", token=""):
       color: #FFFFFF;
       position: relative;
       overflow: hidden;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-      transition: transform 0.2s ease;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.25s ease;
     }
     .kpi-card:hover {
       transform: translateY(-3px);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.32);
     }
     .kpi-card.gradient-crimson {
       background: linear-gradient(135deg, #E11D48 0%, #9F1239 100%);
     }
     .kpi-card.gradient-orange {
       background: linear-gradient(135deg, #F97316 0%, #C2410C 100%);
-    }
-    .kpi-card.gradient-green {
-      background: linear-gradient(135deg, #10B981 0%, #047857 100%);
     }
     .kpi-card.gradient-cyan {
       background: linear-gradient(135deg, #06B6D4 0%, #0369A1 100%);
@@ -3601,18 +4156,18 @@ def render_fleet_html(current_user="admin", token=""):
       margin-bottom: 8px;
     }
     .kpi-value {
-      font-size: 26px;
+      font-size: 24px;
       font-weight: 800;
       letter-spacing: -0.5px;
       margin-bottom: 6px;
     }
     .kpi-subtitle {
       font-size: 12px;
-      opacity: 0.85;
+      opacity: 0.9;
       font-weight: 500;
     }
 
-    /* Frosted Glass Chamfered Cards (Apple Glassmorphism) */
+    /* Frosted Glass Chamfered Cards */
     .glass-card {
       background: var(--card-bg);
       backdrop-filter: blur(20px);
@@ -3620,25 +4175,27 @@ def render_fleet_html(current_user="admin", token=""):
       border: 1px solid var(--card-border);
       border-radius: 18px;
       padding: 24px;
-      box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.05), 0 8px 32px rgba(0, 0, 0, 0.37);
+      box-shadow: var(--shadow-card);
       transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
       position: relative;
     }
     .glass-card:hover {
       border-color: var(--card-border-hover);
-      box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.08), 0 12px 40px rgba(0, 0, 0, 0.5), 0 0 20px rgba(225, 29, 72, 0.15);
+      transform: translateY(-2px);
     }
 
     .section-header-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
       margin-bottom: 20px;
     }
     .section-heading {
       font-size: 18px;
       font-weight: 800;
-      color: #FFFFFF;
+      color: var(--text-strong);
       letter-spacing: -0.3px;
       display: flex;
       align-items: center;
@@ -3653,7 +4210,7 @@ def render_fleet_html(current_user="admin", token=""):
     /* Client Tiles Grid */
     .client-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
       gap: 22px;
       margin-bottom: 34px;
     }
@@ -3664,7 +4221,7 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     .client-avatar {
       width: 48px;
@@ -3675,14 +4232,15 @@ def render_fleet_html(current_user="admin", token=""):
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 800;
       color: #FB7185;
     }
+    html[data-theme="light"] .client-avatar { color: #E11D48; }
     .client-name {
       font-size: 17px;
       font-weight: 700;
-      color: #FFFFFF;
+      color: var(--text-strong);
       margin-bottom: 4px;
     }
     .client-desc {
@@ -3694,11 +4252,11 @@ def render_fleet_html(current_user="admin", token=""):
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 10px;
-      background: rgba(0, 0, 0, 0.25);
+      background: var(--surface-2);
       border-radius: 12px;
       padding: 12px;
-      margin: 16px 0;
-      border: 1px solid rgba(255, 255, 255, 0.04);
+      margin: 14px 0;
+      border: 1px solid var(--card-border);
     }
     .metric-col {
       text-align: center;
@@ -3706,7 +4264,7 @@ def render_fleet_html(current_user="admin", token=""):
     .metric-val {
       font-size: 15px;
       font-weight: 700;
-      color: #FFFFFF;
+      color: var(--text-strong);
     }
     .metric-lbl {
       font-size: 11px;
@@ -3718,16 +4276,16 @@ def render_fleet_html(current_user="admin", token=""):
       align-items: center;
       justify-content: space-between;
       padding-top: 14px;
-      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      border-top: 1px solid var(--card-border);
       font-size: 13px;
       font-weight: 600;
-      color: #FB7185;
+      color: var(--crimson);
     }
 
     /* Add Card Placeholder */
     .add-card-btn {
-      background: rgba(22, 27, 34, 0.35);
-      border: 2px dashed rgba(255, 255, 255, 0.12);
+      background: var(--surface-3);
+      border: 2px dashed var(--card-border);
       border-radius: 18px;
       display: flex;
       flex-direction: column;
@@ -3741,14 +4299,15 @@ def render_fleet_html(current_user="admin", token=""):
     }
     .add-card-btn:hover {
       border-color: var(--crimson);
-      color: #FFFFFF;
+      color: var(--text-strong);
       background: rgba(225, 29, 72, 0.05);
     }
     .add-icon-circle {
       width: 44px;
       height: 44px;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.06);
+      background: var(--surface-3);
+      border: 1px solid var(--card-border);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -3790,14 +4349,14 @@ def render_fleet_html(current_user="admin", token=""):
     .node-name {
       font-size: 18px;
       font-weight: 800;
-      color: #FFFFFF;
+      color: var(--text-strong);
     }
     .node-spec-row {
       display: flex;
       justify-content: space-between;
       padding: 8px 0;
       font-size: 13px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      border-bottom: 1px solid var(--card-border);
     }
     .node-spec-lbl {
       color: var(--text-muted);
@@ -3805,7 +4364,7 @@ def render_fleet_html(current_user="admin", token=""):
     .node-spec-val {
       font-family: var(--font-mono);
       font-weight: 600;
-      color: #FFFFFF;
+      color: var(--text-strong);
     }
 
     /* Interactive Node Detail Inspector View */
@@ -3828,7 +4387,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Apple-style Master Service Switch */
     .service-switch-box {
-      background: rgba(0, 0, 0, 0.35);
+      background: var(--surface-2);
       border: 1px solid var(--card-border);
       border-radius: 16px;
       padding: 18px 20px;
@@ -3840,7 +4399,7 @@ def render_fleet_html(current_user="admin", token=""):
     .service-info h4 {
       font-size: 15px;
       font-weight: 700;
-      color: #FFFFFF;
+      color: var(--text-strong);
       margin-bottom: 4px;
     }
     .service-info p {
@@ -3876,7 +4435,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Delay Configurator Slider & Stepper */
     .delay-box {
-      background: rgba(0, 0, 0, 0.35);
+      background: var(--surface-2);
       border: 1px solid var(--card-border);
       border-radius: 16px;
       padding: 20px;
@@ -3915,9 +4474,10 @@ def render_fleet_html(current_user="admin", token=""):
     .preset-pills {
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
     }
     .preset-pill {
-      background: rgba(255, 255, 255, 0.05);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
       border-radius: 8px;
       padding: 6px 12px;
@@ -3925,6 +4485,9 @@ def render_fleet_html(current_user="admin", token=""):
       font-weight: 600;
       color: var(--text-muted);
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       transition: all 0.2s;
     }
     .preset-pill:hover, .preset-pill.active {
@@ -3935,7 +4498,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Live Hardware Simulation Panel (LED & BOOT Button) */
     .hw-visualizer {
-      background: rgba(0, 0, 0, 0.4);
+      background: var(--surface-2);
       border: 1px solid var(--card-border);
       border-radius: 18px;
       padding: 22px;
@@ -3948,7 +4511,7 @@ def render_fleet_html(current_user="admin", token=""):
       margin-top: 12px;
     }
     .hw-unit {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
       border-radius: 14px;
       padding: 16px;
@@ -4003,7 +4566,7 @@ def render_fleet_html(current_user="admin", token=""):
       margin-bottom: 18px;
     }
     .mode-btn {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
       border-radius: 12px;
       padding: 14px 16px;
@@ -4012,7 +4575,7 @@ def render_fleet_html(current_user="admin", token=""):
       transition: all 0.2s;
     }
     .mode-btn:hover {
-      background: rgba(255, 255, 255, 0.06);
+      border-color: var(--card-border-hover);
     }
     .mode-btn.active {
       background: rgba(225, 29, 72, 0.15);
@@ -4021,7 +4584,7 @@ def render_fleet_html(current_user="admin", token=""):
     .mode-btn-title {
       font-size: 13px;
       font-weight: 700;
-      color: #FFFFFF;
+      color: var(--text-strong);
       margin-bottom: 4px;
     }
     .mode-btn-desc {
@@ -4032,11 +4595,11 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Drag and Drop Zone */
     .dropzone {
-      border: 2px dashed rgba(255, 255, 255, 0.14);
+      border: 2px dashed var(--card-border);
       border-radius: 14px;
       padding: 24px;
       text-align: center;
-      background: rgba(0, 0, 0, 0.2);
+      background: var(--surface-2);
       cursor: pointer;
       transition: all 0.2s;
       margin-bottom: 18px;
@@ -4078,17 +4641,17 @@ def render_fleet_html(current_user="admin", token=""):
       transform: translateY(-1px);
     }
     .btn-usb {
-      background: rgba(255, 255, 255, 0.06);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
-      color: #FFFFFF;
+      color: var(--text-strong);
     }
     .btn-usb:hover {
-      background: rgba(255, 255, 255, 0.1);
+      border-color: var(--crimson);
     }
 
     /* Progress Stepper */
     .update-tracker {
-      background: rgba(0, 0, 0, 0.4);
+      background: var(--surface-2);
       border: 1px solid var(--card-border);
       border-radius: 16px;
       padding: 20px;
@@ -4114,7 +4677,7 @@ def render_fleet_html(current_user="admin", token=""):
     .modal-overlay {
       position: fixed;
       top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.75);
+      background: rgba(0, 0, 0, 0.72);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       display: none;
@@ -4128,18 +4691,21 @@ def render_fleet_html(current_user="admin", token=""):
     .modal-card {
       width: 100%;
       max-width: 580px;
-      background: #0E131F;
+      background: var(--modal-bg);
+      color: var(--text);
       border: 1px solid var(--card-border);
       border-radius: 20px;
       padding: 28px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.45);
       max-height: 90vh;
       overflow-y: auto;
       transform: translateZ(0);
+      animation: viewFadeSlide 0.22s ease;
     }
     .modal-card h3 {
       font-size: 18px;
       font-weight: 800;
+      color: var(--text-strong);
       margin-bottom: 6px;
     }
     .modal-card p {
@@ -4162,10 +4728,10 @@ def render_fleet_html(current_user="admin", token=""):
     .form-input {
       width: 100%;
       padding: 12px 14px;
-      background: rgba(0, 0, 0, 0.3);
+      background: var(--input-bg);
       border: 1px solid var(--card-border);
       border-radius: 10px;
-      color: #FFFFFF;
+      color: var(--text-strong);
       font-size: 14px;
       outline: none;
     }
@@ -4185,11 +4751,21 @@ def render_fleet_html(current_user="admin", token=""):
       padding: 10px 18px;
       border-radius: 10px;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+    }
+    .btn-secondary:hover {
+      color: var(--text-strong);
+      border-color: var(--card-border-hover);
+      background: var(--surface-3);
     }
 
     /* Terminal logs */
     .log-box {
-      background: #05080E;
+      background: var(--log-bg);
       border: 1px solid var(--card-border);
       border-radius: 14px;
       padding: 16px;
@@ -4197,7 +4773,7 @@ def render_fleet_html(current_user="admin", token=""):
       font-size: 12px;
       height: 180px;
       overflow-y: auto;
-      color: #94A3B8;
+      color: var(--log-text);
       line-height: 1.6;
     }
 
@@ -4226,7 +4802,7 @@ def render_fleet_html(current_user="admin", token=""):
 
     /* Base Firmware Golden Reference Card */
     .base-firmware-card {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--surface-3);
       border: 1px solid var(--card-border);
       border-radius: 14px;
       padding: 16px 18px;
@@ -4235,13 +4811,12 @@ def render_fleet_html(current_user="admin", token=""):
       margin-bottom: 18px;
     }
     .base-firmware-card:hover {
-      background: rgba(255, 255, 255, 0.06);
-      border-color: rgba(255, 255, 255, 0.2);
+      border-color: var(--card-border-hover);
     }
     .base-firmware-card.active {
       background: rgba(225, 29, 72, 0.12);
       border-color: var(--crimson);
-      box-shadow: 0 4px 20px rgba(225, 29, 72, 0.25);
+      box-shadow: 0 4px 20px rgba(225, 29, 72, 0.22);
     }
 
     /* Mobile Bottom Navigation Bar */
@@ -4252,7 +4827,7 @@ def render_fleet_html(current_user="admin", token=""):
       left: 0;
       right: 0;
       height: 64px;
-      background: rgba(13, 17, 26, 0.95);
+      background: var(--bnav-bg);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border-top: 1px solid var(--card-border);
@@ -4260,7 +4835,7 @@ def render_fleet_html(current_user="admin", token=""):
       grid-template-columns: repeat(4, 1fr);
       align-items: center;
       padding: 0 8px;
-      box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.6);
+      box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.25);
     }
     .bottom-nav-item {
       display: flex;
@@ -4278,7 +4853,9 @@ def render_fleet_html(current_user="admin", token=""):
       min-height: 48px;
     }
     .bottom-nav-item .bnav-icon {
-      font-size: 18px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       line-height: 1.2;
     }
     .bottom-nav-item .bnav-label {
@@ -4287,7 +4864,7 @@ def render_fleet_html(current_user="admin", token=""):
       margin-top: 2px;
     }
     .bottom-nav-item.active, .bottom-nav-item:active {
-      color: #38BDF8;
+      color: #0EA5E9;
     }
     .bottom-nav-item.active .bnav-icon {
       transform: scale(1.15);
@@ -4301,19 +4878,19 @@ def render_fleet_html(current_user="admin", token=""):
       .topbar { padding: 0 16px !important; height: 60px !important; }
       .search-box { display: none !important; }
       #mdns-link, #public-tunnel-link { display: none !important; }
-      .kpi-grid { grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
+      .kpi-grid { grid-template-columns: 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
       .kpi-card { padding: 16px !important; border-radius: 14px !important; }
       .kpi-title { font-size: 12px !important; }
       .kpi-value { font-size: 20px !important; }
       .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
-      .clients-grid, .projects-grid, .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+      .client-grid, .projects-grid, .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
       .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
       .modal-overlay { align-items: flex-end !important; }
       .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
       .apple-switch { width: 56px !important; height: 32px !important; }
       .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
       .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
-      .btn-main, .btn-secondary { min-height: 48px !important; font-size: 14px !important; }
+      .btn-main, .btn-secondary { min-height: 44px !important; font-size: 13px !important; }
       .form-input { min-height: 46px !important; font-size: 15px !important; }
     }
 
@@ -4323,31 +4900,35 @@ def render_fleet_html(current_user="admin", token=""):
     body.mode-phone-touch .topbar { padding: 0 16px !important; height: 60px !important; }
     body.mode-phone-touch .search-box { display: none !important; }
     body.mode-phone-touch #mdns-link, body.mode-phone-touch #public-tunnel-link { display: none !important; }
-    body.mode-phone-touch .kpi-grid { grid-template-columns: 1fr 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
+    body.mode-phone-touch .kpi-grid { grid-template-columns: 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
     body.mode-phone-touch .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
-    body.mode-phone-touch .clients-grid, body.mode-phone-touch .projects-grid, body.mode-phone-touch .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+    body.mode-phone-touch .client-grid, body.mode-phone-touch .projects-grid, body.mode-phone-touch .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
     body.mode-phone-touch .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
     body.mode-phone-touch .modal-overlay { align-items: flex-end !important; }
     body.mode-phone-touch .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
     body.mode-phone-touch .apple-switch { width: 56px !important; height: 32px !important; }
     body.mode-phone-touch .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
     body.mode-phone-touch .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
-    body.mode-phone-touch .btn-main, body.mode-phone-touch .btn-secondary { min-height: 48px !important; font-size: 14px !important; }
+    body.mode-phone-touch .btn-main, body.mode-phone-touch .btn-secondary { min-height: 44px !important; font-size: 13px !important; }
     body.mode-phone-touch .form-input { min-height: 46px !important; font-size: 15px !important; }
 
     body.mode-desktop-pc .sidebar { display: flex !important; }
     body.mode-desktop-pc .mobile-bottom-nav { display: none !important; }
     body.mode-desktop-pc .content-area { padding: 28px 32px !important; }
-    body.mode-desktop-pc .kpi-grid { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; }
+    body.mode-desktop-pc .kpi-grid { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; }
     body.mode-desktop-pc .node-detail-layout { display: grid !important; grid-template-columns: 1.1fr 0.9fr !important; }
     body.mode-desktop-pc .modal-overlay { align-items: center !important; }
     body.mode-desktop-pc .modal-card { border-radius: 20px !important; max-height: 88vh !important; overflow-y: auto !important; }
   </style>
 </head>
 <body>
+  <canvas id="live-mesh-bg"></canvas>
+  <div class="bg-orb-1"></div>
+  <div class="bg-orb-2"></div>
+
   <div id="iframe-breakout-banner" style="display: none; background: #B91C1C; color: #FFF; padding: 12px 16px; font-size: 13px; text-align: center; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; z-index: 99999; position: relative;">
-    <span>⚠️ You are viewing inside an embedded in-app frame. For Fingerprint & Face ID biometrics, open directly in browser:</span>
-    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome ↗</button>
+    <span>Embedded frame detected. For hardware biometrics (Fingerprint / Face ID), open directly in browser:</span>
+    <button type="button" onclick="window.top.location.href = window.location.href;" style="background: #FFF; color: #000; border: none; padding: 6px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-left: 10px;">Open in Chrome &rarr;</button>
   </div>
 
   <!-- Left Sidebar -->
@@ -4365,10 +4946,19 @@ def render_fleet_html(current_user="admin", token=""):
     <div class="nav-section">
       <div class="nav-section-title">Operations</div>
       <div class="nav-item active" id="nav-dashboard" onclick="navigateTo('dashboard')">
-        <span class="nav-icon">📊</span> Dashboard Overview
+        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
+        <span>Live Fleet</span>
+      </div>
+      <div class="nav-item" id="nav-history" onclick="navigateTo('history-clients')" style="justify-content: space-between;">
+        <span style="display:flex; align-items:center; gap:10px;">
+          <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></span>
+          <span>Fleet History</span>
+        </span>
+        <span class="status-pill pill-cyan" id="sidebar-history-count" style="font-size: 10px; padding: 1px 6px;">0</span>
       </div>
       <div class="nav-item" id="nav-registry" onclick="navigateTo('registry')">
-        <span class="nav-icon">📜</span> Operations Registry
+        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span>
+        <span>Operations Registry</span>
       </div>
     </div>
 
@@ -4385,21 +4975,23 @@ def render_fleet_html(current_user="admin", token=""):
     <div class="nav-section">
       <div class="nav-section-title">Administration</div>
       <div class="nav-item" onclick="openUserModal()">
-        <span class="nav-icon">👥</span> Users & Access
+        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+        <span>Users & Access</span>
       </div>
-      <div class="nav-item" onclick="selectBaseFirmware(); navigateTo('dashboard');">
-        <span class="nav-icon">⭐</span> Golden Base Firmware
+      <div class="nav-item" onclick="toggleTheme()">
+        <span class="nav-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg></span>
+        <span>Switch Theme</span>
       </div>
     </div>
 
     <div class="sidebar-footer">
       <div class="status-badge-row">
-        <span>HiveMQ Cloud</span>
-        <span class="status-pill pill-green"><span class="pulsing-dot"></span> Connected</span>
+        <span>MQTT Broker</span>
+        <span class="status-pill pill-green"><span class="pulsing-dot"></span> Online</span>
       </div>
       <div class="status-badge-row">
-        <span>Fleet Mesh</span>
-        <span class="status-pill pill-cyan">Port 1883</span>
+        <span style="font-family:var(--font-mono); font-size:11px;">broker.hivemq.com</span>
+        <span class="status-pill pill-cyan">1883</span>
       </div>
       <div style="font-size: 10px; color: var(--text-dim); text-align: center; margin-top: 10px;">
         Anashwar Fleet OS v4.2 &bull; Edge Fleet
@@ -4413,22 +5005,32 @@ def render_fleet_html(current_user="admin", token=""):
     <!-- Topbar -->
     <header class="topbar">
       <div class="breadcrumb-row" id="breadcrumb-container">
-        <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+        <span class="breadcrumb-active">Live Fleet</span>
       </div>
 
       <div class="topbar-actions">
         <div class="search-box">
-          <span>🔍</span>
-          <input type="text" placeholder="Search fleet, nodes, MAC...">
-          <span class="kbd-shortcut">⌘K</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted); flex-shrink:0;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="global-search-input" placeholder="Search clients, projects, nodes, MAC..." oninput="onGlobalSearch(this.value)">
+          <span class="kbd-shortcut">Ctrl+K</span>
         </div>
-        <div style="display:flex; align-items:center; gap:8px; border-left:1px solid rgba(255,255,255,0.12); padding-left:12px; margin-left:4px;">
+        <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch Light / Dark Theme">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+          <span>Dark</span>
+        </button>
+        <div style="display:flex; align-items:center; gap:8px; border-left:1px solid var(--card-border); padding-left:10px; margin-left:2px;">
           <div class="user-pill-btn" onclick="openUserModal()" title="Current Logged In User">
-            <span style="font-size:14px;">👤</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
             <span id="topbar-user-name" style="font-weight:700; font-size:12px;">__CURRENT_USER__</span>
           </div>
-          <button class="btn-secondary" style="padding:5px 10px; font-size:11px;" onclick="openUserModal()" title="Manage Users">👥 Users</button>
-          <button class="btn-secondary" style="padding:5px 10px; font-size:11px; border-color:rgba(239,68,68,0.4); color:#F87171;" onclick="handleLogout()" title="Sign Out">🚪 Logout</button>
+          <button class="btn-secondary" style="padding:5px 10px; font-size:11px;" onclick="openUserModal()" title="Manage Users">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+            <span>Users</span>
+          </button>
+          <button class="btn-secondary" style="padding:5px 10px; font-size:11px; border-color:rgba(239,68,68,0.4); color:#F87171;" onclick="handleLogout()" title="Sign Out">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            <span>Logout</span>
+          </button>
         </div>
       </div>
     </header>
@@ -4436,39 +5038,37 @@ def render_fleet_html(current_user="admin", token=""):
     <!-- Dynamic Content Area -->
     <main class="content-area">
 
-      <!-- VIEW 1: DASHBOARD OVERVIEW -->
-      <div id="view-dashboard">
-        <!-- 4 Vibrant Top Snapshot Cards (DashTail Style) -->
+      <!-- VIEW 1: DASHBOARD OVERVIEW (ACTIVE LIVE FLEET) -->
+      <div id="view-dashboard" class="view-animate-in">
+        <!-- 3 Focused Telemetry & Broker Cards -->
         <div class="kpi-grid">
           <div class="kpi-card gradient-crimson">
-            <div class="kpi-title">Active Fleet Nodes</div>
-            <div class="kpi-value" id="kpi-active-nodes">2 / 2 Online</div>
-            <div class="kpi-subtitle">100% Operational Telemetry</div>
+            <div class="kpi-title">Active Live Nodes</div>
+            <div class="kpi-value" id="kpi-active-nodes">0 Online</div>
+            <div class="kpi-subtitle" id="kpi-active-sub">0 Active Clients &bull; 0 Live Projects</div>
           </div>
           <div class="kpi-card gradient-orange">
             <div class="kpi-title">Security Trust Index</div>
             <div class="kpi-value">100% Verified</div>
             <div class="kpi-subtitle">SHA-256 + MAC + eFuse Verified</div>
           </div>
-          <div class="kpi-card gradient-green">
-            <div class="kpi-title">Firmware Pipeline</div>
-            <div class="kpi-value">Mode 1 Active</div>
-            <div class="kpi-subtitle">4 Multi-Mode Builds Ready</div>
-          </div>
           <div class="kpi-card gradient-cyan">
-            <div class="kpi-title">Carrier & Broker Mesh</div>
-            <div class="kpi-value">Low Latency</div>
-            <div class="kpi-subtitle">HiveMQ Cloud (1883) &bull; Zero Drop</div>
+            <div class="kpi-title">MQTT Broker Credentials</div>
+            <div class="kpi-value" style="font-size: 20px; font-family: var(--font-mono); letter-spacing: -0.3px;">broker.hivemq.com</div>
+            <div class="kpi-subtitle">Port: 1883 &bull; Topics: anashwar/poc/*</div>
           </div>
         </div>
 
-        <!-- Clients Section (Dashboard Primary View) -->
+        <!-- Active Live Clients, Projects & Online Nodes (Upfront In-Your-Face View) -->
         <div class="section-header-row">
           <div>
-            <div class="section-heading">🏢 Registered Enterprise Clients & Fleets</div>
-            <div class="section-desc">Internal company operations overview. Green indicates online nodes; red indicates offline nodes.</div>
+            <div class="section-heading">Active Live Clients, Projects & Online Nodes</div>
+            <div class="section-desc">Only clients currently online are surfaced here for immediate control & Web UI access. Offline & past nodes are organized in Fleet History.</div>
           </div>
-          <button class="btn-main btn-crimson" onclick="openAddClientModal()">+ Add New Client</button>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn-secondary" onclick="navigateTo('history-clients')">View Fleet History &rarr;</button>
+            <button class="btn-main btn-crimson" onclick="openAddClientModal()">+ Add New Client</button>
+          </div>
         </div>
 
         <div class="client-grid" id="clients-container">
@@ -4478,12 +5078,63 @@ def render_fleet_html(current_user="admin", token=""):
         <!-- Registry & Operations Log Card -->
         <div class="section-header-row" style="margin-top: 24px;">
           <div>
-            <div class="section-heading">📋 Enterprise Operations Registry</div>
-            <div class="section-desc">Partitioned daily event logs, cryptographic command audits, and presence tracking</div>
+            <div class="section-heading">Operations Event Stream</div>
+            <div class="section-desc">Command dispatches, hardware acknowledgements, OTA deployments, and identity sync events</div>
           </div>
           <button class="btn-main btn-cyan" onclick="navigateTo('registry')">Open Full Registry Archive &rarr;</button>
         </div>
         <div class="log-box" id="activity-log-stream">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- VIEW: HISTORY PAGE 1 - CLIENTS -->
+      <div id="view-history-clients" style="display: none;">
+        <div class="glass-card" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+            <div>
+              <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('dashboard')">&larr; Back to Live Fleet</button>
+              <h2 style="font-size: 24px; font-weight: 800; color: var(--text-strong); display: flex; align-items: center; gap: 10px;">
+                <span>Fleet History: Clients</span>
+                <span class="status-pill pill-cyan">Deduplicated</span>
+              </h2>
+              <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Every unique client ever seen online. Select a client to browse its historical projects on a separate page.</p>
+            </div>
+          </div>
+        </div>
+        <div class="client-grid" id="history-clients-container">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- VIEW: HISTORY PAGE 2 - PROJECTS FOR CLIENT -->
+      <div id="view-history-projects" style="display: none;">
+        <div class="glass-card" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+            <div>
+              <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('history-clients')">&larr; Back to History Clients</button>
+              <h2 id="history-client-title" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Historical Client Projects</h2>
+              <p id="history-client-meta" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Unique projects seen online under this client. Select a project to view its hardware nodes.</p>
+            </div>
+          </div>
+        </div>
+        <div class="projects-grid" id="history-projects-container">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- VIEW: HISTORY PAGE 3 - NODES FOR PROJECT -->
+      <div id="view-history-nodes" style="display: none;">
+        <div class="glass-card" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+            <div>
+              <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('history-projects', selectedHistoryClientKey)">&larr; Back to Client Projects</button>
+              <h2 id="history-project-title" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Historical Project Nodes</h2>
+              <p id="history-project-meta" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Unique hardware nodes seen online under this project.</p>
+            </div>
+          </div>
+        </div>
+        <div class="nodes-grid" id="history-nodes-container">
           <!-- Populated by JS -->
         </div>
       </div>
@@ -4493,15 +5144,18 @@ def render_fleet_html(current_user="admin", token=""):
         <div class="glass-card" style="margin-bottom: 24px;">
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
             <div>
-              <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('dashboard')">&larr; Back to Dashboard</button>
-              <h2 style="font-size: 24px; font-weight: 800; color: #FFFFFF; display: flex; align-items: center; gap: 10px;">
-                <span>📋 Enterprise Operations Registry</span>
+              <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('dashboard')">&larr; Back to Live Fleet</button>
+              <h2 style="font-size: 24px; font-weight: 800; color: var(--text-strong); display: flex; align-items: center; gap: 10px;">
+                <span>Enterprise Operations Registry</span>
                 <span class="status-pill pill-cyan">Daily Event Partitions</span>
               </h2>
-              <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Partitioned daily log files for audit compliance, hardware presence, and command audit trails.</p>
+              <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Partitioned daily log files for audit compliance, hardware events, and command trails.</p>
             </div>
             <div style="display: flex; gap: 8px;">
-              <button class="btn-secondary" onclick="loadRegistryCalendar()"><span>🔄 Refresh Registry</span></button>
+              <button class="btn-secondary" onclick="loadRegistryCalendar()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                <span>Refresh Registry</span>
+              </button>
             </div>
           </div>
         </div>
@@ -4509,21 +5163,21 @@ def render_fleet_html(current_user="admin", token=""):
         <!-- Registry Filters: Yearly, Monthly, Weekly -->
         <div class="glass-card" style="margin-bottom: 24px;">
           <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
-            <span style="font-size: 12px; font-weight: 700; color: #CBD5E1; text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Year:</span>
+            <span style="font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Year:</span>
             <div class="preset-pills" id="registry-year-pills" style="margin: 0;">
               <!-- Populated by JS -->
             </div>
           </div>
 
           <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
-            <span style="font-size: 12px; font-weight: 700; color: #CBD5E1; text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Month:</span>
+            <span style="font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Month:</span>
             <div class="preset-pills" id="registry-month-pills" style="margin: 0; flex-wrap: wrap;">
               <!-- Populated by JS -->
             </div>
           </div>
 
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-            <span style="font-size: 12px; font-weight: 700; color: #CBD5E1; text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Week:</span>
+            <span style="font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; width: 60px;">Week:</span>
             <div class="preset-pills" id="registry-week-pills" style="margin: 0;">
               <span class="preset-pill active" onclick="filterRegistryWeek('all')">All Weeks</span>
               <span class="preset-pill" onclick="filterRegistryWeek(44)">Week 44</span>
@@ -4535,8 +5189,8 @@ def render_fleet_html(current_user="admin", token=""):
         <!-- Daily File Buttons Grid -->
         <div class="section-header-row">
           <div>
-            <div class="section-heading">📅 Daily Event Log Files</div>
-            <div class="section-desc">Click any active daily file button to inspect its comprehensive audit trail. Days without events are dimmed.</div>
+            <div class="section-heading">Daily Event Log Files</div>
+            <div class="section-desc">Select any active daily file to inspect its audit trail. Inactive days are dimmed.</div>
           </div>
         </div>
 
@@ -4551,15 +5205,21 @@ def render_fleet_html(current_user="admin", token=""):
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
             <div>
               <button class="btn-secondary" style="margin-bottom: 10px;" onclick="navigateTo('registry')">&larr; Back to Registry Calendar</button>
-              <h2 id="reg-day-title" style="font-size: 24px; font-weight: 800; color: #FFFFFF;">Registry File: 2026-11-10.log</h2>
+              <h2 id="reg-day-title" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Registry File: 2026-11-10.log</h2>
               <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
-                <span id="reg-day-count-badge" class="status-pill pill-green">● 35 Events Recorded</span>
+                <span id="reg-day-count-badge" class="status-pill pill-green">0 Events Recorded</span>
                 <span class="status-pill pill-cyan">SHA-256 Hashed Log</span>
               </div>
             </div>
             <div style="display: flex; gap: 10px;">
-              <button class="btn-main btn-crimson" id="btn-download-log" onclick="downloadCurrentDayLog()">📥 Download .log File</button>
-              <button class="btn-secondary" onclick="refreshCurrentDayLog()">🔄 Refresh Log</button>
+              <button class="btn-main btn-crimson" id="btn-download-log" onclick="downloadCurrentDayLog()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <span>Download .log File</span>
+              </button>
+              <button class="btn-secondary" onclick="refreshCurrentDayLog()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                <span>Refresh Log</span>
+              </button>
             </div>
           </div>
         </div>
@@ -4568,13 +5228,13 @@ def render_fleet_html(current_user="admin", token=""):
         <div class="glass-card" style="margin-bottom: 18px; padding: 14px 20px;">
           <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
             <div class="search-box" style="flex: 1; min-width: 260px;">
-              <span>🔍</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted); flex-shrink:0;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
               <input type="text" id="reg-search-input" placeholder="Search events by Node, IP, Command, MAC, or keyword..." oninput="onRegistrySearchInput(this.value)">
             </div>
             <div class="preset-pills" id="reg-category-pills" style="margin: 0;">
               <span class="preset-pill active" onclick="filterRegistryCategory('ALL')">All Events</span>
               <span class="preset-pill" onclick="filterRegistryCategory('CMD')">Commands</span>
-              <span class="preset-pill" onclick="filterRegistryCategory('ACK')">Presence ACKs</span>
+              <span class="preset-pill" onclick="filterRegistryCategory('ACK')">Hardware ACKs</span>
               <span class="preset-pill" onclick="filterRegistryCategory('SEC')">Security & Auth</span>
               <span class="preset-pill" onclick="filterRegistryCategory('OTA')">Firmware OTA</span>
             </div>
@@ -4590,18 +5250,18 @@ def render_fleet_html(current_user="admin", token=""):
       <!-- VIEW 2: CLIENT DETAIL VIEW -->
       <div id="view-client" style="display: none;">
         <div class="glass-card" style="margin-bottom: 24px;">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
             <div>
-              <button class="btn-secondary" style="margin-bottom: 12px;" onclick="navigateTo('dashboard')">&larr; Back to Dashboard</button>
-              <h2 id="client-view-title" style="font-size: 24px; font-weight: 800; color: #FFFFFF;">Client 1: Alpha Enterprise Corp</h2>
-              <p id="client-view-desc" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Autonomous Industrial Edge IoT Operations & Real-time Fleet</p>
+              <button class="btn-secondary" style="margin-bottom: 12px;" onclick="navigateTo('dashboard')">&larr; Back to Live Fleet</button>
+              <h2 id="client-view-title" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Client</h2>
+              <p id="client-view-desc" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Enterprise Edge IoT Operations & Real-time Fleet</p>
             </div>
             <button class="btn-main btn-crimson" onclick="openAddProjectModal()">+ Add New Project</button>
           </div>
         </div>
 
         <div class="section-header-row">
-          <div class="section-heading">📁 Client Projects</div>
+          <div class="section-heading">Client Projects</div>
         </div>
         <div class="projects-grid" id="client-projects-container">
           <!-- Populated by JS -->
@@ -4614,14 +5274,14 @@ def render_fleet_html(current_user="admin", token=""):
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <div>
               <button class="btn-secondary" style="margin-bottom: 12px;" onclick="backToClient()">&larr; Back to Client</button>
-              <h2 id="project-view-title" style="font-size: 24px; font-weight: 800; color: #FFFFFF;">Project 1: Enterprise OTA Fleet</h2>
-              <p id="project-view-desc" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Dual ESP32 Wireless & USB Hardware Control Architecture</p>
+              <h2 id="project-view-title" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Project</h2>
+              <p id="project-view-desc" style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">Edge Hardware Control & OTA Architecture</p>
             </div>
           </div>
         </div>
 
         <div class="section-header-row">
-          <div class="section-heading">🖧 Project Hardware Nodes</div>
+          <div class="section-heading">Project Hardware Nodes</div>
           <button class="btn-main btn-crimson" onclick="openAddNodeModal()">+ Register Node to Project</button>
         </div>
         <div class="nodes-grid" id="project-nodes-container">
@@ -4632,18 +5292,33 @@ def render_fleet_html(current_user="admin", token=""):
       <!-- VIEW 4: NODE DETAIL & CONTROL CENTER -->
       <div id="view-node-detail" style="display: none;">
         <div class="glass-card" style="margin-bottom: 24px;">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
             <div>
               <button class="btn-secondary" style="margin-bottom: 12px;" onclick="backToProject()">&larr; Back to Project</button>
               <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-                <h2 id="detail-node-name" style="font-size: 26px; font-weight: 800; color: #FFFFFF;">Node: A</h2>
+                <h2 id="detail-node-name" style="font-size: 26px; font-weight: 800; color: var(--text-strong);">Node Console</h2>
                 <span id="detail-node-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> ONLINE</span>
-                <span class="status-pill pill-cyan">✓ SHA-256 VERIFIED</span>
-                <button class="btn-main btn-cyan" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">🌐 On-Board Web UI</button>
-                <button class="btn-main btn-crimson" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodeReboot(selectedNodeName)" title="Reboot MCU via MQTT">🔄 Reboot</button>
-                <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodePing(selectedNodeName)" title="Ping node for immediate ACK">📡 Ping</button>
-                <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="openRenameModal('node', selectedNodeName, selectedNodeName)">✏️ Rename</button>
-                <button class="btn-secondary" style="border-color: rgba(239,68,68,0.4); color: #F87171; font-size: 12px; padding: 6px 12px;" onclick="deleteNode(selectedNodeName)">🗑️ Delete Node</button>
+                <span class="status-pill pill-cyan">SHA-256 VERIFIED</span>
+                <button class="btn-main btn-cyan" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                  <span>On-Board Web UI</span>
+                </button>
+                <button class="btn-main btn-crimson" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodeReboot(selectedNodeName)" title="Reboot MCU via MQTT">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                  <span>Reboot</span>
+                </button>
+                <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="triggerNodePing(selectedNodeName)" title="Ping node for immediate ACK">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+                  <span>Ping</span>
+                </button>
+                <button class="btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="openRenameModal('node', selectedNodeName, selectedNodeName)">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                  <span>Rename</span>
+                </button>
+                <button class="btn-secondary" style="border-color: rgba(239,68,68,0.4); color: #F87171; font-size: 12px; padding: 6px 12px;" onclick="deleteNode(selectedNodeName)">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                  <span>Delete Node</span>
+                </button>
               </div>
             </div>
             <!-- Quick switcher for all nodes -->
@@ -4686,10 +5361,10 @@ def render_fleet_html(current_user="admin", token=""):
             <!-- Universal Custom Command & Directive Console -->
             <div class="glass-card" style="margin-bottom: 18px;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <div class="panel-title" style="margin: 0;">⚡ Project Action & Directive Console</div>
+                <div class="panel-title" style="margin: 0;">Project Action & Directive Console</div>
                 <span class="status-pill pill-cyan">Real-Time MQTT</span>
               </div>
-              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Dispatch custom action directives to this node (e.g. RELAY:ON, LIGHTS:1, BRIGHTNESS:80, or your project's custom commands):</p>
+              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Dispatch custom action directives to this node (e.g. RELAY:ON, MOTOR:HOME, SPEED:80, or your project's custom commands):</p>
               
               <div style="display: flex; gap: 8px; margin-bottom: 10px;">
                 <input type="text" id="custom-directive-input" class="form-input" style="flex: 1;" placeholder="Enter directive, e.g. SERVICE:ON or RELAY:1" onkeydown="if(event.key==='Enter') sendCustomDirective(selectedNodeName)">
@@ -4698,18 +5373,18 @@ def render_fleet_html(current_user="admin", token=""):
 
               <div style="display: flex; gap: 6px; flex-wrap: wrap;">
                 <span style="font-size: 11px; color: var(--text-dim); align-self: center; margin-right: 4px;">Quick Actions:</span>
-                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'PING')">📡 PING</span>
-                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:ON')">⚡ Service ON</span>
-                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:OFF')">⏸️ Service OFF</span>
-                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'REBOOT')">🔄 REBOOT</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'PING')">PING</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:ON')">Service ON</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:OFF')">Service OFF</span>
+                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'REBOOT')">REBOOT</span>
               </div>
             </div>
 
-            <!-- Output Delay Configurator (Optional / POC Feature) -->
-            <div class="delay-box" id="delay-box-container">
+            <!-- Output Delay Configurator (Legacy POC Only, Hidden by Default) -->
+            <div class="delay-box" id="delay-box-container" style="display: none;">
               <div class="delay-header">
                 <div>
-                  <h4 style="font-size: 15px; font-weight: 700; color: #FFFFFF;">Configurable Output Propagation Delay</h4>
+                  <h4 style="font-size: 15px; font-weight: 700; color: var(--text-strong);">Configurable Output Propagation Delay</h4>
                   <p style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Delay in seconds before button press toggles physical output (0 - 10s, 0.5s step)</p>
                 </div>
                 <div class="delay-val-badge" id="delay-display-val">0.0s</div>
@@ -4726,24 +5401,24 @@ def render_fleet_html(current_user="admin", token=""):
               </div>
             </div>
 
-            <!-- Live Hardware Visualizer (POC Demonstration Component) -->
-            <div class="hw-visualizer" id="poc-visualizer-container">
+            <!-- Live Hardware Visualizer (Legacy POC Only, Hidden by Default) -->
+            <div class="hw-visualizer" id="poc-visualizer-container" style="display: none;">
               <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div class="panel-title" style="margin: 0;">Dual-ESP32 POC Hardware Visualizer</div>
-                <span style="font-size: 10px; color: var(--text-dim);">GPIO 2 & 0 Mirror</span>
+                <div class="panel-title" style="margin: 0;">Legacy Hardware State Mirror</div>
+                <span style="font-size: 10px; color: var(--text-dim);">Optional Telemetry</span>
               </div>
-              <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px 0;">Demonstration visualizer active for nodes with physical button & LED attached. Custom project nodes can ignore these pins.</p>
+              <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px 0;">Optional status mirror if firmware publishes pin telemetry.</p>
               
               <div class="hw-display-row">
                 <div class="hw-unit">
-                  <div style="font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;">GPIO 2 Blue LED</div>
+                  <div style="font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;">Output State</div>
                   <div class="led-orb" id="visualizer-led"></div>
-                  <div style="font-size: 13px; font-weight: 700;" id="visualizer-led-text">DARK / OFF</div>
+                  <div style="font-size: 13px; font-weight: 700;" id="visualizer-led-text">OFF</div>
                 </div>
 
                 <div class="hw-unit">
-                  <div style="font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;">GPIO 0 BOOT Button</div>
-                  <div class="boot-btn-sim" id="visualizer-btn">BOOT</div>
+                  <div style="font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;">Input State</div>
+                  <div class="boot-btn-sim" id="visualizer-btn">INPUT</div>
                   <div style="font-size: 13px; font-weight: 700;" id="visualizer-btn-text">RELEASED</div>
                 </div>
               </div>
@@ -4755,30 +5430,40 @@ def render_fleet_html(current_user="admin", token=""):
                 <div class="panel-title" style="margin: 0;">On-Board Web Server (In-Situ)</div>
                 <span id="insitu-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> Port 80 Live</span>
               </div>
-              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">The ESP32 runs an onboard web server serving its own branded in-situ configuration console. View it live through the secure portal reverse proxy:</p>
+              <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">This hardware node hosts an onboard web application. Access its full multi-page touch/desktop UI globally via the secure portal proxy:</p>
               <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button class="btn-main btn-cyan" onclick="openInsituModal()" style="flex: 1; min-width: 170px; font-size: 13px;">
-                  🌐 Launch In-Portal Proxy Viewer
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                  <span>Launch Global Web UI Viewer</span>
                 </button>
                 <a id="detail-insitu-link" href="#" target="_blank" class="btn-secondary" style="flex: 1; min-width: 150px; text-decoration: none; text-align: center; font-size: 13px;">
-                  ↗ Direct LAN (<span id="detail-insitu-ip">10.94.142.79</span>)
+                  <span>Direct LAN (<span id="detail-insitu-ip">0.0.0.0</span>) &rarr;</span>
                 </a>
               </div>
             </div>
           </div>
 
-          <!-- Right Column: Firmware Pipeline & Hardware Specs -->
+          <!-- Right Column: Hardware Profile & Firmware Pipeline -->
           <div>
             <!-- Microcontroller Hardware Profile & Wireless Capabilities -->
             <div class="glass-card" style="margin-bottom: 24px;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
                 <div class="panel-title" style="margin: 0;">Microcontroller Hardware Profile</div>
-                <span id="spec-mcu-family-pill" class="status-pill pill-cyan" style="font-size: 11px;">ESP32 (Tensilica)</span>
+                <span id="spec-mcu-family-pill" class="status-pill pill-cyan" style="font-size: 11px;">ESP32-WROOM-32</span>
               </div>
-              <div class="node-spec-row"><span class="node-spec-lbl">MCU Architecture</span><span class="node-spec-val" id="spec-mcu-arch" style="color:#A78BFA;">Tensilica Xtensa Dual-Core 240MHz</span></div>
-              <div class="node-spec-row"><span class="node-spec-lbl">Flash Memory</span><span class="node-spec-val" id="spec-mcu-flash" style="color:#38BDF8;">4 MB SPI Flash</span></div>
-              <div class="node-spec-row"><span class="node-spec-lbl">Total SRAM</span><span class="node-spec-val" id="spec-mcu-ram" style="color:#34D399;">320 KB Total SRAM</span></div>
-              <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Onboard Antenna Band</span><span class="node-spec-val" id="spec-mcu-antenna" style="color:#FBBF24;">2.4 GHz 802.11 b/g/n + BLE 4.2</span></div>
+              <div id="detail-esp32-photo-wrap" style="display: none; align-items: center; gap: 14px; padding: 12px; margin-bottom: 14px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--card-border);">
+                <div class="esp32-hero-frame">
+                  <img src="/static/esp32_wroom32.jpg" alt="ESP32-WROOM-32 Module">
+                </div>
+                <div>
+                  <div style="font-size: 14px; font-weight: 800; color: var(--text-strong);">ESP32-WROOM-32 Hardware Node</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Dual-Core Wi-Fi / BLE SoC Module &bull; NVS Identity Sync</div>
+                </div>
+              </div>
+              <div class="node-spec-row"><span class="node-spec-lbl">MCU Architecture</span><span class="node-spec-val" id="spec-mcu-arch" style="color:#8B5CF6;">Tensilica Xtensa Dual-Core 240MHz</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Flash Memory</span><span class="node-spec-val" id="spec-mcu-flash" style="color:#0EA5E9;">4 MB SPI Flash</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Total SRAM</span><span class="node-spec-val" id="spec-mcu-ram" style="color:#10B981;">320 KB Total SRAM</span></div>
+              <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Onboard Antenna Band</span><span class="node-spec-val" id="spec-mcu-antenna" style="color:#D97706;">2.4 GHz 802.11 b/g/n + BLE 4.2</span></div>
             </div>
 
             <!-- Hardware Specifications Card -->
@@ -4786,13 +5471,13 @@ def render_fleet_html(current_user="admin", token=""):
               <div class="panel-title">Node Telemetry & Markers</div>
               <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val" id="spec-mac">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">eFuse Chip ID</span><span class="node-spec-val" id="spec-chip">-</span></div>
-              <div class="node-spec-row"><span class="node-spec-lbl">STA Local IP</span><span class="node-spec-val" id="spec-ip" style="color:#38BDF8;">-</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">STA Local IP</span><span class="node-spec-val" id="spec-ip" style="color:#0EA5E9;">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">USB Port (Backdoor)</span><span class="node-spec-val" id="spec-port">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Wi-Fi Signal (RSSI)</span><span class="node-spec-val" id="spec-rssi">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Free Heap RAM</span><span class="node-spec-val" id="spec-heap">-</span></div>
-              <div class="node-spec-row"><span class="node-spec-lbl">Geographic Location</span><span class="node-spec-val" id="spec-geo" style="color:#38BDF8;">Pune, Maharashtra, India</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Geographic Location</span><span class="node-spec-val" id="spec-geo" style="color:#0EA5E9;">Pune, Maharashtra, India</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Public WAN IP & Carrier</span><span class="node-spec-val" id="spec-public-ip">-</span></div>
-              <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">SHA-256 Fingerprint</span><span class="node-spec-val" id="spec-hash" style="color:#34D399; font-size:11px; word-break:break-all;">-</span></div>
+              <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">SHA-256 Fingerprint</span><span class="node-spec-val" id="spec-hash" style="color:#10B981; font-size:11px; word-break:break-all;">-</span></div>
             </div>
 
             <!-- Firmware Deployment Hub -->
@@ -4803,30 +5488,33 @@ def render_fleet_html(current_user="admin", token=""):
               <!-- Golden Base Firmware Reference Build -->
               <div class="base-firmware-card active" id="card-base-firmware" onclick="selectBaseFirmware()">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                  <div style="font-size: 14px; font-weight: 700; color: #FFFFFF; display: flex; align-items: center; gap: 8px;">
-                    <span style="color:#F59E0B;">⭐</span> <span>Base_firmware.bin</span>
+                  <div style="font-size: 14px; font-weight: 700; color: var(--text-strong); display: flex; align-items: center; gap: 8px;">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    <span>Base_firmware.bin</span>
                     <span class="status-pill pill-green" style="font-size: 10px; padding: 2px 8px;">GOLDEN REFERENCE</span>
                   </div>
                   <span class="status-pill pill-cyan" style="font-size: 10px; padding: 2px 8px;">1059.5 KB</span>
                 </div>
                 <div style="font-size: 12px; color: var(--text-muted); line-height: 1.5;">
-                  Standard golden reference image for multi-MCU fleet integration (ESP32, ESP8266, BW16, Arduino Uno R4). Validated with dual-OTA partition fit, HiveMQ broker telemetry, onboard in-situ web console, hardware SHA-256 fingerprint, and autonomous offline service.
+                  Standard reference image for multi-MCU fleet integration (ESP32, ESP8266, BW16, Arduino Uno R4). Includes OTA fit checks, HiveMQ broker telemetry, NVS identity sync, and onboard reverse proxy relay.
                 </div>
               </div>
 
               <!-- Custom .bin Upload Zone -->
               <div class="dropzone" id="bin-dropzone" onclick="document.getElementById('bin-file-input').click()">
-                <div class="dropzone-icon">📥</div>
-                <div style="font-size: 13px; font-weight: 700; color: #FFFFFF;" id="dropzone-label">Drop custom .bin file here or click to browse</div>
-                <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Pre-flash deep verification of OTA partition, endpoints, & markers</div>
+                <div class="dropzone-icon">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--crimson)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                </div>
+                <div style="font-size: 13px; font-weight: 700; color: var(--text-strong);" id="dropzone-label">Drop custom .bin file here or click to browse</div>
+                <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Pre-flash verification of OTA partition, endpoints, &amp; markers</div>
                 <input type="file" id="bin-file-input" style="display:none;" accept=".bin" onchange="handleFileSelect(this.files)">
               </div>
 
               <!-- Firmware Pre-Flash Deep Inspection Report Card -->
-              <div id="bin-inspect-card" style="display: none; background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 14px; margin-top: 14px;">
+              <div id="bin-inspect-card" style="display: none; background: var(--surface-2); border: 1px solid var(--card-border); border-radius: 12px; padding: 14px; margin-top: 14px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                  <span style="font-size: 12px; font-weight: 700; color: #FFFFFF;">Binary Pre-Flash Inspection</span>
-                  <span id="inspect-compliance-pill" class="status-pill pill-green">✓ 100% Compliant</span>
+                  <span style="font-size: 12px; font-weight: 700; color: var(--text-strong);">Binary Pre-Flash Inspection</span>
+                  <span id="inspect-compliance-pill" class="status-pill pill-green">100% Compliant</span>
                 </div>
                 <div style="font-size: 11px; color: var(--text-muted); line-height: 1.6;" id="inspect-details">
                   <!-- Populated by JS -->
@@ -4836,10 +5524,12 @@ def render_fleet_html(current_user="admin", token=""):
               <!-- Deployment Actions -->
               <div class="btn-action-row">
                 <button class="btn-main btn-crimson" onclick="triggerDeployment('cloud')">
-                  🚀 Wireless OTA Update
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>
+                  <span>Wireless OTA Update</span>
                 </button>
                 <button class="btn-main btn-usb" onclick="triggerDeployment('usb')">
-                  🔌 USB Direct Flash
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>
+                  <span>USB Direct Flash</span>
                 </button>
               </div>
 
@@ -4847,7 +5537,7 @@ def render_fleet_html(current_user="admin", token=""):
               <div class="update-tracker" id="detail-tracker">
                 <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: 700;">
                   <span id="tracker-stage-title">Deployment in Progress</span>
-                  <span id="tracker-pct" style="color:#38BDF8;">0%</span>
+                  <span id="tracker-pct" style="color:#0EA5E9;">0%</span>
                 </div>
                 <div class="tracker-bar-bg">
                   <div class="tracker-bar-fill" id="tracker-fill"></div>
@@ -4959,21 +5649,21 @@ def render_fleet_html(current_user="admin", token=""):
     <div class="modal-card" style="max-width: 580px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
         <h3 style="margin: 0;">Enterprise User Accounts & Device Telemetry</h3>
-        <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px;" onclick="closeModal('modal-users')">✕ Close</button>
+        <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px;" onclick="closeModal('modal-users')">&times; Close</button>
       </div>
       <p>Manage authenticated administrators, operators, and review connected device sessions.</p>
       
       <div style="margin-bottom: 20px;">
-        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 8px;">Existing Accounts</div>
+        <div style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 8px;">Existing Accounts</div>
         <div id="users-list-container" style="max-height: 180px; overflow-y: auto;">
           <!-- Populated by JS -->
         </div>
       </div>
 
       <!-- Active Sessions & Connected Device Telemetry -->
-      <div style="margin-bottom: 20px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
+      <div style="margin-bottom: 20px; border-top: 1px solid var(--card-border); padding-top: 16px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-          <div style="font-size: 12px; font-weight: 700; color: #CBD5E1;">📱 Connected Devices & Active Login Sessions</div>
+          <div style="font-size: 12px; font-weight: 700; color: var(--text-muted);">Connected Devices & Active Login Sessions</div>
           <span class="status-pill pill-cyan" id="sessions-count-pill" style="font-size: 10px;">1 Active</span>
         </div>
         <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 10px;">Hardware, OS, device model, form factor, IP, and location captured per login:</div>
@@ -4982,8 +5672,8 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
       </div>
 
-      <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px;">
-        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 10px;">Register New User Account</div>
+      <div style="border-top: 1px solid var(--card-border); padding-top: 16px;">
+        <div style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 10px;">Register New User Account</div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
           <div>
             <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Username</label>
@@ -5010,19 +5700,19 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
           <button id="btn-add-user" class="btn-main btn-crimson" onclick="submitNewUser(false)" style="padding: 10px 14px; font-size: 12px;">
-            💾 Save User Account
+            Save User Account
           </button>
           <button id="btn-add-user-bio" class="btn-main btn-cyan" onclick="submitNewUser(true)" style="padding: 10px 14px; font-size: 12px;">
-            📲 Save &amp; Enroll Biometrics
+            Save &amp; Enroll Biometrics
           </button>
         </div>
       </div>
 
-      <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px; margin-top: 16px;">
-        <div style="font-size: 12px; font-weight: 700; color: #CBD5E1; margin-bottom: 6px;">Device Native Biometrics (Samsung Fingerprint / Apple Face ID)</div>
+      <div style="border-top: 1px solid var(--card-border); padding-top: 16px; margin-top: 16px;">
+        <div style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px;">Device Native Biometrics (Fingerprint / Face ID)</div>
         <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 12px;">Enroll this device's biometric scanner (Fingerprint or Face ID) for your current account to enable fast, passwordless Biometric Login:</div>
-        <button id="btn-enroll-curr-device" class="btn-secondary" style="width: 100%; font-size: 12px; padding: 10px; border-color: rgba(56, 189, 248, 0.4); color: #38BDF8;" onclick="enrollCurrentDeviceBiometrics()">
-          📲 Enroll This Device for Currently Logged-in Account
+        <button id="btn-enroll-curr-device" class="btn-secondary" style="width: 100%; font-size: 12px; padding: 10px; border-color: rgba(56, 189, 248, 0.4); color: #0EA5E9;" onclick="enrollCurrentDeviceBiometrics()">
+          Enroll This Device for Currently Logged-in Account
         </button>
       </div>
     </div>
@@ -5041,7 +5731,7 @@ def render_fleet_html(current_user="admin", token=""):
       </div>
       <div class="modal-actions">
         <button class="btn-secondary" onclick="closeModal('modal-rename')">Cancel</button>
-        <button class="btn-main btn-crimson" onclick="submitRename()">Save & Synchronize</button>
+        <button class="btn-main btn-crimson" onclick="submitRename()">Save &amp; Synchronize</button>
       </div>
     </div>
   </div>
@@ -5049,18 +5739,21 @@ def render_fleet_html(current_user="admin", token=""):
   <!-- Modal: In-Situ Web UI Viewer -->
   <div class="modal-overlay" id="modal-insitu-webui">
     <div class="modal-card" style="max-width: 960px; width: 95vw; padding: 20px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; border-bottom: 1px solid var(--card-border); padding-bottom: 12px; flex-wrap: wrap; gap: 10px;">
         <div>
           <h3 style="margin: 0;" id="insitu-modal-title">In-Situ On-Board Web UI</h3>
-          <div style="font-size: 11px; color: #34D399; margin-top: 2px;">● Connected via Anashwar High-Speed Hardware Reverse Proxy</div>
+          <div style="font-size: 11px; color: #10B981; margin-top: 2px;">Connected via Anashwar Hardware Reverse Proxy Tunnel</div>
         </div>
-        <div style="display: flex; gap: 8px;">
-          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="refreshInsituIframe()">🔄 Reload</button>
-          <a id="insitu-modal-direct-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 12px; font-size: 12px; text-decoration: none;">↗ Direct Link</a>
-          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">✕ Close</button>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="refreshInsituIframe()">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            <span>Reload</span>
+          </button>
+          <a id="insitu-modal-direct-link" href="#" target="_blank" class="btn-secondary" style="padding: 6px 12px; font-size: 12px; text-decoration: none;">Direct LAN &rarr;</a>
+          <button class="btn-secondary" style="padding: 6px 12px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">&times; Close</button>
         </div>
       </div>
-      <div style="width: 100%; height: 580px; border-radius: 14px; overflow: hidden; background: #0B0F19; border: 1px solid rgba(255,255,255,0.1);">
+      <div style="width: 100%; height: 580px; border-radius: 14px; overflow: hidden; background: var(--log-bg); border: 1px solid var(--card-border);">
         <iframe id="insitu-iframe" style="width: 100%; height: 100%; border: none;" src="about:blank"></iframe>
       </div>
     </div>
@@ -5069,32 +5762,36 @@ def render_fleet_html(current_user="admin", token=""):
   <!-- Mobile Bottom Navigation Bar (Touch Screen Phone Form) -->
   <nav class="mobile-bottom-nav" id="mobile-bottom-nav">
     <button class="bottom-nav-item active" id="bnav-dashboard" onclick="navigateTo('dashboard')">
-      <span class="bnav-icon">🏢</span>
-      <span class="bnav-label">Clients</span>
+      <span class="bnav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>
+      <span class="bnav-label">Live Fleet</span>
+    </button>
+    <button class="bottom-nav-item" id="bnav-history" onclick="navigateTo('history-clients')">
+      <span class="bnav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></span>
+      <span class="bnav-label">History</span>
     </button>
     <button class="bottom-nav-item" id="bnav-node-detail" onclick="openCurrentNodeDetail()">
-      <span class="bnav-icon">🖧</span>
-      <span class="bnav-label">Node Detail</span>
+      <span class="bnav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/></svg></span>
+      <span class="bnav-label">Node</span>
     </button>
     <button class="bottom-nav-item" id="bnav-registry" onclick="navigateTo('registry')">
-      <span class="bnav-icon">📜</span>
+      <span class="bnav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span>
       <span class="bnav-label">Registry</span>
-    </button>
-    <button class="bottom-nav-item" id="bnav-users" onclick="openUserModal()">
-      <span class="bnav-icon">👥</span>
-      <span class="bnav-label">Sessions</span>
     </button>
   </nav>
 
   <script>
     // State
+    const DEFAULT_FLEET = { clients: {}, projects: {}, registered_nodes: {}, history: { clients: {}, projects: {}, nodes: {} } };
     let currentView = "dashboard";
-    let selectedClientId = "client_1";
-    let selectedProjectId = "proj_1";
-    let selectedNodeName = "Node: A";
+    let selectedClientId = "";
+    let selectedProjectId = "";
+    let selectedNodeName = "";
+    let selectedHistoryClientKey = "";
+    let selectedHistoryProjectKey = "";
     let selectedFirmwareFile = "Base_firmware.bin";
+    let globalSearchQuery = "";
 
-    let fleetData = {};
+    let fleetData = DEFAULT_FLEET;
     let telemetryData = {};
 
     let currentRegYear = 2026;
@@ -5104,14 +5801,112 @@ def render_fleet_html(current_user="admin", token=""):
     let currentDayEvents = [];
     let currentCategoryFilter = "ALL";
 
+    const ICONS = {
+      edit: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+      trash: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>',
+      globe: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+      sliders: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+      ping: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>',
+      reboot: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>',
+      chip: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="5"/><line x1="15" y1="2" x2="15" y2="5"/><line x1="9" y1="19" x2="9" y2="22"/><line x1="15" y1="19" x2="15" y2="22"/><line x1="2" y1="9" x2="5" y2="9"/><line x1="2" y1="15" x2="5" y2="15"/><line x1="19" y1="9" x2="22" y2="9"/><line x1="19" y1="15" x2="22" y2="15"/></svg>',
+      phone: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>',
+      desktop: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+      sun: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>',
+      moon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'
+    };
+
+    function escHtml(val) {
+      return String(val == null ? "" : val)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function escJs(val) {
+      const bs = String.fromCharCode(92);
+      const raw = String(val == null ? "" : val)
+        .split(bs).join(bs + bs)
+        .split("'").join(bs + "'")
+        .split(String.fromCharCode(10)).join(" ")
+        .split(String.fromCharCode(13)).join("");
+      return escHtml(raw);
+    }
+
+    function normKey(val) {
+      return String(val == null ? "" : val).trim().toLowerCase()
+        .split(String.fromCharCode(0x2018)).join("'")
+        .split(String.fromCharCode(0x2019)).join("'")
+        .split("`").join("'");
+    }
+
+    function isEsp32Node(node) {
+      if (!node) return false;
+      const meta = ((node.mcu || "") + " " + (node.mcu_family || "") + " " + (node.mcu_type || "") + " " + (node.mcu_arch || "")).toUpperCase();
+      return meta.includes("ESP32") || meta.includes("WROOM") || meta.includes("XTENSA");
+    }
+
+    function updateThemeButton() {
+      const btn = document.getElementById("theme-toggle-btn");
+      if (!btn) return;
+      const cur = document.documentElement.getAttribute("data-theme") || "dark";
+      if (cur === "light") {
+        btn.innerHTML = ICONS.moon + "<span>Dark</span>";
+      } else {
+        btn.innerHTML = ICONS.sun + "<span>Light</span>";
+      }
+    }
+
+    function toggleTheme() {
+      const cur = document.documentElement.getAttribute("data-theme") || "dark";
+      const next = (cur === "dark") ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("anashwar_theme", next); } catch(e) {}
+      updateThemeButton();
+    }
+
+    function onGlobalSearch(val) {
+      globalSearchQuery = (val || "").toLowerCase().trim();
+      if (currentView === "dashboard") renderClients();
+      else if (currentView === "history-clients") renderHistoryClients();
+      else if (currentView === "history-projects") renderHistoryProjects();
+      else if (currentView === "history-nodes") renderHistoryNodes();
+      else if (currentView === "client") renderClientProjects();
+      else if (currentView === "project") renderProjectNodes();
+    }
+
+    document.addEventListener("keydown", function(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        const inp = document.getElementById("global-search-input");
+        if (inp) inp.focus();
+      }
+    });
+
+    function showAnimatedView(viewElId) {
+      const el = document.getElementById(viewElId);
+      if (!el) return;
+      el.classList.remove("view-animate-in");
+      el.style.display = "block";
+      void el.offsetWidth;
+      el.classList.add("view-animate-in");
+    }
+
     function navigateTo(view, param1, param2) {
       currentView = view;
-      document.querySelectorAll("#view-dashboard, #view-client, #view-project, #view-node-detail, #view-registry, #view-registry-day").forEach(el => el.style.display = "none");
+      document.querySelectorAll("#view-dashboard, #view-history-clients, #view-history-projects, #view-history-nodes, #view-client, #view-project, #view-node-detail, #view-registry, #view-registry-day").forEach(el => {
+        el.style.display = "none";
+        el.classList.remove("view-animate-in");
+      });
       document.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
       document.querySelectorAll(".bottom-nav-item").forEach(el => el.classList.remove("active"));
 
       if (view === "dashboard" || view === "clients" || view === "client" || view === "projects" || view === "project") {
         const b = document.getElementById("bnav-dashboard");
+        if (b) b.classList.add("active");
+      } else if (view.startsWith("history")) {
+        const b = document.getElementById("bnav-history");
         if (b) b.classList.add("active");
       } else if (view === "registry" || view === "registry-day") {
         const b = document.getElementById("bnav-registry");
@@ -5122,34 +5917,86 @@ def render_fleet_html(current_user="admin", token=""):
       }
 
       const breadcrumb = document.getElementById("breadcrumb-container");
+      const hData = (fleetData && fleetData.history) ? fleetData.history : { clients: {}, projects: {}, nodes: {} };
 
       if (view === "dashboard") {
         const navD = document.getElementById("nav-dashboard");
         if (navD) navD.classList.add("active");
-        document.getElementById("view-dashboard").style.display = "block";
-        breadcrumb.innerHTML = `<span class="breadcrumb-active">🏠 Dashboard Overview</span>`;
+        showAnimatedView("view-dashboard");
+        breadcrumb.innerHTML = `<span class="breadcrumb-active">Live Fleet</span>`;
         renderClients();
+      } else if (view === "history-clients") {
+        const navH = document.getElementById("nav-history");
+        if (navH) navH.classList.add("active");
+        showAnimatedView("view-history-clients");
+        breadcrumb.innerHTML = `
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-active">Fleet History: Clients</span>
+        `;
+        renderHistoryClients();
+      } else if (view === "history-projects") {
+        const navH = document.getElementById("nav-history");
+        if (navH) navH.classList.add("active");
+        if (param1) selectedHistoryClientKey = param1;
+        else if (!selectedHistoryClientKey && hData.clients && Object.keys(hData.clients).length > 0) {
+          selectedHistoryClientKey = Object.keys(hData.clients)[0];
+        }
+        const hc = hData.clients ? hData.clients[selectedHistoryClientKey] : null;
+        const hcName = hc ? hc.name : (selectedHistoryClientKey || "Client");
+        showAnimatedView("view-history-projects");
+        breadcrumb.innerHTML = `
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-item" onclick="navigateTo('history-clients')">Fleet History</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-active">${escHtml(hcName)}</span>
+        `;
+        renderHistoryProjects();
+      } else if (view === "history-nodes") {
+        const navH = document.getElementById("nav-history");
+        if (navH) navH.classList.add("active");
+        if (param1) selectedHistoryProjectKey = param1;
+        else if (!selectedHistoryProjectKey && hData.projects && Object.keys(hData.projects).length > 0) {
+          selectedHistoryProjectKey = Object.keys(hData.projects)[0];
+        }
+        const hp = hData.projects ? hData.projects[selectedHistoryProjectKey] : null;
+        if (hp && hp.client_key) selectedHistoryClientKey = hp.client_key;
+        const hc = hData.clients ? hData.clients[selectedHistoryClientKey] : null;
+        const hcName = hc ? hc.name : (hp ? hp.client_name : "Client");
+        const hpName = hp ? hp.name : (selectedHistoryProjectKey || "Project");
+        showAnimatedView("view-history-nodes");
+        breadcrumb.innerHTML = `
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-item" onclick="navigateTo('history-clients')">Fleet History</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-item" onclick="navigateTo('history-projects', '${escJs(selectedHistoryClientKey)}')">${escHtml(hcName)}</span>
+          <span class="breadcrumb-sep">&gt;</span>
+          <span class="breadcrumb-active">${escHtml(hpName)}</span>
+        `;
+        renderHistoryNodes();
       } else if (view === "registry") {
         const navR = document.getElementById("nav-registry");
         if (navR) navR.classList.add("active");
-        document.getElementById("view-registry").style.display = "block";
+        showAnimatedView("view-registry");
         breadcrumb.innerHTML = `
-          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-active">📋 Operations Registry</span>
+          <span class="breadcrumb-active">Operations Registry</span>
         `;
         loadRegistryCalendar();
       } else if (view === "registry-day") {
         const navR = document.getElementById("nav-registry");
         if (navR) navR.classList.add("active");
-        document.getElementById("view-registry-day").style.display = "block";
+        showAnimatedView("view-registry-day");
         const dStr = param1 || (new Date()).toISOString().split("T")[0];
         breadcrumb.innerHTML = `
-          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-item" onclick="navigateTo('registry')">📋 Operations Registry</span>
+          <span class="breadcrumb-item" onclick="navigateTo('registry')">Operations Registry</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-active">📅 ${dStr}.log</span>
+          <span class="breadcrumb-active">${escHtml(dStr)}.log</span>
         `;
         openRegistryDay(dStr);
       } else if (view === "clients" || view === "client") {
@@ -5158,15 +6005,15 @@ def render_fleet_html(current_user="admin", token=""):
         } else if (!selectedClientId && fleetData.clients && Object.keys(fleetData.clients).length > 0) {
           selectedClientId = Object.keys(fleetData.clients)[0];
         }
-        document.getElementById("view-client").style.display = "block";
+        showAnimatedView("view-client");
         const client = fleetData.clients ? fleetData.clients[selectedClientId] : null;
-        const cName = client ? client.name : selectedClientId;
+        const cName = client ? client.name : (selectedClientId || "Client");
         document.getElementById("client-view-title").innerText = cName;
-        document.getElementById("client-view-desc").innerText = client ? client.description : "";
+        document.getElementById("client-view-desc").innerText = client ? (client.description || "") : "";
         breadcrumb.innerHTML = `
-          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-active">🏢 ${cName}</span>
+          <span class="breadcrumb-active">${escHtml(cName)}</span>
         `;
         renderClientProjects();
       } else if (view === "projects" || view === "project") {
@@ -5175,18 +6022,18 @@ def render_fleet_html(current_user="admin", token=""):
         } else if (!selectedProjectId && fleetData.projects && Object.keys(fleetData.projects).length > 0) {
           selectedProjectId = Object.keys(fleetData.projects)[0];
         }
-        document.getElementById("view-project").style.display = "block";
+        showAnimatedView("view-project");
         const proj = fleetData.projects ? fleetData.projects[selectedProjectId] : null;
         const client = (proj && fleetData.clients) ? fleetData.clients[proj.client_id] : null;
-        const pName = proj ? proj.name : selectedProjectId;
+        const pName = proj ? proj.name : (selectedProjectId || "Project");
         document.getElementById("project-view-title").innerText = pName;
-        document.getElementById("project-view-desc").innerText = proj ? proj.description : "";
+        document.getElementById("project-view-desc").innerText = proj ? (proj.description || "") : "";
         breadcrumb.innerHTML = `
-          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-item" onclick="navigateTo('client', '${proj ? proj.client_id : ""}')">🏢 ${client ? client.name : "Client"}</span>
+          <span class="breadcrumb-item" onclick="navigateTo('client', '${escJs(proj ? proj.client_id : "")}')">${escHtml(client ? client.name : "Client")}</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-active">📁 ${pName}</span>
+          <span class="breadcrumb-active">${escHtml(pName)}</span>
         `;
         renderProjectNodes();
       } else if (view === "node-detail") {
@@ -5196,15 +6043,15 @@ def render_fleet_html(current_user="admin", token=""):
           selectedProjectId = regNode.project_id;
           selectedClientId = regNode.client_id;
         }
-        document.getElementById("view-node-detail").style.display = "block";
+        showAnimatedView("view-node-detail");
         const proj = fleetData.projects ? fleetData.projects[selectedProjectId] : null;
         const pName = proj ? proj.name : "Project";
         breadcrumb.innerHTML = `
-          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">🏠 Dashboard</span>
+          <span class="breadcrumb-item" onclick="navigateTo('dashboard')">Live Fleet</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-item" onclick="navigateTo('project', '${selectedProjectId}')">📁 ${pName}</span>
+          <span class="breadcrumb-item" onclick="navigateTo('project', '${escJs(selectedProjectId)}')">${escHtml(pName)}</span>
           <span class="breadcrumb-sep">&gt;</span>
-          <span class="breadcrumb-active">⚡ ${selectedNodeName}</span>
+          <span class="breadcrumb-active">${escHtml(selectedNodeName || "Node")}</span>
         `;
         updateNodeDetailUI();
       }
@@ -5362,20 +6209,20 @@ def render_fleet_html(current_user="admin", token=""):
         for (const u of data.users) {
           const isSelf = u.is_self;
           html += `
-            <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); padding:10px 14px; border-radius:10px; margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; background:var(--surface-2); border:1px solid var(--card-border); padding:10px 14px; border-radius:10px; margin-bottom:8px;">
               <div>
-                <div style="font-weight:700; font-size:13px; color:#FFFFFF; display:flex; align-items:center; gap:6px;">
-                  <span>${u.username}</span>
-                  ${isSelf ? '<span style="color:#38BDF8; font-size:11px;">(You)</span>' : ""}
-                  ${u.biometrics_enrolled ? '<span style="font-size:11px; color:#10B981; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:1px 6px;">✓ Biometrics Enrolled</span>' : ""}
+                <div style="font-weight:700; font-size:13px; color:var(--text-strong); display:flex; align-items:center; gap:6px;">
+                  <span>${escHtml(u.username)}</span>
+                  ${isSelf ? '<span style="color:#0EA5E9; font-size:11px;">(You)</span>' : ""}
+                  ${u.biometrics_enrolled ? '<span style="font-size:11px; color:#10B981; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:1px 6px;">Biometrics Enrolled</span>' : ""}
                 </div>
-                <div style="font-size:11px; color:var(--text-dim);">${u.role} &bull; Created ${u.created_at || "Recently"}</div>
+                <div style="font-size:11px; color:var(--text-dim);">${escHtml(u.role)} &bull; Created ${escHtml(u.created_at || "Recently")}</div>
               </div>
               <div style="display:flex; align-items:center; gap:8px;">
-                <button class="btn-secondary" style="font-size:11px; padding:4px 8px; border-color:rgba(56, 189, 248, 0.4); color:#38BDF8;" onclick="enrollBiometricsForUser('${u.username}')">
-                  ${u.biometrics_enrolled ? '🔄 Re-enroll' : '📲 Enroll Biometrics'}
+                <button class="btn-secondary" style="font-size:11px; padding:4px 8px; border-color:rgba(56, 189, 248, 0.4); color:#0EA5E9;" onclick="enrollBiometricsForUser('${escJs(u.username)}')">
+                  ${u.biometrics_enrolled ? 'Re-enroll' : 'Enroll Biometrics'}
                 </button>
-                ${u.can_delete ? `<button class="delete-btn-tiny" onclick="deleteUser('${u.username}')">${isSelf ? "🗑️ Delete Self" : "🗑️ Delete"}</button>` : `<span style="font-size:11px; color:#64748B;">Protected</span>`}
+                ${u.can_delete ? `<button class="delete-btn-tiny" onclick="deleteUser('${escJs(u.username)}')" title="Delete Account">${ICONS.trash} ${isSelf ? "Delete Self" : "Delete"}</button>` : `<span style="font-size:11px; color:var(--text-dim);">Protected</span>`}
               </div>
             </div>
           `;
@@ -5390,19 +6237,19 @@ def render_fleet_html(current_user="admin", token=""):
           let sHtml = "";
           for (const s of sessions) {
             const isTouch = s.is_touch;
-            const icon = isTouch ? "📱" : "💻";
-            const formBadge = isTouch ? '<span class="status-pill pill-crimson" style="font-size:10px; padding:2px 8px;">📱 Touch Phone</span>' : '<span class="status-pill pill-cyan" style="font-size:10px; padding:2px 8px;">💻 Desktop PC</span>';
+            const icon = isTouch ? ICONS.phone : ICONS.desktop;
+            const formBadge = isTouch ? '<span class="status-pill pill-crimson" style="font-size:10px; padding:2px 8px;">Touch Mobile</span>' : '<span class="status-pill pill-cyan" style="font-size:10px; padding:2px 8px;">Desktop</span>';
             const currBadge = s.is_current ? '<span class="status-pill pill-green" style="font-size:10px; padding:2px 8px;">This Device</span>' : '';
             sHtml += `
-              <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); padding:10px 12px; border-radius:10px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                  <div style="font-weight:700; font-size:13px; color:#FFFFFF; display:flex; align-items:center; gap:6px;">
-                    <span>${icon}</span>
-                    <span>${s.device_model || "Hardware Device"}</span>
+              <div style="background:var(--surface-2); border:1px solid var(--card-border); padding:10px 12px; border-radius:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px; flex-wrap:wrap; gap:6px;">
+                  <div style="font-weight:700; font-size:13px; color:var(--text-strong); display:flex; align-items:center; gap:6px;">
+                    <span class="svg-icon">${icon}</span>
+                    <span>${escHtml(s.device_model || "Hardware Device")}</span>
                     ${formBadge}
                     ${currBadge}
                   </div>
-                  <span style="font-size:11px; color:#38BDF8; font-weight:700;">${s.username} (${s.role})</span>
+                  <span style="font-size:11px; color:#0EA5E9; font-weight:700;">${escHtml(s.username)} (${escHtml(s.role)})</span>
                 </div>
                 <div style="font-size:11px; color:var(--text-dim); display:flex; flex-wrap:wrap; gap:8px; line-height:1.4;">
                   <span><strong>OS:</strong> ${s.os || "Unknown"}</span>
@@ -5493,18 +6340,18 @@ def render_fleet_html(current_user="admin", token=""):
           const bioOk = await enrollBiometricsForUser(u, data.bio_options);
           await loadUsersList();
           if (bioOk) {
-            alert(`✓ User '${u}' registered and device biometric authentication linked successfully!\nYou can now use Biometric Login.`);
+            alert(`User '${u}' registered and device biometric authentication linked successfully!\nYou can now use Biometric Login.`);
           }
         } else {
           await loadUsersList();
-          alert(`✓ User '${u}' (${r}) registered successfully!`);
+          alert(`User '${u}' (${r}) registered successfully!`);
         }
       } catch(err) {
         alert("Network error creating user: " + err);
       } finally {
         if (submitBtn) {
           submitBtn.disabled = false;
-          submitBtn.innerText = enrollBiometricsAfter ? "📲 Save & Enroll Biometrics" : "💾 Save User Account";
+          submitBtn.innerText = enrollBiometricsAfter ? "Save & Enroll Biometrics" : "Save User Account";
         }
       }
     }
@@ -5538,7 +6385,7 @@ def render_fleet_html(current_user="admin", token=""):
       const u = "__CURRENT_USER__" || "admin";
       const ok = await enrollBiometricsForUser(u);
       if (ok) {
-        alert(`✓ Biometric authentication (Fingerprint / Face ID) successfully enrolled for user '${u}'!\nYou can now sign in using 'Biometric Login' on the sign-in screen.`);
+        alert(`Biometric authentication (Fingerprint / Face ID) successfully enrolled for user '${u}'!\nYou can now sign in using 'Biometric Login' on the sign-in screen.`);
       }
     }
 
@@ -5644,7 +6491,8 @@ def render_fleet_html(current_user="admin", token=""):
       });
       if (res.ok) {
         fetchTelemetry();
-        navigateTo("dashboard");
+        if (currentView === "history-clients") navigateTo("history-clients");
+        else navigateTo("dashboard");
       } else {
         alert("Error deleting client");
       }
@@ -5659,7 +6507,8 @@ def render_fleet_html(current_user="admin", token=""):
       });
       if (res.ok) {
         fetchTelemetry();
-        navigateTo("client", selectedClientId);
+        if (currentView === "history-projects") navigateTo("history-projects", selectedHistoryClientKey);
+        else navigateTo("client", selectedClientId);
       } else {
         alert("Error deleting project");
       }
@@ -5674,8 +6523,13 @@ def render_fleet_html(current_user="admin", token=""):
         body: `node_name=${encodeURIComponent(nodeName)}`
       });
       if (res.ok) {
+        if (selectedNodeName === nodeName) selectedNodeName = "";
         fetchTelemetry();
-        navigateTo("project", selectedProjectId);
+        if (selectedProjectId && fleetData.projects && fleetData.projects[selectedProjectId]) {
+          navigateTo("project", selectedProjectId);
+        } else {
+          navigateTo("dashboard");
+        }
       } else {
         alert("Error deleting node");
       }
@@ -5731,6 +6585,11 @@ def render_fleet_html(current_user="admin", token=""):
     }
 
     // In-Situ Reverse Proxy Viewer
+    function openInsituNode(nodeName) {
+      if (nodeName) selectedNodeName = nodeName;
+      openInsituModal();
+    }
+
     function openInsituModal() {
       const modal = document.getElementById("modal-insitu-webui");
       const iframe = document.getElementById("insitu-iframe");
@@ -5813,12 +6672,19 @@ def render_fleet_html(current_user="admin", token=""):
     }
 
     function openCurrentNodeDetail() {
+      const nodesObj = telemetryData.nodes || {};
       let target = selectedNodeName;
-      if (!target || (target === "Node: A" && telemetryData.nodes && !telemetryData.nodes["Node: A"])) {
-        const keys = Object.keys(telemetryData.nodes || {});
-        if (keys.length > 0) target = keys[keys.length - 1];
+      if (!target || !nodesObj[target]) {
+        const onlineKeys = Object.keys(nodesObj).filter(k => nodesObj[k] && nodesObj[k].online);
+        const allKeys = Object.keys(nodesObj);
+        target = onlineKeys[0] || allKeys[0] || "";
       }
-      openNodeDetail(target || 'Node: A');
+      if (!target) {
+        alert("No hardware nodes are currently registered. Wait for a node to connect or inspect Fleet History.");
+        navigateTo("history-clients");
+        return;
+      }
+      openNodeDetail(target);
     }
 
     function submitNewClient() {
@@ -5882,7 +6748,7 @@ def render_fleet_html(current_user="admin", token=""):
       
       if (pill) {
         pill.className = compliant ? "status-pill pill-green" : "status-pill pill-crimson";
-        pill.innerText = compliant ? `✓ ${info.compliance_score || 9}/9 Compliant` : "⚠️ Non-Compliant";
+        pill.innerText = compliant ? `${info.compliance_score || 9}/9 Compliant` : "Non-Compliant";
       }
       
       details.innerHTML = `
@@ -5942,7 +6808,7 @@ def render_fleet_html(current_user="admin", token=""):
       }).then(r => r.json()).then(d => {
         if (d.success) {
           selectedFirmwareFile = d.binary.filename;
-          document.getElementById("dropzone-label").innerText = `✓ Verified ${d.binary.filename} (${d.binary.size_kb} KB, ${d.binary.target_chip})`;
+          document.getElementById("dropzone-label").innerText = `Verified ${d.binary.filename} (${d.binary.size_kb} KB, ${d.binary.target_chip})`;
           updateBinaryInspectionCard(d.binary);
         } else {
           alert("Upload failed: " + (d.error || "Invalid file"));
@@ -5987,29 +6853,29 @@ def render_fleet_html(current_user="admin", token=""):
           for (const d of filteredDays) {
             if (d.has_events) {
               html += `
-                <div class="glass-card" style="padding:16px; cursor:pointer; border-color:rgba(56,189,248,0.25); background:rgba(15,23,42,0.6);" onclick="navigateTo('registry-day', '${d.date}')">
+                <div class="glass-card" style="padding:16px; cursor:pointer; border-color:rgba(14,165,233,0.3); background:var(--surface-2);" onclick="navigateTo('registry-day', '${escJs(d.date)}')">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                    <span style="font-weight:700; font-size:14px; color:#FFFFFF;">📅 ${d.date}</span>
-                    <span class="status-pill pill-cyan">${d.weekday} &bull; Wk ${d.week}</span>
+                    <span style="font-weight:700; font-size:14px; color:var(--text-strong);">${escHtml(d.date)}</span>
+                    <span class="status-pill pill-cyan">${escHtml(d.weekday)} &bull; Wk ${d.week}</span>
                   </div>
-                  <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">File: <code style="color:#38BDF8;">${d.filename}</code></div>
+                  <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">File: <code style="color:#0EA5E9;">${escHtml(d.filename)}</code></div>
                   <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <span class="status-pill pill-green">● ${d.count} Events Recorded</span>
-                    <span style="font-size:12px; color:#38BDF8; font-weight:700;">Open &rarr;</span>
+                    <span class="status-pill pill-green">${d.count} Events Recorded</span>
+                    <span style="font-size:12px; color:#0EA5E9; font-weight:700;">Open &rarr;</span>
                   </div>
                 </div>
               `;
             } else {
               html += `
-                <div class="glass-card" style="padding:16px; opacity:0.35; filter:grayscale(1); cursor:not-allowed;">
+                <div class="glass-card" style="padding:16px; opacity:0.42; cursor:not-allowed;">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                    <span style="font-weight:600; font-size:13px; color:#94A3B8;">📅 ${d.date}</span>
-                    <span class="status-pill" style="background:rgba(255,255,255,0.05); color:#64748B;">${d.weekday}</span>
+                    <span style="font-weight:600; font-size:13px; color:var(--text-muted);">${escHtml(d.date)}</span>
+                    <span class="status-pill" style="background:var(--surface-3); color:var(--text-dim);">${escHtml(d.weekday)}</span>
                   </div>
-                  <div style="font-size:11px; color:#64748B; margin-bottom:12px;">File: <code>${d.filename}</code></div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-bottom:12px;">File: <code>${escHtml(d.filename)}</code></div>
                   <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <span style="font-size:11px; color:#64748B;">No events logged</span>
-                    <span style="font-size:11px; color:#64748B;">—</span>
+                    <span style="font-size:11px; color:var(--text-dim);">No events logged</span>
+                    <span style="font-size:11px; color:var(--text-dim);">-</span>
                   </div>
                 </div>
               `;
@@ -6038,7 +6904,7 @@ def render_fleet_html(current_user="admin", token=""):
         const res = await authedFetch(`/api/registry/day?date=${encodeURIComponent(dateStr)}`);
         const data = await res.json();
         currentDayEvents = data.events || [];
-        document.getElementById("reg-day-count-badge").innerText = `● ${currentDayEvents.length} Events Recorded`;
+        document.getElementById("reg-day-count-badge").innerText = `${currentDayEvents.length} Events Recorded`;
         renderRegistryEventsList();
       } catch(e) {
         console.error("Error loading registry day:", e);
@@ -6077,7 +6943,7 @@ def render_fleet_html(current_user="admin", token=""):
         events = events.filter(e => {
           const u = e.toUpperCase();
           if (currentCategoryFilter === "CMD") return u.includes("COMMAND") || u.includes("CMD:");
-          if (currentCategoryFilter === "ACK") return u.includes("ACK") || u.includes("PING") || u.includes("PRESENCE");
+          if (currentCategoryFilter === "ACK") return u.includes("ACK") || u.includes("PRESENCE") || u.includes("ONLINE");
           if (currentCategoryFilter === "SEC") return u.includes("AUTH") || u.includes("LOGIN") || u.includes("SECURITY") || u.includes("HASH");
           if (currentCategoryFilter === "OTA") return u.includes("OTA") || u.includes("DEPLOY") || u.includes("FLASH") || u.includes("BIN");
           return true;
@@ -6094,81 +6960,193 @@ def render_fleet_html(current_user="admin", token=""):
       }
       
       container.innerHTML = events.map(line => {
-        let color = "#CBD5E1";
+        let color = "var(--log-text)";
         const u = line.toUpperCase();
-        if (u.includes("ACK") || u.includes("SUCCESS") || u.includes("VERIFIED")) color = "#34D399";
-        else if (u.includes("ERROR") || u.includes("FAIL") || u.includes("OFFLINE")) color = "#F87171";
-        else if (u.includes("CMD:") || u.includes("COMMAND") || u.includes("OTA")) color = "#38BDF8";
-        else if (u.includes("AUTH") || u.includes("USER")) color = "#FBBF24";
+        if (u.includes("ACK") || u.includes("SUCCESS") || u.includes("VERIFIED")) color = "#10B981";
+        else if (u.includes("ERROR") || u.includes("FAIL") || u.includes("OFFLINE")) color = "#EF4444";
+        else if (u.includes("CMD:") || u.includes("COMMAND") || u.includes("OTA")) color = "#0EA5E9";
+        else if (u.includes("AUTH") || u.includes("USER")) color = "#D97706";
         
-        return `<div style="color:${color}; font-family:var(--font-mono); font-size:12px; padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.03);">${line}</div>`;
+        return `<div style="color:${color}; font-family:var(--font-mono); font-size:12px; padding:4px 0; border-bottom:1px solid var(--card-border);">${escHtml(line)}</div>`;
       }).join("");
     }
 
     // Render Helpers
+    function findLiveNodeByNameOrId(name, mac, chipId) {
+      const nodesObj = telemetryData.nodes || {};
+      if (name && nodesObj[name]) return { key: name, data: nodesObj[name] };
+      const mU = (mac || "").toUpperCase();
+      const cU = (chipId || "").toUpperCase();
+      for (const [k, v] of Object.entries(nodesObj)) {
+        if (mU && (v.mac || "").toUpperCase() === mU) return { key: k, data: v };
+        if (cU && (v.chip_id || "").toUpperCase() === cU) return { key: k, data: v };
+      }
+      return null;
+    }
+
+    function findActiveClientId(histKey, histName) {
+      if (!fleetData.clients) return "";
+      const targetK = normKey(histName || histKey);
+      for (const [cid, cl] of Object.entries(fleetData.clients)) {
+        if (normKey(cl.name) === targetK) return cid;
+      }
+      return "";
+    }
+
+    function findActiveProjectId(histClientKey, histProjName) {
+      if (!fleetData.projects) return "";
+      const pTarget = normKey(histProjName);
+      for (const [pid, pr] of Object.entries(fleetData.projects)) {
+        const cl = fleetData.clients ? fleetData.clients[pr.client_id] : null;
+        if (normKey(pr.name) === pTarget && (!histClientKey || !cl || normKey(cl.name) === histClientKey)) {
+          return pid;
+        }
+      }
+      return "";
+    }
+
+    function renderNodeThumb(nodeData) {
+      if (isEsp32Node(nodeData)) {
+        return `<div class="esp32-hw-frame"><img src="/static/esp32_wroom32.jpg" alt="ESP32-WROOM-32"></div>`;
+      }
+      return `<div class="esp32-hw-frame" style="background:var(--surface-3); color:var(--info);">${ICONS.chip}</div>`;
+    }
+
     function renderClients() {
       const container = document.getElementById("clients-container");
       if (!container || !fleetData.clients) return;
 
-      let html = "";
+      const hClients = (fleetData.history && fleetData.history.clients) ? fleetData.history.clients : {};
+      const activeList = [];
+
       for (const [c_id, client] of Object.entries(fleetData.clients)) {
-        const numProjects = client.projects ? client.projects.length : 0;
-        
-        // Find all nodes registered under this client
         const clientNodes = [];
+        const onlineNodes = [];
+        const liveProjSet = new Set();
+
         if (fleetData.projects) {
           for (const p_id of (client.projects || [])) {
             const p = fleetData.projects[p_id];
             if (p && p.nodes) {
               for (const nName of p.nodes) {
                 const nData = telemetryData.nodes ? telemetryData.nodes[nName] : null;
-                clientNodes.push({
+                const entry = {
                   name: nName,
-                  online: nData ? nData.online : false,
-                  ip: nData ? nData.ip : "0.0.0.0"
-                });
+                  projectId: p_id,
+                  projectName: p.name || p_id,
+                  online: !!(nData && nData.online),
+                  ip: nData ? (nData.ip || "0.0.0.0") : "0.0.0.0",
+                  rssi: nData ? (nData.rssi || 0) : 0,
+                  data: nData || {}
+                };
+                clientNodes.push(entry);
+                if (entry.online) {
+                  onlineNodes.push(entry);
+                  liveProjSet.add(p_id);
+                }
               }
             }
           }
         }
 
-        const onlineCount = clientNodes.filter(n => n.online).length;
+        const isManualEmpty = (clientNodes.length === 0 && (client.manual_pending || !hClients[normKey(client.name)]));
+        if (onlineNodes.length === 0 && !isManualEmpty) {
+          continue;
+        }
+
+        if (globalSearchQuery) {
+          const hay = [
+            client.name, client.code, client.description,
+            ...clientNodes.map(n => `${n.name} ${n.projectName} ${n.ip} ${n.data.mac || ""} ${n.data.chip_id || ""}`)
+          ].join(" ").toLowerCase();
+          if (!hay.includes(globalSearchQuery)) continue;
+        }
+
+        activeList.push({ c_id, client, clientNodes, onlineNodes, liveProjCount: liveProjSet.size });
+      }
+
+      activeList.sort((a, b) => b.onlineNodes.length - a.onlineNodes.length);
+
+      let html = "";
+      for (const item of activeList) {
+        const { c_id, client, clientNodes, onlineNodes } = item;
+        const numProjects = client.projects ? client.projects.length : 0;
+        const onlineCount = onlineNodes.length;
         const offlineCount = clientNodes.length - onlineCount;
 
-        html += `
-          <div class="glass-card client-tile" onclick="navigateTo('client', '${c_id}')">
-            <div class="client-tile-header">
-              <div class="client-avatar">${client.code ? client.code.substring(0,2) : "CL"}</div>
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span class="status-pill pill-crimson">${client.tier || "Enterprise"}</span>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('client', '${c_id}', '${client.name}')" title="Rename Client">✏️</button>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteClient('${c_id}', '${client.name}')" title="Delete Client">🗑️</button>
+        const liveRowsHtml = onlineNodes.length > 0 ? onlineNodes.map(n => {
+          const svcOn = (n.data && n.data.service !== false);
+          return `
+            <div class="active-node-row" onclick="event.stopPropagation(); openNodeDetail('${escJs(n.name)}')">
+              <div style="display:flex; align-items:center; gap:12px; min-width:0; flex:1;">
+                ${renderNodeThumb(n.data)}
+                <div style="min-width:0; flex:1;">
+                  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span style="font-weight:700; font-size:14px; color:var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escHtml(n.name)}</span>
+                    <span class="status-pill pill-green" style="font-size:10px; padding:2px 8px;"><span class="pulsing-dot"></span> ONLINE</span>
+                    <span class="status-pill pill-cyan" style="font-size:10px; padding:2px 8px;">${escHtml(n.projectName)}</span>
+                  </div>
+                  <div style="font-size:11px; color:var(--text-muted); margin-top:4px; font-family:var(--font-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    IP: ${escHtml(n.ip)} &bull; RSSI: ${n.rssi} dBm &bull; ${svcOn ? "ACTIVE" : "STANDBY"}
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+                <button class="btn-main btn-cyan" style="padding:7px 11px; font-size:11px; border-radius:9px;" onclick="event.stopPropagation(); openInsituNode('${escJs(n.name)}')" title="Open On-Board Web UI">
+                  ${ICONS.globe}
+                  <span>Web UI</span>
+                </button>
+                <button class="btn-main btn-crimson" style="padding:7px 11px; font-size:11px; border-radius:9px;" onclick="event.stopPropagation(); openNodeDetail('${escJs(n.name)}')" title="Open Node Controls">
+                  ${ICONS.sliders}
+                  <span>Controls</span>
+                </button>
               </div>
             </div>
-            <div class="client-name">${client.name}</div>
-            <div class="client-desc">${client.description}</div>
+          `;
+        }).join("") : '<div style="font-size:12px; color:var(--text-dim); padding:10px 0;">Ready for project &amp; node onboarding.</div>';
 
-            <!-- Dynamic Node Presence: Green = Online, Red = Offline -->
-            <div style="margin: 14px 0 10px 0;">
-              <div style="font-size: 11px; font-weight: 700; color: #CBD5E1; text-transform: uppercase; margin-bottom: 6px;">Hardware Edge Presence:</div>
-              <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-                ${clientNodes.length > 0 ? clientNodes.map(n => `
-                  <span class="status-pill ${n.online ? "pill-green" : "pill-crimson"}" style="font-size: 11px; padding: 4px 10px; cursor:pointer;" onclick="event.stopPropagation(); openNodeDetail('${n.name}')" title="Click to open console">
-                    <span class="pulsing-dot" style="${n.online ? "" : "background:#EF4444; box-shadow:none;"}"></span> ${n.name} (${n.online ? "ONLINE" : "OFFLINE"})
-                  </span>
-                `).join("") : '<span style="font-size:11px; color:var(--text-dim);">No nodes registered</span>'}
+        html += `
+          <div class="glass-card client-tile" onclick="navigateTo('client', '${escJs(c_id)}')">
+            <div class="client-tile-header">
+              <div class="client-avatar">${escHtml(client.code ? client.code.substring(0,2) : "CL")}</div>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill ${onlineCount > 0 ? "pill-green" : "pill-cyan"}">${onlineCount > 0 ? `${onlineCount} Live Now` : (client.tier || "Active")}</span>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('client', '${escJs(c_id)}', '${escJs(client.name)}')" title="Rename Client">${ICONS.edit}</button>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteClient('${escJs(c_id)}', '${escJs(client.name)}')" title="Delete Client">${ICONS.trash}</button>
               </div>
+            </div>
+            <div class="client-name">${escHtml(client.name)}</div>
+            <div class="client-desc">${escHtml(client.description || "Connected Edge Operations")}</div>
+
+            <div style="margin: 12px 0 8px 0;">
+              <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">Live Projects &amp; Online Hardware</div>
+              ${liveRowsHtml}
             </div>
 
             <div class="client-metrics-row">
               <div class="metric-col"><div class="metric-val">${numProjects}</div><div class="metric-lbl">Projects</div></div>
-              <div class="metric-col"><div class="metric-val" style="color:#34D399;">${onlineCount}</div><div class="metric-lbl">Online Nodes</div></div>
-              <div class="metric-col"><div class="metric-val" style="color:${offlineCount > 0 ? "#F87171" : "var(--text-muted)"};">${offlineCount}</div><div class="metric-lbl">Offline Nodes</div></div>
+              <div class="metric-col"><div class="metric-val" style="color:#10B981;">${onlineCount}</div><div class="metric-lbl">Online Now</div></div>
+              <div class="metric-col"><div class="metric-val" style="color:${offlineCount > 0 ? "#EF4444" : "var(--text-muted)"};">${offlineCount}</div><div class="metric-lbl">Offline</div></div>
             </div>
 
             <div class="client-footer-btn">
-              <span>Open Client Console</span>
+              <span>Manage Client Projects</span>
               <span>&rarr;</span>
+            </div>
+          </div>
+        `;
+      }
+
+      if (activeList.length === 0) {
+        html += `
+          <div class="glass-card" style="grid-column: 1 / -1; text-align:center; padding:32px 24px;">
+            <div style="font-size:17px; font-weight:800; color:var(--text-strong); margin-bottom:6px;">No Active Live Clients Online</div>
+            <div style="font-size:13px; color:var(--text-muted); max-width:520px; margin:0 auto 18px auto;">
+              Power on an edge node connected to HiveMQ (broker.hivemq.com:1883) to see live hardware here automatically, or browse previously seen devices in Fleet History.
+            </div>
+            <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+              <button class="btn-main btn-cyan" style="padding:10px 18px; font-size:13px;" onclick="navigateTo('history-clients')">Browse Fleet History &rarr;</button>
+              <button class="btn-main btn-crimson" style="padding:10px 18px; font-size:13px;" onclick="openAddClientModal()">+ Add New Client</button>
             </div>
           </div>
         `;
@@ -6178,9 +7156,228 @@ def render_fleet_html(current_user="admin", token=""):
         <div class="add-card-btn" onclick="openAddClientModal()">
           <div class="add-icon-circle">+</div>
           <div style="font-weight:700;">Add Enterprise Client</div>
-          <div style="font-size:11px;color:var(--text-dim);">Register a new client account</div>
+          <div style="font-size:11px;color:var(--text-dim);">Register a new client tenant</div>
         </div>
       `;
+
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
+    }
+
+    function renderHistoryClients() {
+      const container = document.getElementById("history-clients-container");
+      if (!container) return;
+      const h = (fleetData && fleetData.history) ? fleetData.history : { clients: {}, projects: {}, nodes: {} };
+      const hClients = Object.values(h.clients || {});
+      const hProjects = Object.values(h.projects || {});
+      const hNodes = Object.values(h.nodes || {});
+
+      const enriched = hClients.map(hc => {
+        const projs = hProjects.filter(p => p.client_key === hc.key);
+        const nodes = hNodes.filter(n => n.client_key === hc.key);
+        let liveOnline = 0;
+        for (const hn of nodes) {
+          const found = findLiveNodeByNameOrId(hn.name, hn.mac, hn.chip_id);
+          if (found && found.data && found.data.online) liveOnline++;
+        }
+        const activeCid = findActiveClientId(hc.key, hc.name);
+        return { hc, projCount: projs.length, nodeCount: nodes.length, liveOnline, activeCid };
+      }).filter(item => {
+        if (!globalSearchQuery) return true;
+        return `${item.hc.name} ${item.hc.code}`.toLowerCase().includes(globalSearchQuery);
+      });
+
+      enriched.sort((a, b) => (b.liveOnline - a.liveOnline) || ((b.hc.last_seen_ts || 0) - (a.hc.last_seen_ts || 0)));
+
+      let html = "";
+      for (const item of enriched) {
+        const { hc, projCount, nodeCount, liveOnline, activeCid } = item;
+        html += `
+          <div class="glass-card client-tile" onclick="navigateTo('history-projects', '${escJs(hc.key)}')">
+            <div class="client-tile-header">
+              <div class="client-avatar">${escHtml((hc.code || "CL").substring(0, 2))}</div>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill ${liveOnline > 0 ? "pill-green" : "pill-cyan"}">${liveOnline > 0 ? `LIVE (${liveOnline} Online)` : "HISTORICAL"}</span>
+                ${activeCid ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('client', '${escJs(activeCid)}', '${escJs(hc.name)}')" title="Rename Client">${ICONS.edit}</button>` : ""}
+                ${activeCid ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteClient('${escJs(activeCid)}', '${escJs(hc.name)}')" title="Delete Client & History">${ICONS.trash}</button>` : ""}
+              </div>
+            </div>
+            <div class="client-name">${escHtml(hc.name)}</div>
+            <div class="client-desc">First seen: ${escHtml(hc.first_seen || "-")} &bull; Last online: ${escHtml(hc.last_seen || "-")}</div>
+            <div class="client-metrics-row">
+              <div class="metric-col"><div class="metric-val">${projCount}</div><div class="metric-lbl">Projects Seen</div></div>
+              <div class="metric-col"><div class="metric-val">${nodeCount}</div><div class="metric-lbl">Nodes Seen</div></div>
+              <div class="metric-col"><div class="metric-val" style="color:${liveOnline > 0 ? "#10B981" : "var(--text-muted)"};">${liveOnline}</div><div class="metric-lbl">Online Now</div></div>
+            </div>
+            <div class="client-footer-btn">
+              <span>View Client Projects Page</span>
+              <span>&rarr;</span>
+            </div>
+          </div>
+        `;
+      }
+
+      if (!html) {
+        html = `
+          <div class="glass-card" style="grid-column: 1 / -1; text-align:center; padding:32px 24px;">
+            <div style="font-size:16px; font-weight:700; color:var(--text-strong); margin-bottom:6px;">No Historical Clients Recorded Yet</div>
+            <div style="font-size:13px; color:var(--text-muted);">Once any hardware node connects online via MQTT, its client, project, and node records are stored uniquely here without duplication.</div>
+          </div>
+        `;
+      }
+
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
+    }
+
+    function renderHistoryProjects() {
+      const container = document.getElementById("history-projects-container");
+      if (!container) return;
+      const h = (fleetData && fleetData.history) ? fleetData.history : { clients: {}, projects: {}, nodes: {} };
+      const hc = h.clients ? h.clients[selectedHistoryClientKey] : null;
+      const titleEl = document.getElementById("history-client-title");
+      const metaEl = document.getElementById("history-client-meta");
+      if (titleEl) titleEl.innerText = hc ? `Projects for ${hc.name}` : "Historical Client Projects";
+      if (metaEl) metaEl.innerText = hc ? `First seen ${hc.first_seen || "-"} | Last online ${hc.last_seen || "-"}` : "Unique projects seen online under this client.";
+
+      const hProjects = Object.values(h.projects || {}).filter(p => p.client_key === selectedHistoryClientKey);
+      const hNodes = Object.values(h.nodes || {});
+
+      const enriched = hProjects.map(hp => {
+        const nodes = hNodes.filter(n => n.project_key === hp.key);
+        let liveOnline = 0;
+        for (const hn of nodes) {
+          const found = findLiveNodeByNameOrId(hn.name, hn.mac, hn.chip_id);
+          if (found && found.data && found.data.online) liveOnline++;
+        }
+        const activePid = findActiveProjectId(selectedHistoryClientKey, hp.name);
+        return { hp, nodeCount: nodes.length, liveOnline, activePid };
+      }).filter(item => {
+        if (!globalSearchQuery) return true;
+        return `${item.hp.name} ${item.hp.code}`.toLowerCase().includes(globalSearchQuery);
+      });
+
+      enriched.sort((a, b) => (b.liveOnline - a.liveOnline) || ((b.hp.last_seen_ts || 0) - (a.hp.last_seen_ts || 0)));
+
+      let html = "";
+      for (const item of enriched) {
+        const { hp, nodeCount, liveOnline, activePid } = item;
+        html += `
+          <div class="glass-card project-card" onclick="navigateTo('history-nodes', '${escJs(hp.key)}')">
+            <div style="display:flex; justify-content:space-between; margin-bottom:12px; align-items:center;">
+              <span class="status-pill pill-cyan">${escHtml(hp.code || "PROJ")}</span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill ${liveOnline > 0 ? "pill-green" : "pill-crimson"}">${liveOnline} / ${nodeCount} Online</span>
+                ${activePid ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('project', '${escJs(activePid)}', '${escJs(hp.name)}')" title="Rename Project">${ICONS.edit}</button>` : ""}
+                ${activePid ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteProject('${escJs(activePid)}', '${escJs(hp.name)}')" title="Delete Project">${ICONS.trash}</button>` : ""}
+              </div>
+            </div>
+            <div class="client-name">${escHtml(hp.name)}</div>
+            <div class="client-desc">First seen: ${escHtml(hp.first_seen || "-")} &bull; Last seen: ${escHtml(hp.last_seen || "-")}</div>
+            <div class="client-footer-btn" style="margin-top:16px;">
+              <span>View Project Nodes Page (${nodeCount})</span>
+              <span>&rarr;</span>
+            </div>
+          </div>
+        `;
+      }
+
+      if (!html) {
+        html = `
+          <div class="glass-card" style="grid-column: 1 / -1; text-align:center; padding:32px 24px;">
+            <div style="font-size:15px; font-weight:700; color:var(--text-strong);">No Projects Recorded for This Client</div>
+          </div>
+        `;
+      }
+
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
+    }
+
+    function renderHistoryNodes() {
+      const container = document.getElementById("history-nodes-container");
+      if (!container) return;
+      const h = (fleetData && fleetData.history) ? fleetData.history : { clients: {}, projects: {}, nodes: {} };
+      const hp = h.projects ? h.projects[selectedHistoryProjectKey] : null;
+      const titleEl = document.getElementById("history-project-title");
+      const metaEl = document.getElementById("history-project-meta");
+      if (titleEl) titleEl.innerText = hp ? `Nodes in ${hp.name}` : "Historical Project Nodes";
+      if (metaEl) metaEl.innerText = hp ? `Client: ${hp.client_name || "-"} | Last online ${hp.last_seen || "-"}` : "Unique hardware nodes seen under this project.";
+
+      const hNodes = Object.values(h.nodes || {}).filter(n => n.project_key === selectedHistoryProjectKey);
+      const enriched = hNodes.map(hn => {
+        const liveMatch = findLiveNodeByNameOrId(hn.name, hn.mac, hn.chip_id);
+        const liveKey = liveMatch ? liveMatch.key : hn.name;
+        const liveData = liveMatch ? liveMatch.data : null;
+        return { hn, liveKey, liveData, isOnline: !!(liveData && liveData.online) };
+      }).filter(item => {
+        if (!globalSearchQuery) return true;
+        return `${item.hn.name} ${item.hn.mac} ${item.hn.chip_id} ${item.hn.ip}`.toLowerCase().includes(globalSearchQuery);
+      });
+
+      enriched.sort((a, b) => (Number(b.isOnline) - Number(a.isOnline)) || ((b.hn.last_seen_ts || 0) - (a.hn.last_seen_ts || 0)));
+
+      let html = "";
+      for (const item of enriched) {
+        const { hn, liveKey, liveData, isOnline } = item;
+        const boardData = liveData || hn;
+        const canOpenDetail = !!(telemetryData.nodes && telemetryData.nodes[liveKey]);
+        html += `
+          <div class="glass-card node-card" onclick="${canOpenDetail ? `openNodeDetail('${escJs(liveKey)}')` : ""}">
+            <div class="node-header">
+              <div class="node-title-group">
+                ${renderNodeThumb(boardData)}
+                <div>
+                  <div class="node-name">${escHtml(liveKey)}</div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">${escHtml(boardData.mcu_family || "MCU Node")}</div>
+                </div>
+              </div>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="status-pill ${isOnline ? "pill-green" : "pill-crimson"}">
+                  <span class="pulsing-dot" style="${isOnline ? "" : "background:#EF4444; box-shadow:none;"}"></span> ${isOnline ? "ONLINE" : "OFFLINE"}
+                </span>
+                ${canOpenDetail ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('node', '${escJs(liveKey)}', '${escJs(liveKey)}')" title="Rename Node">${ICONS.edit}</button>` : ""}
+                ${canOpenDetail ? `<button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteNode('${escJs(liveKey)}')" title="Delete Node">${ICONS.trash}</button>` : ""}
+              </div>
+            </div>
+
+            <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val">${escHtml(boardData.mac || "-")}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">eFuse Chip ID</span><span class="node-spec-val">${escHtml(boardData.chip_id || "-")}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Last Known IP</span><span class="node-spec-val" style="color:#0EA5E9;">${escHtml(boardData.ip || "-")}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">First Seen Online</span><span class="node-spec-val">${escHtml(hn.first_seen || "-")}</span></div>
+            <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Last Seen Online</span><span class="node-spec-val">${escHtml(hn.last_seen || "-")}</span></div>
+
+            ${canOpenDetail ? `
+              <div style="display: grid; grid-template-columns: ${isOnline ? "1fr 1fr" : "1fr"}; gap: 8px; margin-top: 14px;">
+                <button class="btn-main btn-crimson" style="padding: 9px 14px; font-size: 12px; font-weight: 700;" onclick="event.stopPropagation(); openNodeDetail('${escJs(liveKey)}')">
+                  ${ICONS.sliders}
+                  <span>Open Controls</span>
+                </button>
+                ${isOnline ? `
+                  <button class="btn-main btn-cyan" style="padding: 9px 14px; font-size: 12px; font-weight: 700;" onclick="event.stopPropagation(); openInsituNode('${escJs(liveKey)}')">
+                    ${ICONS.globe}
+                    <span>Web UI</span>
+                  </button>
+                ` : ""}
+              </div>
+            ` : `<div style="font-size:11px; color:var(--text-dim); margin-top:12px;">Historical snapshot (node removed from active queue).</div>`}
+          </div>
+        `;
+      }
+
+      if (!html) {
+        html = `
+          <div class="glass-card" style="grid-column: 1 / -1; text-align:center; padding:32px 24px;">
+            <div style="font-size:15px; font-weight:700; color:var(--text-strong);">No Nodes Recorded for This Project</div>
+          </div>
+        `;
+      }
 
       if (container.dataset.lastHtml !== html) {
         container.dataset.lastHtml = html;
@@ -6193,14 +7390,15 @@ def render_fleet_html(current_user="admin", token=""):
       if (!container || !fleetData.projects) return;
 
       const client = fleetData.clients ? fleetData.clients[selectedClientId] : null;
-      const projIds = client ? client.projects : [];
+      const projIds = client ? (client.projects || []) : [];
 
       let html = "";
       for (const p_id of projIds) {
         const proj = fleetData.projects[p_id];
         if (!proj) continue;
+        if (globalSearchQuery && !`${proj.name} ${proj.code} ${proj.description}`.toLowerCase().includes(globalSearchQuery)) continue;
+
         const numNodes = proj.nodes ? proj.nodes.length : 0;
-        
         let pOnline = 0;
         if (proj.nodes && telemetryData.nodes) {
           for (const n of proj.nodes) {
@@ -6209,17 +7407,17 @@ def render_fleet_html(current_user="admin", token=""):
         }
 
         html += `
-          <div class="glass-card project-card" onclick="navigateTo('project', '${p_id}')">
+          <div class="glass-card project-card" onclick="navigateTo('project', '${escJs(p_id)}')">
             <div style="display:flex; justify-content:space-between; margin-bottom:12px; align-items:center;">
-              <span class="status-pill pill-cyan">${proj.code || "PROJ"}</span>
+              <span class="status-pill pill-cyan">${escHtml(proj.code || "PROJ")}</span>
               <div style="display:flex; align-items:center; gap:8px;">
                 <span class="status-pill ${pOnline > 0 ? "pill-green" : "pill-crimson"}">${pOnline} / ${numNodes} Online</span>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('project', '${p_id}', '${proj.name}')" title="Rename Project">✏️</button>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteProject('${p_id}', '${proj.name}')" title="Delete Project">🗑️</button>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('project', '${escJs(p_id)}', '${escJs(proj.name)}')" title="Rename Project">${ICONS.edit}</button>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteProject('${escJs(p_id)}', '${escJs(proj.name)}')" title="Delete Project">${ICONS.trash}</button>
               </div>
             </div>
-            <div class="client-name">${proj.name}</div>
-            <div class="client-desc">${proj.description}</div>
+            <div class="client-name">${escHtml(proj.name)}</div>
+            <div class="client-desc">${escHtml(proj.description || "Connected Hardware Project")}</div>
             <div class="client-footer-btn" style="margin-top:16px;">
               <span>Open Project Edge Nodes</span>
               <span>&rarr;</span>
@@ -6247,50 +7445,55 @@ def render_fleet_html(current_user="admin", token=""):
       if (!container || !fleetData.projects) return;
 
       const proj = fleetData.projects[selectedProjectId];
-      const nodeNames = proj ? proj.nodes : [];
+      const nodeNames = proj ? (proj.nodes || []) : [];
 
       let html = "";
       for (const n_name of nodeNames) {
         const node = telemetryData.nodes ? telemetryData.nodes[n_name] : null;
         if (!node) continue;
+        if (globalSearchQuery && !`${n_name} ${node.mac} ${node.ip} ${node.chip_id}`.toLowerCase().includes(globalSearchQuery)) continue;
 
-        const isOnline = node.online;
-        const modeNum = node.mode;
-        const modeTitles = ["", "Mode 1 (Solid on Press)", "Mode 2 (Blink on Press)", "Mode 3 (Solid on Release)", "Mode 4 (Blink on Release)"];
+        const isOnline = !!node.online;
 
         html += `
-          <div class="glass-card node-card" onclick="openNodeDetail('${n_name}')">
+          <div class="glass-card node-card" onclick="openNodeDetail('${escJs(n_name)}')">
             <div class="node-header">
               <div class="node-title-group">
-                <span style="font-size:20px;">⚡</span>
-                <span class="node-name">${n_name}</span>
+                ${renderNodeThumb(node)}
+                <div>
+                  <div class="node-name">${escHtml(n_name)}</div>
+                  <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">${escHtml(node.mcu_family || "MCU Hardware")}</div>
+                </div>
               </div>
               <div style="display:flex; align-items:center; gap:8px;">
                 <span class="status-pill ${isOnline ? "pill-green" : "pill-crimson"}">
                   <span class="pulsing-dot" style="${isOnline ? "" : "background:#EF4444; box-shadow:none;"}"></span> ${isOnline ? "ONLINE" : "OFFLINE"}
                 </span>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('node', '${n_name}', '${n_name}')" title="Rename Node">✏️</button>
-                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteNode('${n_name}')" title="Delete Node">🗑️</button>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); openRenameModal('node', '${escJs(n_name)}', '${escJs(n_name)}')" title="Rename Node">${ICONS.edit}</button>
+                <button class="delete-btn-tiny" onclick="event.stopPropagation(); deleteNode('${escJs(n_name)}')" title="Delete Node">${ICONS.trash}</button>
               </div>
             </div>
 
-            <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val">${node.mac}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Carrier IP (STA)</span><span class="node-spec-val" style="color:#38BDF8;">${node.ip}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Active Mode</span><span class="node-spec-val">${modeTitles[modeNum] || "Mode " + modeNum}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Master Service</span><span class="node-spec-val" style="color:${node.service ? "#34D399":"#FBBF24"}">${node.service ? "ACTIVE" : "STANDBY"}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Autonomous Offline</span><span class="node-spec-val" style="color:${node.offline ? "#34D399":"#94A3B8"}">${node.offline ? "ENABLED" : "DISABLED"}</span></div>
-            <div class="node-spec-row"><span class="node-spec-lbl">Output Delay</span><span class="node-spec-val">${(node.delay || 0).toFixed(1)}s</span></div>
-            <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Security Hash</span><span class="node-spec-val" style="color:#34D399;font-size:11px;">✓ Verified</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Hardware MAC</span><span class="node-spec-val">${escHtml(node.mac || "-")}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Carrier IP (STA)</span><span class="node-spec-val" style="color:#0EA5E9;">${escHtml(node.ip || "-")}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Wi-Fi Signal (RSSI)</span><span class="node-spec-val">${node.rssi || 0} dBm</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Master Service</span><span class="node-spec-val" style="color:${node.service ? "#10B981" : "#D97706"}">${node.service ? "ACTIVE" : "STANDBY"}</span></div>
+            <div class="node-spec-row"><span class="node-spec-lbl">Autonomous Offline</span><span class="node-spec-val" style="color:${node.offline ? "#10B981" : "var(--text-muted)"}">${node.offline ? "ENABLED" : "DISABLED"}</span></div>
+            <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">Security Hash</span><span class="node-spec-val" style="color:#10B981;font-size:11px;">SHA-256 Verified</span></div>
 
-            <div style="display: grid; grid-template-columns: 1fr auto auto; gap: 8px; margin-top: 14px;">
-              <button class="btn-main btn-crimson" style="padding: 9px 14px; font-size: 13px; font-weight: 700; width: 100%; text-align: center;" onclick="event.stopPropagation(); openNodeDetail('${n_name}')">
-                ⚡ Open Node Controls &rarr;
+            <div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; margin-top: 14px;">
+              <button class="btn-main btn-crimson" style="padding: 9px 12px; font-size: 12px; font-weight: 700; width: 100%; text-align: center;" onclick="event.stopPropagation(); openNodeDetail('${escJs(n_name)}')">
+                ${ICONS.sliders}
+                <span>Controls</span>
               </button>
-              <button class="btn-secondary" style="padding: 9px 12px; font-size: 13px;" onclick="event.stopPropagation(); triggerNodePing('${n_name}')" title="Ping Node (ACK)">
-                📡
+              <button class="btn-main btn-cyan" style="padding: 9px 12px; font-size: 12px;" onclick="event.stopPropagation(); openInsituNode('${escJs(n_name)}')" title="Open On-Board Web UI">
+                ${ICONS.globe}
               </button>
-              <button class="btn-secondary" style="padding: 9px 12px; font-size: 13px;" onclick="event.stopPropagation(); triggerNodeReboot('${n_name}')" title="Reboot MCU via MQTT">
-                🔄
+              <button class="btn-secondary" style="padding: 9px 12px; font-size: 12px;" onclick="event.stopPropagation(); triggerNodePing('${escJs(n_name)}')" title="Ping Node (ACK)">
+                ${ICONS.ping}
+              </button>
+              <button class="btn-secondary" style="padding: 9px 12px; font-size: 12px;" onclick="event.stopPropagation(); triggerNodeReboot('${escJs(n_name)}')" title="Reboot MCU via MQTT">
+                ${ICONS.reboot}
               </button>
             </div>
           </div>
@@ -6301,7 +7504,7 @@ def render_fleet_html(current_user="admin", token=""):
         <div class="add-card-btn" onclick="openAddNodeModal()">
           <div class="add-icon-circle">+</div>
           <div style="font-weight:700;">Register Node to Project</div>
-          <div style="font-size:11px;color:var(--text-dim);">Assign an ESP32 hardware node</div>
+          <div style="font-size:11px;color:var(--text-dim);">Assign an edge hardware node</div>
         </div>
       `;
 
@@ -6326,13 +7529,19 @@ def render_fleet_html(current_user="admin", token=""):
         statusPill.innerHTML = '<span class="pulsing-dot" style="background:#EF4444; box-shadow:none;"></span> OFFLINE';
       }
 
+      // Show ESP32-WROOM-32 image ONLY on ESP32 hardware nodes
+      const espPhotoWrap = document.getElementById("detail-esp32-photo-wrap");
+      if (espPhotoWrap) {
+        espPhotoWrap.style.display = isEsp32Node(node) ? "flex" : "none";
+      }
+
       // Quick switcher buttons
       const sw = document.getElementById("node-switcher-container");
       if (sw && telemetryData.nodes) {
         let swHtml = "";
         for (const nName of Object.keys(telemetryData.nodes)) {
           const isSel = (nName === selectedNodeName);
-          swHtml += `<button class="${isSel ? "btn-main btn-crimson" : "btn-secondary"}" style="padding: 6px 14px; font-size: 12px;" onclick="openNodeDetail('${nName}')">${nName}</button>`;
+          swHtml += `<button class="${isSel ? "btn-main btn-crimson" : "btn-secondary"}" style="padding: 6px 14px; font-size: 12px;" onclick="openNodeDetail('${escJs(nName)}')">${escHtml(nName)}</button>`;
         }
         sw.innerHTML = swHtml;
       }
@@ -6371,10 +7580,10 @@ def render_fleet_html(current_user="admin", token=""):
       if (document.getElementById("delay-range")) document.getElementById("delay-range").value = node.delay || 0;
       if (document.getElementById("delay-display-val")) document.getElementById("delay-display-val").innerText = (node.delay || 0).toFixed(1) + "s";
 
-      // POC Visualizer adaptation: Show only for legacy dual-ESP32 test nodes (Node: A, Node: B) or if explicitly reporting active pins
+      // Legacy POC Hardware Visualizer & Delay box: kept hidden unless explicit legacy POC name
       const pocVis = document.getElementById("poc-visualizer-container");
       const delayBox = document.getElementById("delay-box-container");
-      const isLegacyDemo = (node.name === "Node: A" || node.name === "Node: B" || (node.btn !== undefined && node.btn > 0) || (node.led !== undefined && node.led > 0));
+      const isLegacyDemo = (node.name === "Node: A" || node.name === "Node: B");
       if (pocVis) pocVis.style.display = isLegacyDemo ? "block" : "none";
       if (delayBox) delayBox.style.display = isLegacyDemo ? "block" : "none";
 
@@ -6383,35 +7592,6 @@ def render_fleet_html(current_user="admin", token=""):
       const insituIp = document.getElementById("detail-insitu-ip");
       if (insituLink && node.ip) insituLink.href = `http://${node.ip}/`;
       if (insituIp && node.ip) insituIp.innerText = node.ip;
-
-      // Real-time Visualizer
-      const ledOrb = document.getElementById("visualizer-led");
-      const ledText = document.getElementById("visualizer-led-text");
-      if (ledOrb && ledText) {
-        if (node.led === 1 || (node.service && node.btn === 1 && node.mode === 1)) {
-          ledOrb.classList.add("active");
-          ledText.innerText = "SOLID ON (Active-HIGH)";
-          ledText.style.color = "#60A5FA";
-        } else {
-          ledOrb.classList.remove("active");
-          ledText.innerText = "DARK / OFF";
-          ledText.style.color = "#94A3B8";
-        }
-      }
-
-      const btnSim = document.getElementById("visualizer-btn");
-      const btnText = document.getElementById("visualizer-btn-text");
-      if (btnSim && btnText) {
-        if (node.btn === 1) {
-          btnSim.classList.add("pressed");
-          btnText.innerText = "PRESSED (LOW)";
-          btnText.style.color = "#F59E0B";
-        } else {
-          btnSim.classList.remove("pressed");
-          btnText.innerText = "RELEASED (HIGH)";
-          btnText.style.color = "#94A3B8";
-        }
-      }
 
       // Update tracker
       if (telemetryData.updates) {
@@ -6445,30 +7625,35 @@ def render_fleet_html(current_user="admin", token=""):
           telemetryData = data;
           fleetData = data.fleet || DEFAULT_FLEET;
 
-          // If a modal is open (e.g. Add User, Node modal, etc.), completely skip touching the DOM to eliminate screen flickering!
+          // If a modal is open, skip DOM updates to avoid flickering
           const isModalOpen = !!document.querySelector(".modal-overlay.open");
           if (isModalOpen) return;
 
-          // Dynamic Sidebar Nodes List (with change detection to prevent layout reflows)
+          // Update History Sidebar Count
+          const hClientsCount = (fleetData.history && fleetData.history.clients) ? Object.keys(fleetData.history.clients).length : 0;
+          const histCountEl = document.getElementById("sidebar-history-count");
+          if (histCountEl) histCountEl.innerText = String(hClientsCount);
+
+          // Dynamic Sidebar Nodes List (sorted online first)
           const sidebarList = document.getElementById("sidebar-nodes-list");
           const sidebarCount = document.getElementById("sidebar-node-count");
           if (sidebarList && data.nodes) {
             let sHtml = "";
             let sOnline = 0;
-            const entries = Object.entries(data.nodes);
+            const entries = Object.entries(data.nodes).sort((a, b) => Number(!!b[1].online) - Number(!!a[1].online));
             for (const [nName, nInfo] of entries) {
               const isOnline = !!nInfo.online;
               if (isOnline) sOnline++;
               const dotClass = isOnline ? "online-dot" : "offline-dot";
-              const mcu = nInfo.mcu_type || "ESP32";
+              const mcu = nInfo.mcu_family || nInfo.mcu_type || "ESP32";
               const isActive = (currentView === "node-detail" && selectedNodeName === nName) ? "active" : "";
               sHtml += `
-                <div class="nav-item ${isActive}" onclick="openNodeDetail('${nName}')" style="font-size:12px; padding:7px 12px; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
+                <div class="nav-item ${isActive}" onclick="openNodeDetail('${escJs(nName)}')" style="font-size:12px; padding:7px 12px; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
                   <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
                     <span class="status-dot ${dotClass}" style="width:7px; height:7px; flex-shrink:0;"></span>
-                    <span style="font-weight:600; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${nName}</span>
+                    <span style="font-weight:600; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${escHtml(nName)}</span>
                   </div>
-                  <span class="status-pill pill-cyan" style="font-size:9px; padding:1px 5px; flex-shrink:0;">${mcu}</span>
+                  <span class="status-pill pill-cyan" style="font-size:9px; padding:1px 5px; flex-shrink:0;">${escHtml(mcu)}</span>
                 </div>
               `;
             }
@@ -6482,25 +7667,43 @@ def render_fleet_html(current_user="admin", token=""):
             if (sidebarCount) sidebarCount.innerText = `${sOnline} Online`;
           }
 
-          // KPI Active nodes
+          // KPI Active live nodes, clients & projects
           let onlineCount = 0;
-          let totalCount = 0;
           if (data.nodes) {
             for (const n of Object.values(data.nodes)) {
-              totalCount++;
               if (n.online) onlineCount++;
+            }
+          }
+          let activeClientsCount = 0;
+          let activeProjectsCount = 0;
+          if (fleetData.clients && fleetData.projects) {
+            for (const cl of Object.values(fleetData.clients)) {
+              let clHasOnline = false;
+              for (const pid of (cl.projects || [])) {
+                const p = fleetData.projects[pid];
+                if (p && (p.nodes || []).some(nn => data.nodes && data.nodes[nn] && data.nodes[nn].online)) {
+                  clHasOnline = true;
+                  activeProjectsCount++;
+                }
+              }
+              if (clHasOnline) activeClientsCount++;
             }
           }
           const kpiEl = document.getElementById("kpi-active-nodes");
           if (kpiEl) {
-            const kpiTxt = `${onlineCount} / ${totalCount} Online`;
+            const kpiTxt = `${onlineCount} Online`;
             if (kpiEl.innerText !== kpiTxt) kpiEl.innerText = kpiTxt;
           }
+          const kpiSubEl = document.getElementById("kpi-active-sub");
+          if (kpiSubEl) {
+            const subTxt = `${activeClientsCount} Active Client${activeClientsCount === 1 ? "" : "s"} \u2022 ${activeProjectsCount} Live Project${activeProjectsCount === 1 ? "" : "s"}`;
+            if (kpiSubEl.innerText !== subTxt) kpiSubEl.innerText = subTxt;
+          }
 
-          // Activity logs (smooth update only when content changed)
+          // Activity logs
           if (data.logs && document.getElementById("activity-log-stream")) {
             const logBox = document.getElementById("activity-log-stream");
-            const newLogsHtml = data.logs.map(l => `<div>${l}</div>`).join("");
+            const newLogsHtml = data.logs.map(l => `<div>${escHtml(l)}</div>`).join("");
             if (logBox.dataset.lastLogs !== newLogsHtml) {
               logBox.dataset.lastLogs = newLogsHtml;
               logBox.innerHTML = newLogsHtml;
@@ -6511,6 +7714,12 @@ def render_fleet_html(current_user="admin", token=""):
           // Re-render active view
           if (currentView === "dashboard") {
             renderClients();
+          } else if (currentView === "history-clients") {
+            renderHistoryClients();
+          } else if (currentView === "history-projects") {
+            renderHistoryProjects();
+          } else if (currentView === "history-nodes") {
+            renderHistoryNodes();
           } else if (currentView === "client") {
             renderClientProjects();
           } else if (currentView === "project") {
@@ -6520,6 +7729,73 @@ def render_fleet_html(current_user="admin", token=""):
           }
         })
         .catch(e => console.error("Telemetry error:", e));
+    }
+
+    // Live Animated Particle Mesh Background (Adapts to Dark & Light Mode)
+    function initLiveMeshBg() {
+      const canvas = document.getElementById("live-mesh-bg");
+      if (!canvas || !canvas.getContext) return;
+      if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+      const ctx = canvas.getContext("2d");
+      let w = 0, h = 0;
+      const particles = [];
+      const COUNT = 46;
+
+      function resize() {
+        w = canvas.width = window.innerWidth;
+        h = canvas.height = window.innerHeight;
+      }
+      window.addEventListener("resize", resize);
+      resize();
+
+      for (let i = 0; i < COUNT; i++) {
+        particles.push({
+          x: Math.random() * w,
+          y: Math.random() * h,
+          vx: (Math.random() - 0.5) * 0.42,
+          vy: (Math.random() - 0.5) * 0.42,
+          r: 1.4 + Math.random() * 1.6
+        });
+      }
+
+      function tick() {
+        ctx.clearRect(0, 0, w, h);
+        const isLight = (document.documentElement.getAttribute("data-theme") === "light");
+        const dotColor = isLight ? "rgba(225, 29, 72, 0.32)" : "rgba(56, 189, 248, 0.45)";
+        const lineRgb = isLight ? "14, 165, 233" : "148, 163, 184";
+        const maxAlpha = isLight ? 0.16 : 0.14;
+
+        for (let i = 0; i < COUNT; i++) {
+          const p = particles[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          if (p.x < 0 || p.x > w) p.vx *= -1;
+          if (p.y < 0 || p.y > h) p.vy *= -1;
+
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fillStyle = dotColor;
+          ctx.fill();
+
+          for (let j = i + 1; j < COUNT; j++) {
+            const q = particles[j];
+            const dx = p.x - q.x;
+            const dy = p.y - q.y;
+            const distSq = dx * dx + dy * dy;
+            if (distSq < 19600) {
+              const a = (1 - Math.sqrt(distSq) / 140) * maxAlpha;
+              ctx.beginPath();
+              ctx.moveTo(p.x, p.y);
+              ctx.lineTo(q.x, q.y);
+              ctx.strokeStyle = `rgba(${lineRgb}, ${a.toFixed(3)})`;
+              ctx.lineWidth = 1;
+              ctx.stroke();
+            }
+          }
+        }
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
     }
 
     // Automatic Responsive Display Engine (Touch Screen Phone vs Non-Touch PC/Mac Desktop)
@@ -6544,11 +7820,12 @@ def render_fleet_html(current_user="admin", token=""):
     window.addEventListener("resize", applyDisplayFormMode);
     window.addEventListener("orientationchange", applyDisplayFormMode);
 
-    // Initialize auto display mode & golden base firmware
+    // Initialize auto display mode, theme toggle, live background & telemetry polling
     applyDisplayFormMode();
+    updateThemeButton();
+    initLiveMeshBg();
     selectBaseFirmware();
 
-    // Polling interval (2s cadence prevents screen repainting/flickering)
     fetchTelemetry();
     setInterval(fetchTelemetry, 2000);
 

@@ -27,6 +27,7 @@
 #include <PubSubClient.h>    // Standard MQTT library
 #include <WebServer.h>       // Or use ESPAsyncWebServer if your project uses it
 #include <HTTPUpdate.h>      // Built-in ESP32 remote OTA updater
+#include <Preferences.h>     // Built-in ESP32 NVS persistent storage
 #include <mbedtls/sha256.h>  // Built-in cryptographic SHA-256
 
 // =============================================================================
@@ -48,16 +49,25 @@ const char* FLEET_TOPIC_STATUS   = "anashwar/poc/status";    // Node -> Portal T
 const char* FLEET_TOPIC_COMMANDS = "anashwar/poc/commands";  // Portal -> Node Directives
 const char* FLEET_SECURITY_SALT  = "AnashwarEnterprise2026SecureSalt";
 
-// Name your device for the Portal Dashboard (e.g., "Tree 1", "Stage-Motor-Rig")
-String fleetNodeName    = "Tree 1";
-String fleetClientName  = "Hamley’s x Cadbury";
-String fleetProjectName = "Connected Edge Fleet";
+// Original coded defaults for this project (persisted into NVS on first boot
+// or whenever firmware defaults change; ESP32 UI Reset reverts to these values)
+const char* DEFAULT_NODE_NAME    = "Tree 1";
+const char* DEFAULT_CLIENT_NAME  = "Hamley's x Cadbury";
+const char* DEFAULT_PROJECT_NAME = "Connected Edge Fleet";
+const char* FLEET_NVS_NS         = "anashwar_id";
+
+// Active fleet identity (loaded from NVS at boot; updated when renamed from Portal)
+String fleetNodeName    = DEFAULT_NODE_NAME;
+String fleetClientName  = DEFAULT_CLIENT_NAME;
+String fleetProjectName = DEFAULT_PROJECT_NAME;
 
 // System State Tracking
-String fleetMac       = "";
-String fleetChipId    = "";
-String fleetSecHash   = "";
-bool   fleetServiceOn = true;  // Master enable/disable flag
+String fleetMac            = "";
+String fleetChipId         = "";
+String fleetSecHash        = "";
+bool   fleetServiceOn      = true;   // Master enable/disable flag
+bool   fleetIdentityCustom = false;  // True if renamed from Web Portal
+uint32_t fleetResetSeq     = 0;      // Incremented each time ESP32 resets names to defaults
 
 WiFiMulti    fleetWiFiMulti;
 WiFiClient   fleetMqttNetClient;
@@ -85,12 +95,13 @@ String computeFleetSecHash(const String& input) {
 void publishFleetTelemetry() {
   if (!fleetMqtt.connected()) return;
 
-  char buf[768];
+  char buf[1024];
   snprintf(buf, sizeof(buf),
     "{\"name\":\"%s\",\"id\":\"Anashwar-%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
     "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\",\"mode\":1,"
     "\"service\":%s,\"offline\":false,\"state\":\"%s\",\"ip\":\"%s\","
     "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"delay\":0.0,\"btn\":0,\"led\":%d,"
+    "\"identity_custom\":%s,\"reset_seq\":%lu,"
     "\"mcu\":\"ESP32\",\"arch\":\"Xtensa LX6 Dual-Core @ 240MHz\",\"flash\":4.0,"
     "\"ram\":320,\"antenna\":\"2.4 GHz 802.11 b/g/n\"}",
     fleetNodeName.c_str(), fleetChipId.c_str(), fleetMac.c_str(), fleetChipId.c_str(),
@@ -99,9 +110,85 @@ void publishFleetTelemetry() {
     fleetServiceOn ? "online" : "standby",
     WiFi.localIP().toString().c_str(), WiFi.RSSI(),
     (unsigned int)ESP.getFreeHeap(), millis() / 1000,
-    fleetServiceOn ? 1 : 0);
+    fleetServiceOn ? 1 : 0,
+    fleetIdentityCustom ? "true" : "false",
+    (unsigned long)fleetResetSeq);
 
   fleetMqtt.publish(FLEET_TOPIC_STATUS, buf, false);
+}
+
+// =============================================================================
+// STEP 2B: NVS IDENTITY PERSISTENCE & FACTORY RESET HELPERS
+// Keeps original coded names in NVS alongside active portal-renamed names.
+// =============================================================================
+void loadFleetIdentityFromNVS() {
+  Preferences prefs;
+  prefs.begin(FLEET_NVS_NS, false);
+
+  // Detect if firmware was freshly coded with new hardcoded defaults
+  String codeSig = String(DEFAULT_NODE_NAME) + "|" + String(DEFAULT_CLIENT_NAME) + "|" + String(DEFAULT_PROJECT_NAME);
+  String savedSig = prefs.getString("def_sig", "");
+
+  if (savedSig != codeSig || !prefs.isKey("def_node")) {
+    prefs.putString("def_node",   DEFAULT_NODE_NAME);
+    prefs.putString("def_client", DEFAULT_CLIENT_NAME);
+    prefs.putString("def_proj",   DEFAULT_PROJECT_NAME);
+    prefs.putString("def_sig",    codeSig);
+    if (!prefs.getBool("custom_set", false)) {
+      prefs.putString("act_node",   DEFAULT_NODE_NAME);
+      prefs.putString("act_client", DEFAULT_CLIENT_NAME);
+      prefs.putString("act_proj",   DEFAULT_PROJECT_NAME);
+    }
+  }
+
+  fleetNodeName       = prefs.getString("act_node",   DEFAULT_NODE_NAME);
+  fleetClientName     = prefs.getString("act_client", DEFAULT_CLIENT_NAME);
+  fleetProjectName    = prefs.getString("act_proj",   DEFAULT_PROJECT_NAME);
+  fleetIdentityCustom = prefs.getBool("custom_set",   false);
+  fleetResetSeq       = prefs.getUInt("rst_seq",      0);
+  prefs.end();
+
+  Serial.printf("[NVS] Identity loaded (custom=%d, rst_seq=%lu) -> Client: %s | Project: %s | Node: %s\n",
+                fleetIdentityCustom ? 1 : 0, (unsigned long)fleetResetSeq,
+                fleetClientName.c_str(), fleetProjectName.c_str(), fleetNodeName.c_str());
+}
+
+void saveFleetActiveIdentity(bool customFlag) {
+  Preferences prefs;
+  prefs.begin(FLEET_NVS_NS, false);
+  prefs.putString("act_node",   fleetNodeName);
+  prefs.putString("act_client", fleetClientName);
+  prefs.putString("act_proj",   fleetProjectName);
+  prefs.putBool("custom_set",   customFlag);
+  prefs.end();
+  fleetIdentityCustom = customFlag;
+}
+
+void resetFleetIdentityToDefaults() {
+  Preferences prefs;
+  prefs.begin(FLEET_NVS_NS, false);
+  String defN = prefs.getString("def_node",   DEFAULT_NODE_NAME);
+  String defC = prefs.getString("def_client", DEFAULT_CLIENT_NAME);
+  String defP = prefs.getString("def_proj",   DEFAULT_PROJECT_NAME);
+  uint32_t nextSeq = prefs.getUInt("rst_seq", 0) + 1;
+  prefs.putString("act_node",   defN);
+  prefs.putString("act_client", defC);
+  prefs.putString("act_proj",   defP);
+  prefs.putBool("custom_set",   false);
+  prefs.putUInt("rst_seq",      nextSeq);
+  prefs.end();
+
+  fleetNodeName       = defN;
+  fleetClientName     = defC;
+  fleetProjectName    = defP;
+  fleetIdentityCustom = false;
+  fleetResetSeq       = nextSeq;
+
+  Serial.printf("[NVS RESET #%lu] Reverted to coded defaults -> Client: %s | Project: %s | Node: %s\n",
+                (unsigned long)fleetResetSeq, fleetClientName.c_str(), fleetProjectName.c_str(), fleetNodeName.c_str());
+
+  // Immediately publish reverted names so the Web Portal syncs right away
+  publishFleetTelemetry();
 }
 
 // =============================================================================
@@ -114,43 +201,97 @@ void onFleetDirective(char* topic, byte* payload, unsigned int length) {
   String cmd = String(msgBuf);
   cmd.trim();
 
-  // Verify target: broadcast [*] or specific node [fleetNodeName]
-  if (cmd.indexOf("[*]") < 0 && cmd.indexOf("[" + fleetNodeName + "]") < 0) return;
+  // Verify target: broadcast [*], specific [fleetNodeName], [fleetChipId], or [fleetMac]
+  bool targeted = (cmd.indexOf("[*]") >= 0)
+               || (cmd.indexOf("[" + fleetNodeName + "]") >= 0)
+               || (cmd.indexOf("[" + fleetChipId + "]") >= 0)
+               || (cmd.indexOf("[" + fleetMac + "]") >= 0);
+  if (!targeted) return;
 
-  Serial.printf("[FLEET DIRECTIVE] Received: %s\n", cmd.c_str());
+  // Extract directive body after "]:" (e.g. CMD:[Tree 1]:RENAME:NewName -> RENAME:NewName)
+  int sep = cmd.indexOf("]:");
+  String body = (sep >= 0) ? cmd.substring(sep + 2) : cmd;
+  body.trim();
 
-  // ---------------------------------------------------------------------------
-  // 1. STANDARD FLEET DIRECTIVES (Do not remove)
-  // ---------------------------------------------------------------------------
-  if (cmd.indexOf("PING") >= 0) {
-    publishFleetTelemetry(); // Instant presence ACK to portal
+  if (body.indexOf("PING") >= 0) {
+    publishFleetTelemetry(); // Silent instant presence ACK to portal
     return;
   }
-  
-  if (cmd.indexOf("REBOOT") >= 0) {
+
+  Serial.printf("[FLEET DIRECTIVE] Received: %s\n", body.c_str());
+
+  // ---------------------------------------------------------------------------
+  // 1. PORTAL <-> ESP32 BIDIRECTIONAL IDENTITY SYNC (Persisted to NVS)
+  // ---------------------------------------------------------------------------
+  if (body.startsWith("RENAME:")) {
+    String newName = body.substring(7);
+    newName.trim();
+    if (newName.length() > 0) {
+      fleetNodeName = newName;
+      saveFleetActiveIdentity(true);
+      Serial.printf("[NVS] Node renamed via Portal -> %s\n", fleetNodeName.c_str());
+      publishFleetTelemetry();
+    }
+    return;
+  }
+
+  if (body.startsWith("SETCLIENT:")) {
+    String newClient = body.substring(10);
+    newClient.trim();
+    if (newClient.length() > 0) {
+      fleetClientName = newClient;
+      saveFleetActiveIdentity(true);
+      Serial.printf("[NVS] Client renamed via Portal -> %s\n", fleetClientName.c_str());
+      publishFleetTelemetry();
+    }
+    return;
+  }
+
+  if (body.startsWith("SETPROJECT:")) {
+    String newProj = body.substring(11);
+    newProj.trim();
+    if (newProj.length() > 0) {
+      fleetProjectName = newProj;
+      saveFleetActiveIdentity(true);
+      Serial.printf("[NVS] Project renamed via Portal -> %s\n", fleetProjectName.c_str());
+      publishFleetTelemetry();
+    }
+    return;
+  }
+
+  if (body.equals("RESET_NAMES") || body.equals("RESET_IDENTITY")) {
+    resetFleetIdentityToDefaults();
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. STANDARD FLEET DIRECTIVES (Do not remove)
+  // ---------------------------------------------------------------------------
+  if (body.indexOf("REBOOT") >= 0) {
     delay(200);
     ESP.restart(); // Remote software restart
     return;
   }
 
-  if (cmd.indexOf("SERVICE:OFF") >= 0) {
+  if (body.indexOf("SERVICE:OFF") >= 0) {
     fleetServiceOn = false;
     // >>> HOOK: Pause your steppers or silence audio here if desired <<<
     publishFleetTelemetry();
     return;
   }
 
-  if (cmd.indexOf("SERVICE:ON") >= 0) {
+  if (body.indexOf("SERVICE:ON") >= 0) {
     fleetServiceOn = true;
     // >>> HOOK: Resume normal hardware operations here <<<
     publishFleetTelemetry();
     return;
   }
 
-  if (cmd.startsWith("OTA:")) {
-    int lastCol = cmd.lastIndexOf(':');
-    if (lastCol > 0) {
-      String url = cmd.substring(lastCol + 1);
+  if (body.startsWith("OTA:")) {
+    int firstCol = body.indexOf(':');
+    if (firstCol > 0) {
+      String url = body.substring(firstCol + 1);
+      url.trim();
       WiFiClient otaClient;
       httpUpdate.update(otaClient, url); // Flash new .bin over HTTP
     }
@@ -158,12 +299,12 @@ void onFleetDirective(char* topic, byte* payload, unsigned int length) {
   }
 
   // ---------------------------------------------------------------------------
-  // 2. PROJECT-SPECIFIC HARDWARE HOOKS (Trigger your custom peripherals!)
+  // 3. PROJECT-SPECIFIC HARDWARE HOOKS (Trigger your custom peripherals!)
   // ---------------------------------------------------------------------------
   // EXAMPLE A: STEPPER MOTOR CONTROL
   // From the portal console, type: STEPPER:MOVE:500 or STEPPER:HOME
-  if (cmd.indexOf("STEPPER:MOVE:") >= 0) {
-    int steps = cmd.substring(cmd.lastIndexOf(':') + 1).toInt();
+  if (body.indexOf("STEPPER:MOVE:") >= 0) {
+    int steps = body.substring(body.lastIndexOf(':') + 1).toInt();
     Serial.printf("[STEPPER] Moving %d steps...\n", steps);
     // myStepper.step(steps); // <-- Call your existing stepper function!
     publishFleetTelemetry();
@@ -171,8 +312,8 @@ void onFleetDirective(char* topic, byte* payload, unsigned int length) {
   
   // EXAMPLE B: DFPLAYER MINI MP3 AUDIO TRIGGER
   // From the portal console, type: AUDIO:PLAY:1 or AUDIO:VOLUME:25
-  else if (cmd.indexOf("AUDIO:PLAY:") >= 0) {
-    int trackNum = cmd.substring(cmd.lastIndexOf(':') + 1).toInt();
+  else if (body.indexOf("AUDIO:PLAY:") >= 0) {
+    int trackNum = body.substring(body.lastIndexOf(':') + 1).toInt();
     Serial.printf("[DFPLAYER] Playing track #%d...\n", trackNum);
     // myDFPlayer.play(trackNum); // <-- Call your existing audio function!
     publishFleetTelemetry();
@@ -180,8 +321,8 @@ void onFleetDirective(char* topic, byte* payload, unsigned int length) {
 
   // EXAMPLE C: RELAY OR SOLENOID TRIGGER
   // From the portal console, type: RELAY:1:ON or RELAY:1:OFF
-  else if (cmd.indexOf("RELAY:") >= 0) {
-    bool state = (cmd.indexOf(":ON") >= 0);
+  else if (body.indexOf("RELAY:") >= 0) {
+    bool state = (body.indexOf(":ON") >= 0);
     Serial.printf("[RELAY] Switched %s\n", state ? "ON" : "OFF");
     // digitalWrite(MY_RELAY_PIN, state ? HIGH : LOW);
     publishFleetTelemetry();
@@ -212,13 +353,16 @@ void reconnectFleetMQTT() {
 // STEP 5: INITIALIZATION FUNCTION (Call this once in your setup())
 // =============================================================================
 void initFleetManager() {
-  // 1. Read silicon MAC & eFuse chip ID
+  // 1. Load coded defaults & portal-synced active identity from NVS
+  loadFleetIdentityFromNVS();
+
+  // 2. Read silicon MAC & eFuse chip ID
   uint64_t mac = ESP.getEfuseMac();
   char cBuf[32];
   snprintf(cBuf, sizeof(cBuf), "%04X%08X", (uint16_t)(mac >> 32), (uint32_t)mac);
   fleetChipId = String(cBuf);
 
-  // 2. Configure Multi-AP Plug & Play Wi-Fi Roaming
+  // 3. Configure Multi-AP Plug & Play Wi-Fi Roaming
   WiFi.mode(WIFI_STA);
   fleetWiFiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
   fleetWiFiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
@@ -236,10 +380,10 @@ void initFleetManager() {
   Serial.printf("[WiFi] Assigned STA IP : %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("[SECURITY] SHA-256 Fingerprint: %s\n", fleetSecHash.c_str());
 
-  // 3. Configure HiveMQ MQTT Mesh Client
+  // 4. Configure HiveMQ MQTT Mesh Client
   fleetMqtt.setServer(FLEET_MQTT_BROKER, FLEET_MQTT_PORT);
   fleetMqtt.setCallback(onFleetDirective);
-  fleetMqtt.setBufferSize(768);
+  fleetMqtt.setBufferSize(1024);
 }
 
 // =============================================================================
@@ -289,15 +433,19 @@ void setupMyExistingProjectUI() {
     html += ".nav-links a { color:#38BDF8; margin:0 8px; font-size:13px; text-decoration:none; }";
     html += "</style></head><body>";
     html += "<div class='card'>";
-    html += "<h2>🎛️ Stepper & Audio Rig</h2>";
+    html += "<h2>Stepper & Audio Rig</h2>";
+    html += "<div style='font-size:11px;color:#94A3B8;margin-bottom:8px;'>";
+    html += "Active: <b>" + fleetClientName + "</b> / <b>" + fleetProjectName + "</b> / <b>" + fleetNodeName + "</b>";
+    html += "</div>";
     html += "<div class='dial' id='pos-dial'>500</div>";
     html += "<p style='color:#94A3B8; font-size:12px;'>Swipe, dial & touch enabled interface</p>";
     html += "<button class='btn' onclick='vibratePhone(); sendStep(50)'>Step Motor Forward (+50)</button>";
     html += "<button class='btn' style='background:#10B981;' onclick='vibratePhone(); playSound(1)'>Play Audio Track 1</button>";
+    html += "<button class='btn' style='background:#475569;' onclick='vibratePhone(); resetIdentity()'>Reset Names to Coded Defaults (NVS)</button>";
     html += "<div class='nav-links' style='margin-top:16px;'>";
     html += "<a href='/motors'>Motor Config &rarr;</a>";
     html += "<a href='/audio'>Audio Playlist &rarr;</a>";
-    html += "<a href='/settings'>System Calibration &rarr;</a>";
+    html += "<a href='/settings'>Identity & Calibration &rarr;</a>";
     html += "</div></div>";
     
     // Client-side phone haptic feedback and API calls
@@ -305,6 +453,7 @@ void setupMyExistingProjectUI() {
     html += "function vibratePhone() { if(navigator.vibrate) navigator.vibrate(40); }";
     html += "function sendStep(n) { fetch('/api/step?n='+n); }";
     html += "function playSound(t) { fetch('/api/sound?track='+t); }";
+    html += "function resetIdentity() { if(confirm('Revert Client/Project/Node names back to NVS coded defaults and sync with Portal?')) { fetch('/api/reset_identity', {method:'POST'}).then(r=>r.json()).then(()=>{ location.reload(); }); } }";
     html += "</script>";
     html += "</body></html>";
     myExistingWebServer.send(200, "text/html", html);
@@ -318,6 +467,39 @@ void setupMyExistingProjectUI() {
   // PAGE 3: Audio Playlist Page (/audio)
   myExistingWebServer.on("/audio", HTTP_GET, []() {
     myExistingWebServer.send(200, "text/html", "<h1>DFPlayer Audio Page</h1><p><a href='/'>&larr; Back to Main</a></p>");
+  });
+
+  // PAGE 4: Identity & Calibration Page (/settings) showing active vs NVS defaults
+  myExistingWebServer.on("/settings", HTTP_GET, []() {
+    Preferences prefs;
+    prefs.begin(FLEET_NVS_NS, true);
+    String defC = prefs.getString("def_client", DEFAULT_CLIENT_NAME);
+    String defP = prefs.getString("def_proj",   DEFAULT_PROJECT_NAME);
+    String defN = prefs.getString("def_node",   DEFAULT_NODE_NAME);
+    prefs.end();
+
+    String page = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    page += "<title>Node Identity & Calibration</title>";
+    page += "<style>body{background:#0F172A;color:#F8FAFC;font-family:sans-serif;padding:24px;}.box{background:#1E293B;padding:20px;border-radius:14px;max-width:480px;margin:0 auto;}";
+    page += "button{background:#E11D48;color:#fff;border:none;padding:12px 18px;border-radius:10px;font-weight:700;cursor:pointer;width:100%;margin-top:12px;}a{color:#38BDF8;}</style></head><body>";
+    page += "<div class='box'><h2>Device Identity (NVS)</h2>";
+    page += "<p><b>Active (Portal Synced):</b><br>" + fleetClientName + " / " + fleetProjectName + " / " + fleetNodeName + "</p>";
+    page += "<p><b>Stored Coded Defaults (NVS):</b><br>" + defC + " / " + defP + " / " + defN + "</p>";
+    page += "<button onclick=\"fetch('/api/reset_identity',{method:'POST'}).then(()=>location.reload())\">Reset to Coded Defaults & Sync Portal</button>";
+    page += "<p style='margin-top:16px;'><a href='/'>&larr; Back to Dashboard</a></p></div></body></html>";
+    myExistingWebServer.send(200, "text/html", page);
+  });
+
+  // ACTION API: Reset active NVS identity back to coded defaults and notify Portal
+  myExistingWebServer.on("/api/reset_identity", HTTP_POST, []() {
+    resetFleetIdentityToDefaults();
+    myExistingWebServer.send(200, "application/json",
+      "{\"status\":\"reset\",\"node\":\"" + fleetNodeName + "\",\"client\":\"" + fleetClientName + "\",\"project\":\"" + fleetProjectName + "\"}");
+  });
+  myExistingWebServer.on("/api/reset_identity", HTTP_GET, []() {
+    resetFleetIdentityToDefaults();
+    myExistingWebServer.send(200, "application/json",
+      "{\"status\":\"reset\",\"node\":\"" + fleetNodeName + "\",\"client\":\"" + fleetClientName + "\",\"project\":\"" + fleetProjectName + "\"}");
   });
 
   // ACTION API: Step motor
