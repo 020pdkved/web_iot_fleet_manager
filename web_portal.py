@@ -19,11 +19,18 @@ import secrets
 import uuid
 import base64
 import ipaddress
+import sqlite3
+import ssl
 import urllib.request
 import urllib.parse
 import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
+
+try:
+    import pg8000.native as _pg8000_native
+except Exception:
+    _pg8000_native = None
 
 PORT = int(os.environ.get("PORT", 8080))
 DEFAULT_MQTT_BROKER = "broker.hivemq.com"
@@ -33,29 +40,198 @@ DEFAULT_MQTT_TOPIC_STATUS = "anashwar/poc/status"
 PROXY_TOPIC_REQ_PREFIX = "anashwar/proxy/req/"
 PROXY_TOPIC_RES = "anashwar/proxy/res"
 SECURITY_SALT = "AnashwarEnterprise2026SecureSalt"
+ON_CLOUD_HOST = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 
 _mqtt_pub_lock = threading.Lock()
 _mqtt_pub_sock = None
 _proxy_lock = threading.Lock()
 pending_proxy_requests = {}
+_db_lock = threading.Lock()
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_env_state_dir = os.environ.get("ANASHWAR_STATE_DIR", "").strip()
+if _env_state_dir:
+    STATE_DIR = _env_state_dir
+elif os.path.isdir("/var/data") and os.access("/var/data", os.W_OK):
+    STATE_DIR = "/var/data"
+else:
+    STATE_DIR = PROJECT_ROOT
+os.makedirs(STATE_DIR, exist_ok=True)
+
 BINARIES_DIR = os.path.join(PROJECT_ROOT, "binaries")
 STATIC_DIR = os.path.join(PROJECT_ROOT, "static")
-REGISTRY_FILE = os.path.join(PROJECT_ROOT, "fleet_registry.json")
-USERS_FILE = os.path.join(PROJECT_ROOT, "users.json")
-REGISTRY_DIR = os.path.join(PROJECT_ROOT, "registry_logs")
-WEBAUTHN_FILE = os.path.join(PROJECT_ROOT, "webauthn_credentials.json")
+REGISTRY_FILE = os.path.join(STATE_DIR, "fleet_registry.json")
+USERS_FILE = os.path.join(STATE_DIR, "users.json")
+REGISTRY_DIR = os.path.join(STATE_DIR, "registry_logs")
+WEBAUTHN_FILE = os.path.join(STATE_DIR, "webauthn_credentials.json")
+STATE_DB_FILE = os.path.join(STATE_DIR, "fleet_state.db")
 os.makedirs(BINARIES_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(REGISTRY_DIR, exist_ok=True)
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+
+def _init_sqlite():
+    with _db_lock:
+        conn = sqlite3.connect(STATE_DB_FILE, check_same_thread=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, val_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+        conn.commit()
+        conn.close()
+
+_init_sqlite()
+
+def _pg_connect():
+    if not DATABASE_URL or _pg8000_native is None:
+        return None
+    u = urlparse(DATABASE_URL)
+    host = u.hostname or "localhost"
+    port = u.port or 5432
+    db_name = (u.path or "").lstrip("/")
+    user = urllib.parse.unquote(u.username or "")
+    pwd = urllib.parse.unquote(u.password or "")
+    use_ssl = ("sslmode=disable" not in DATABASE_URL) and (host not in ("localhost", "127.0.0.1") or "sslmode=require" in DATABASE_URL)
+    ssl_ctx = ssl.create_default_context() if use_ssl else None
+    conn = _pg8000_native.Connection(user=user, password=pwd, host=host, port=port, database=db_name, ssl_context=ssl_ctx, timeout=6)
+    conn.run("CREATE TABLE IF NOT EXISTS anashwar_kv_store (key TEXT PRIMARY KEY, val_json TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)")
+    return conn
+
+def db_backend_status():
+    if DATABASE_URL and _pg8000_native is not None:
+        return {"backend": "PostgreSQL (Persistent Cloud DB)", "persistent": True, "type": "postgres"}
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        return {"backend": "Upstash Redis KV (Persistent Cloud DB)", "persistent": True, "type": "upstash"}
+    if STATE_DIR != PROJECT_ROOT:
+        return {"backend": f"Persistent Disk ({STATE_DIR}/fleet_state.db)", "persistent": True, "type": "disk"}
+    if ON_CLOUD_HOST:
+        return {"backend": "Ephemeral Render Disk (Set DATABASE_URL to keep new users across deploys)", "persistent": False, "type": "ephemeral"}
+    return {"backend": "Local SQLite + JSON (fleet_state.db)", "persistent": True, "type": "local"}
+
+def _cloud_kv_get(key):
+    if DATABASE_URL and _pg8000_native is not None:
+        conn = None
+        try:
+            conn = _pg_connect()
+            rows = conn.run("SELECT val_json FROM anashwar_kv_store WHERE key = :k", k=key)
+            if rows and rows[0]:
+                return json.loads(rows[0][0])
+        except Exception as e:
+            print(f"[DB] Postgres read error ({key}): {e}")
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            req = urllib.request.Request(
+                f"{UPSTASH_URL}/get/{urllib.parse.quote('anashwar:' + key, safe='')}",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = json.loads(resp.read().decode("utf-8")).get("result")
+                if raw:
+                    return json.loads(raw)
+        except Exception as e:
+            print(f"[DB] Upstash read error ({key}): {e}")
+    return None
+
+def _cloud_kv_set(key, payload_str):
+    if DATABASE_URL and _pg8000_native is not None:
+        conn = None
+        try:
+            conn = _pg_connect()
+            conn.run(
+                "INSERT INTO anashwar_kv_store (key, val_json, updated_at) VALUES (:k, :v, :t) "
+                "ON CONFLICT (key) DO UPDATE SET val_json = EXCLUDED.val_json, updated_at = EXCLUDED.updated_at",
+                k=key, v=payload_str, t=time.time(),
+            )
+        except Exception as e:
+            print(f"[DB] Postgres write error ({key}): {e}")
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            cmd_body = json.dumps(["SET", f"anashwar:{key}", payload_str]).encode("utf-8")
+            req = urllib.request.Request(
+                UPSTASH_URL,
+                data=cmd_body,
+                method="POST",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            print(f"[DB] Upstash write error ({key}): {e}")
+
+def state_load_json(key, json_path, default_val):
+    # 1. Remote Cloud DB first (survives container rebuilds/redeploys)
+    remote = _cloud_kv_get(key)
+    if remote is not None:
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(remote, f, indent=2)
+        except Exception:
+            pass
+        return remote
+
+    # 2. Local SQLite in STATE_DIR
+    with _db_lock:
+        try:
+            conn = sqlite3.connect(STATE_DB_FILE, check_same_thread=False)
+            row = conn.execute("SELECT val_json FROM kv_store WHERE key = ?", (key,)).fetchone()
+            conn.close()
+            if row and row[0]:
+                return json.loads(row[0])
+        except Exception:
+            pass
+
+    # 3. JSON file in STATE_DIR (or fallback seed in PROJECT_ROOT)
+    candidates = [json_path]
+    proj_fallback = os.path.join(PROJECT_ROOT, os.path.basename(json_path))
+    if proj_fallback != json_path:
+        candidates.append(proj_fallback)
+    for cand in candidates:
+        if os.path.isfile(cand):
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    state_save_json(key, json_path, data)
+                    return data
+            except Exception as e:
+                print(f"[STATE] Error reading {cand}: {e}")
+    return json.loads(json.dumps(default_val))
+
+def state_save_json(key, json_path, obj):
+    payload_str = json.dumps(obj, indent=2)
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(payload_str)
+    except Exception as e:
+        print(f"[STATE] Error saving {json_path}: {e}")
+    with _db_lock:
+        try:
+            conn = sqlite3.connect(STATE_DB_FILE, check_same_thread=False)
+            conn.execute(
+                "INSERT INTO kv_store (key, val_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET val_json=excluded.val_json, updated_at=excluded.updated_at",
+                (key, payload_str, time.time()),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[STATE] SQLite write error ({key}): {e}")
+    if DATABASE_URL or (UPSTASH_URL and UPSTASH_TOKEN):
+        threading.Thread(target=_cloud_kv_set, args=(key, payload_str), daemon=True).start()
+
 # User Database & Session Store
 users_db = {}
 active_sessions = {}  # token -> device_info dict with username, os, device_model, ip, location, etc.
-ACTIVE_SESSIONS_FILE = os.path.join(PROJECT_ROOT, "active_sessions.json")
+ACTIVE_SESSIONS_FILE = os.path.join(STATE_DIR, "active_sessions.json")
 session_history = []  # list of past login device telemetry records
-SESSION_HISTORY_FILE = os.path.join(PROJECT_ROOT, "session_history.json")
+SESSION_HISTORY_FILE = os.path.join(STATE_DIR, "session_history.json")
 webauthn_credentials = {} # username -> list of credentials
 webauthn_challenges = {} # username / _login_ -> {"challenge": str, "ts": float}
 last_presence_ping_time = 0.0
@@ -63,41 +239,21 @@ geo_cache = {}
 
 def load_active_sessions():
     global active_sessions
-    if os.path.isfile(ACTIVE_SESSIONS_FILE):
-        try:
-            with open(ACTIVE_SESSIONS_FILE, "r") as f:
-                active_sessions = json.load(f)
-                return
-        except Exception as e:
-            print(f"[AUTH] Error reading {ACTIVE_SESSIONS_FILE}: {e}")
-    active_sessions = {}
+    loaded = state_load_json("active_sessions", ACTIVE_SESSIONS_FILE, {})
+    active_sessions = loaded if isinstance(loaded, dict) else {}
 
 def save_active_sessions():
-    try:
-        with open(ACTIVE_SESSIONS_FILE, "w") as f:
-            json.dump(active_sessions, f, indent=2)
-    except Exception as e:
-        print(f"[AUTH] Error saving {ACTIVE_SESSIONS_FILE}: {e}")
+    state_save_json("active_sessions", ACTIVE_SESSIONS_FILE, active_sessions)
 
 load_active_sessions()
 
 def load_session_history():
     global session_history
-    if os.path.isfile(SESSION_HISTORY_FILE):
-        try:
-            with open(SESSION_HISTORY_FILE, "r") as f:
-                session_history = json.load(f)
-                return
-        except Exception:
-            pass
-    session_history = []
+    loaded = state_load_json("session_history", SESSION_HISTORY_FILE, [])
+    session_history = loaded if isinstance(loaded, list) else []
 
 def save_session_history():
-    try:
-        with open(SESSION_HISTORY_FILE, "w") as f:
-            json.dump(session_history[-60:], f, indent=2)
-    except Exception:
-        pass
+    state_save_json("session_history", SESSION_HISTORY_FILE, session_history[-60:])
 
 load_session_history()
 
@@ -110,69 +266,132 @@ def add_session_history(info):
 
 def load_webauthn():
     global webauthn_credentials
-    if os.path.isfile(WEBAUTHN_FILE):
-        try:
-            with open(WEBAUTHN_FILE, "r") as f:
-                webauthn_credentials = json.load(f)
-                return
-        except Exception as e:
-            print(f"[AUTH] Error reading {WEBAUTHN_FILE}: {e}")
-    webauthn_credentials = {}
+    loaded = state_load_json("webauthn", WEBAUTHN_FILE, {})
+    webauthn_credentials = loaded if isinstance(loaded, dict) else {}
 
 def save_webauthn():
-    try:
-        with open(WEBAUTHN_FILE, "w") as f:
-            json.dump(webauthn_credentials, f, indent=2)
-    except Exception as e:
-        print(f"[AUTH] Error saving {WEBAUTHN_FILE}: {e}")
+    state_save_json("webauthn", WEBAUTHN_FILE, webauthn_credentials)
 
 load_webauthn()
 
-def get_ip_geolocation(ip_str=""):
-    if not ip_str or ip_str.startswith("192.168.") or ip_str.startswith("10.") or ip_str.startswith("172.") or ip_str == "127.0.0.1":
-        cache_key = "wan_self"
-        url = "http://ip-api.com/json/"
-    else:
-        cache_key = ip_str
-        url = f"http://ip-api.com/json/{ip_str}"
-
-    if cache_key in geo_cache and (time.time() - geo_cache[cache_key]["ts"] < 3600):
-        return geo_cache[cache_key]["data"]
-
-    res = {
-        "location": "Pune, Maharashtra, India",
-        "city": "Pune",
-        "region": "Maharashtra",
-        "country": "India",
-        "isp": "Reliance Jio Infocomm Limited",
-        "public_ip": ""
-    }
+def _is_public_ip(ip_str):
+    if not ip_str:
+        return False
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "AnashwarFleet/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        addr = ipaddress.ip_address(str(ip_str).strip())
+        return bool(addr.is_global and not addr.is_private and not addr.is_loopback and not addr.is_multicast and not addr.is_link_local)
+    except Exception:
+        return False
+
+def _extract_client_ip(headers, remote_addr=""):
+    candidates = []
+    if headers:
+        for h_name in ("CF-Connecting-IP", "True-Client-IP", "X-Real-IP", "Fly-Client-IP"):
+            v = (headers.get(h_name) or "").strip()
+            if v:
+                candidates.append(v)
+        xff = (headers.get("X-Forwarded-For") or "").strip()
+        if xff:
+            for part in xff.split(","):
+                p = part.strip()
+                if p:
+                    candidates.append(p)
+    if remote_addr:
+        candidates.append(str(remote_addr).strip())
+    for c in candidates:
+        if _is_public_ip(c):
+            return c
+    for c in candidates:
+        try:
+            ipaddress.ip_address(c)
+            return c
+        except Exception:
+            pass
+    return str(remote_addr or "127.0.0.1")
+
+def get_ip_geolocation(ip_str="", allow_self_wan=None):
+    if allow_self_wan is None:
+        allow_self_wan = not ON_CLOUD_HOST
+
+    ip_clean = str(ip_str or "").strip()
+    is_pub = _is_public_ip(ip_clean)
+    if not is_pub:
+        if not allow_self_wan:
+            # Never geolocate Render/cloud US datacenter for private LAN IPs (e.g. 10.x / 192.168.x)
+            return {
+                "location": f"STA LAN ({ip_clean})" if ip_clean else "Local Private Subnet",
+                "city": "",
+                "region": "",
+                "country": "",
+                "isp": "Local Wi-Fi NAT (Flash WAN Geo in Anashwar_Fleet_Reference.ino)",
+                "public_ip": ip_clean or "Private LAN",
+            }
+        cache_key = "wan_self"
+        ip_api_url = "http://ip-api.com/json/?fields=status,country,regionName,city,isp,query"
+        ipwho_url = "https://ipwho.is/"
+    else:
+        cache_key = ip_clean
+        ip_api_url = f"http://ip-api.com/json/{ip_clean}?fields=status,country,regionName,city,isp,query"
+        ipwho_url = f"https://ipwho.is/{ip_clean}"
+
+    cached = geo_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"] < 3600):
+        return cached["data"]
+
+    fallback = {
+        "location": f"WAN IP ({ip_clean})" if is_pub else "Local Router WAN",
+        "city": "",
+        "region": "",
+        "country": "",
+        "isp": "Edge ISP",
+        "public_ip": ip_clean,
+    }
+
+    try:
+        req = urllib.request.Request(ip_api_url, headers={"User-Agent": "AnashwarFleet/2.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("status") == "success":
                 city = data.get("city", "")
                 region = data.get("regionName", "")
                 country = data.get("country", "")
                 isp = data.get("isp", "")
-                query_ip = data.get("query", "")
-                loc_parts = [p for p in [city, region, country] if p]
-                loc_str = ", ".join(loc_parts) if loc_parts else (country or "Global")
+                query_ip = data.get("query", ip_clean)
+                loc_parts = [p for p in (city, region, country) if p]
                 res = {
-                    "location": loc_str,
-                    "city": city,
-                    "region": region,
-                    "country": country,
-                    "isp": isp,
-                    "public_ip": query_ip
+                    "location": ", ".join(loc_parts) if loc_parts else (country or fallback["location"]),
+                    "city": city, "region": region, "country": country,
+                    "isp": isp or "ISP", "public_ip": query_ip,
                 }
                 geo_cache[cache_key] = {"ts": time.time(), "data": res}
                 return res
-    except Exception as e:
+    except Exception:
         pass
-    geo_cache[cache_key] = {"ts": time.time(), "data": res}
-    return res
+
+    try:
+        req2 = urllib.request.Request(ipwho_url, headers={"User-Agent": "AnashwarFleet/2.0"})
+        with urllib.request.urlopen(req2, timeout=2.5) as resp2:
+            d2 = json.loads(resp2.read().decode("utf-8"))
+            if d2.get("success") is not False and d2.get("country"):
+                city = d2.get("city", "")
+                region = d2.get("region", "")
+                country = d2.get("country", "")
+                conn_obj = d2.get("connection") or {}
+                isp = conn_obj.get("isp") or conn_obj.get("org") or "ISP"
+                query_ip = d2.get("ip", ip_clean)
+                loc_parts = [p for p in (city, region, country) if p]
+                res = {
+                    "location": ", ".join(loc_parts) if loc_parts else country,
+                    "city": city, "region": region, "country": country,
+                    "isp": isp, "public_ip": query_ip,
+                }
+                geo_cache[cache_key] = {"ts": time.time(), "data": res}
+                return res
+    except Exception:
+        pass
+
+    geo_cache[cache_key] = {"ts": time.time() - 3300, "data": fallback}
+    return fallback
 
 def parse_client_device(user_agent_str, headers=None, client_ip="127.0.0.1", extra_payload=None):
     ua = user_agent_str or ""
@@ -257,8 +476,8 @@ def parse_client_device(user_agent_str, headers=None, client_ip="127.0.0.1", ext
         "is_touch": bool(is_touch),
         "screen": screen_res,
         "ip": client_ip,
-        "location": geo.get("location", "Pune, Maharashtra, India"),
-        "carrier": geo.get("isp", "Reliance Jio"),
+        "location": geo.get("location", "Unresolved Client Location"),
+        "carrier": geo.get("isp", "Client Network"),
         "login_time": time.time(),
         "login_time_str": time.strftime("%Y-%m-%d %H:%M:%S", now),
         "last_active": time.time()
@@ -330,31 +549,61 @@ def format_log_display(line, caller_role):
     except Exception:
         return line
 
+def _merge_seed_users(target_db):
+    """Merge users from ANASHWAR_SEED_USERS_JSON env var without overwriting runtime edits."""
+    changed = False
+    raw_seed = os.environ.get("ANASHWAR_SEED_USERS_JSON", "").strip()
+    if raw_seed:
+        try:
+            seed_obj = json.loads(raw_seed)
+            if isinstance(seed_obj, dict):
+                for uname, uinfo in seed_obj.items():
+                    if not isinstance(uname, str) or not isinstance(uinfo, dict):
+                        continue
+                    clean_u = uname.strip()
+                    if not clean_u or clean_u in target_db:
+                        continue
+                    pwd_hash = uinfo.get("password_hash", "")
+                    if not pwd_hash and uinfo.get("password"):
+                        pwd_hash = hashlib.sha256(str(uinfo["password"]).encode("utf-8")).hexdigest()
+                    if not pwd_hash:
+                        continue
+                    target_db[clean_u] = {
+                        "username": clean_u,
+                        "password_hash": pwd_hash,
+                        "role": uinfo.get("role", "Fleet Operator"),
+                        "created_at": uinfo.get("created_at", time.strftime("%Y-%m-%d"))
+                    }
+                    changed = True
+        except Exception as e:
+            print(f"[AUTH] Error parsing ANASHWAR_SEED_USERS_JSON: {e}")
+    return changed
+
 def load_users():
     global users_db
-    if os.path.isfile(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r") as f:
-                users_db = json.load(f)
-                return
-        except Exception as e:
-            print(f"[AUTH] Error reading {USERS_FILE}: {e}")
-    users_db = {
-        "admin": {
-            "username": "admin",
-            "password_hash": hashlib.sha256("At@12345".encode("utf-8")).hexdigest(),
-            "role": "Super Admin",
-            "created_at": time.strftime("%Y-%m-%d")
+    loaded = state_load_json("users", USERS_FILE, {})
+    needs_save = False
+    if isinstance(loaded, dict) and loaded:
+        users_db = loaded
+    else:
+        users_db = {
+            "admin": {
+                "username": "admin",
+                "password_hash": hashlib.sha256("At@12345".encode("utf-8")).hexdigest(),
+                "role": "Super Admin",
+                "created_at": time.strftime("%Y-%m-%d")
+            }
         }
-    }
-    save_users()
+        needs_save = True
+
+    if _merge_seed_users(users_db):
+        needs_save = True
+
+    if needs_save:
+        save_users()
 
 def save_users():
-    try:
-        with open(USERS_FILE, "w") as f:
-            json.dump(users_db, f, indent=2)
-    except Exception as e:
-        print(f"[AUTH] Error saving {USERS_FILE}: {e}")
+    state_save_json("users", USERS_FILE, users_db)
 
 load_users()
 
@@ -511,15 +760,9 @@ def ensure_history_schema():
 def load_fleet_registry():
     global fleet_registry
     dirty = False
-    if os.path.isfile(REGISTRY_FILE):
-        try:
-            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "clients" in data and "projects" in data and "registered_nodes" in data:
-                    fleet_registry = data
-        except Exception as e:
-            print(f"[REGISTRY] Error reading {REGISTRY_FILE}: {e}")
-            dirty = True
+    stored_reg = state_load_json("fleet_registry", REGISTRY_FILE, {})
+    if isinstance(stored_reg, dict) and "clients" in stored_reg and "projects" in stored_reg and "registered_nodes" in stored_reg:
+        fleet_registry = stored_reg
     else:
         dirty = True
 
@@ -554,10 +797,9 @@ def load_fleet_registry():
 def save_fleet_registry():
     try:
         ensure_history_schema()
-        with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
-            json.dump(fleet_registry, f, indent=2)
+        state_save_json("fleet_registry", REGISTRY_FILE, fleet_registry)
     except Exception as e:
-        print(f"[REGISTRY] Error saving {REGISTRY_FILE}: {e}")
+        print(f"[REGISTRY] Error saving fleet_registry: {e}")
 
 def record_history_online(node_name, client_name, project_name, tdata):
     """Upsert deduplicated client/project/node records whenever a hardware node is online."""
@@ -1422,6 +1664,9 @@ def start_mqtt_client():
                             if tdata.get("flash"): node["flash_mb"] = float(tdata["flash"])
                             if tdata.get("ram"): node["ram_total_kb"] = int(tdata["ram"])
                             if tdata.get("antenna"): node["wireless_bands"] = tdata["antenna"]
+                            if tdata.get("pub_ip"): node["pub_ip"] = str(tdata["pub_ip"]).strip()
+                            if tdata.get("geo"): node["geo"] = str(tdata["geo"]).strip()
+                            if tdata.get("isp"): node["isp"] = str(tdata["isp"]).strip()
                             if "offline" in tdata: node["offline"] = bool(tdata["offline"])
                             node["last_seen"] = time.time()
                             node["online"] = True
@@ -2227,11 +2472,25 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             # Ping/ACK presence evaluation (ACK received within 15s = Online Green, otherwise Offline Red)
             for key, node in nodes_telemetry.items():
                 node["online"] = (now - node.get("last_seen", 0) < 15)
-                # Resolve geographic location and WAN carrier
-                geo = get_ip_geolocation(node.get("ip", ""))
-                node["geo_location"] = geo.get("location", "Pune, Maharashtra, India")
-                node["public_ip"] = geo.get("public_ip", "")
-                node["carrier_isp"] = geo.get("isp", "")
+                # Resolve geographic location and WAN carrier from node WAN IP first (never Render self-IP)
+                pub_ip = str(node.get("pub_ip", "")).strip()
+                sta_ip = str(node.get("ip", "")).strip()
+                hw_geo = str(node.get("geo", "")).strip()
+                hw_isp = str(node.get("isp", "")).strip()
+                if _is_public_ip(pub_ip):
+                    geo = get_ip_geolocation(pub_ip, allow_self_wan=(not ON_CLOUD_HOST))
+                    node["geo_location"] = geo.get("location") or hw_geo or f"WAN ({pub_ip})"
+                    node["public_ip"] = geo.get("public_ip") or pub_ip
+                    node["carrier_isp"] = hw_isp or geo.get("isp") or "WAN"
+                elif hw_geo:
+                    node["geo_location"] = hw_geo
+                    node["public_ip"] = sta_ip
+                    node["carrier_isp"] = hw_isp or "Local Wi-Fi NAT"
+                else:
+                    geo = get_ip_geolocation(sta_ip, allow_self_wan=(not ON_CLOUD_HOST))
+                    node["geo_location"] = geo.get("location") or (f"STA LAN ({sta_ip})" if sta_ip else "Local Subnet")
+                    node["public_ip"] = geo.get("public_ip") or sta_ip
+                    node["carrier_isp"] = hw_isp or geo.get("isp") or "Local Wi-Fi NAT"
 
             # Auto-update reboot elapsed time for active updates
             for key, u in node_updates.items():
@@ -2257,6 +2516,21 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 "usb_devices": scan_usb_devices()
             }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        elif path == "/api/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "version": "4.3",
+                "db": db_backend_status(),
+                "on_cloud": ON_CLOUD_HOST,
+                "users_count": len(users_db),
+                "nodes_seen": len(nodes_telemetry)
+            }).encode("utf-8"))
+            return
 
         elif path == "/api/binaries":
             self.send_response(200)
@@ -2311,8 +2585,30 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 "current_user": user,
                 "caller_role": caller_role,
                 "sessions": sessions_data,
-                "session_history": session_history[-30:]
+                "session_history": session_history[-30:],
+                "db_status": db_backend_status()
             }).encode("utf-8"))
+
+        elif path == "/api/users/backup":
+            user, _token = get_authenticated_user(self.headers, parsed)
+            if not user:
+                self.send_error(401, "Unauthorized")
+                return
+            caller_role = users_db.get(user, {}).get("role", "User")
+            if caller_role != "Super Admin":
+                self.send_error(403, "Super Admin role required")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "success": True,
+                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "db_status": db_backend_status(),
+                "users": users_db,
+                "webauthn_credentials": webauthn_credentials
+            }, indent=2).encode("utf-8"))
 
         elif path == "/api/registry/calendar":
             user, token = get_authenticated_user(self.headers, parsed)
@@ -2512,7 +2808,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             p = data.get("password", [""])[0].strip()
             if verify_credentials(u, p):
                 token = secrets.token_hex(24)
-                client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+                client_ip = _extract_client_ip(self.headers, self.client_address[0])
                 dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, data)
                 dev_info["username"] = u
                 u_role = users_db[u].get("role", "User")
@@ -2597,7 +2893,7 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
 
                 if matched_user and matched_user in users_db:
                     token = secrets.token_hex(24)
-                    client_ip = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() or self.client_address[0]
+                    client_ip = _extract_client_ip(self.headers, self.client_address[0])
                     dev_info = parse_client_device(self.headers.get("User-Agent", ""), self.headers, client_ip, data)
                     dev_info["username"] = matched_user
                     u_role = users_db.get(matched_user, {}).get("role", "User")
@@ -3040,6 +3336,56 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(resp_payload).encode("utf-8"))
+
+        elif path == "/api/users/restore":
+            if caller_role != "Super Admin":
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Super Admin role required"}')
+                return
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                incoming_users = payload.get("users", payload) if isinstance(payload, dict) else {}
+                if not isinstance(incoming_users, dict):
+                    raise ValueError("Expected JSON object of users")
+                restored_count = 0
+                for uname, uinfo in incoming_users.items():
+                    if not isinstance(uname, str) or not isinstance(uinfo, dict):
+                        continue
+                    clean_u = uname.strip()
+                    if not clean_u:
+                        continue
+                    pwd_hash = uinfo.get("password_hash", "")
+                    if not pwd_hash and uinfo.get("password"):
+                        pwd_hash = hashlib.sha256(str(uinfo["password"]).encode("utf-8")).hexdigest()
+                    if not pwd_hash:
+                        continue
+                    users_db[clean_u] = {
+                        "username": clean_u,
+                        "password_hash": pwd_hash,
+                        "role": uinfo.get("role", "Fleet Operator"),
+                        "created_at": uinfo.get("created_at", time.strftime("%Y-%m-%d"))
+                    }
+                    restored_count += 1
+                incoming_creds = payload.get("webauthn_credentials") if isinstance(payload, dict) else None
+                if isinstance(incoming_creds, dict):
+                    for uname, clist in incoming_creds.items():
+                        if isinstance(uname, str) and isinstance(clist, list) and clist:
+                            webauthn_credentials[uname] = clist
+                    save_webauthn()
+                if restored_count > 0:
+                    save_users()
+                    log_event(f"AUTH: Restored {restored_count} user account(s) via backup", actor=user, actor_role=caller_role)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "restored_users": restored_count, "db_status": db_backend_status()}).encode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
 
         # 10. User Management: Delete User with Strict RBAC & Self-Deletion
         elif path == "/api/users/delete":
@@ -5204,6 +5550,15 @@ def render_fleet_html(current_user="admin", token=""):
       box-shadow: 0 4px 20px rgba(225, 29, 72, 0.22);
     }
 
+    .mobile-brand-chip { display: none; cursor: pointer; }
+    .topbar-user-group { display: flex; align-items: center; gap: 8px; border-left: 1px solid var(--card-border); padding-left: 10px; margin-left: 2px; }
+    .active-node-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .detail-action-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .dual-toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+    .users-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+    .modal-card-insitu { max-width: 1120px; width: 96vw; padding: 14px 16px; }
+    .insitu-iframe-wrap { width: 100%; height: 72vh; min-height: 460px; border-radius: 12px; overflow: hidden; background: var(--log-bg); border: 1px solid var(--card-border); }
+
     /* Mobile Bottom Navigation Bar */
     .mobile-bottom-nav {
       display: none;
@@ -5211,16 +5566,16 @@ def render_fleet_html(current_user="admin", token=""):
       bottom: 0;
       left: 0;
       right: 0;
-      height: 64px;
+      min-height: 62px;
       background: var(--bnav-bg);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
+      backdrop-filter: blur(22px);
+      -webkit-backdrop-filter: blur(22px);
       border-top: 1px solid var(--card-border);
       z-index: 150;
       grid-template-columns: repeat(4, 1fr);
       align-items: center;
-      padding: 0 8px;
-      box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.25);
+      padding: 4px 10px calc(6px + env(safe-area-inset-bottom, 0px));
+      box-shadow: 0 -6px 28px rgba(0, 0, 0, 0.28);
     }
     .bottom-nav-item {
       display: flex;
@@ -5231,11 +5586,11 @@ def render_fleet_html(current_user="admin", token=""):
       border: none;
       color: var(--text-muted);
       cursor: pointer;
-      padding: 8px 4px;
-      border-radius: 10px;
-      transition: all 0.2s;
+      padding: 6px 4px;
+      border-radius: 12px;
+      transition: all 0.2s cubic-bezier(0.22, 1, 0.36, 1);
       text-decoration: none;
-      min-height: 48px;
+      min-height: 46px;
     }
     .bottom-nav-item .bnav-icon {
       display: inline-flex;
@@ -5250,52 +5605,95 @@ def render_fleet_html(current_user="admin", token=""):
     }
     .bottom-nav-item.active, .bottom-nav-item:active {
       color: #0EA5E9;
+      background: rgba(14, 165, 233, 0.12);
     }
     .bottom-nav-item.active .bnav-icon {
-      transform: scale(1.15);
+      transform: scale(1.1);
     }
 
-    /* Responsive Phone Touch Mode (Default <= 860px or overridden by class) */
+    /* Responsive Phone Touch Mode (<= 860px viewport or narrow touch tablet) */
     @media (max-width: 860px) {
       .sidebar { display: none !important; }
       .mobile-bottom-nav { display: grid !important; }
-      .content-area { padding: 14px 16px 84px 16px !important; }
-      .topbar { padding: 0 16px !important; height: 60px !important; }
+      .content-area { padding: 14px 14px calc(86px + env(safe-area-inset-bottom, 0px)) 14px !important; }
+      .topbar { padding: 0 12px !important; height: 56px !important; gap: 8px !important; }
+      .mobile-brand-chip { display: inline-flex !important; align-items: center; gap: 7px; flex-shrink: 0; }
+      .breadcrumb-row { font-size: 12px !important; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; }
+      .topbar-actions { gap: 6px !important; flex-shrink: 0; }
+      .topbar-btn-label { display: none !important; }
+      .topbar-user-group { border-left: none !important; padding-left: 0 !important; margin-left: 0 !important; gap: 6px !important; }
+      .user-pill-btn { padding: 6px 9px !important; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .theme-toggle-btn, .topbar-icon-btn { padding: 0 10px !important; min-height: 36px !important; height: 36px !important; border-radius: 10px !important; }
       .search-box { display: none !important; }
       #mdns-link, #public-tunnel-link { display: none !important; }
-      .kpi-grid { grid-template-columns: 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
-      .kpi-card { padding: 16px !important; border-radius: 14px !important; }
-      .kpi-title { font-size: 12px !important; }
+      .kpi-grid { display: flex !important; overflow-x: auto !important; scroll-snap-type: x mandatory; gap: 10px !important; margin-bottom: 16px !important; padding-bottom: 2px; scrollbar-width: none; }
+      .kpi-grid::-webkit-scrollbar { display: none; }
+      .kpi-card { flex: 0 0 80%; min-width: 224px; scroll-snap-align: start; padding: 14px 16px !important; border-radius: 14px !important; }
+      .kpi-title { font-size: 11px !important; }
       .kpi-value { font-size: 20px !important; }
-      .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
+      .glass-card, .client-tile { padding: 14px !important; border-radius: 16px !important; }
+      .active-node-row { flex-direction: column !important; align-items: stretch !important; gap: 10px !important; padding: 12px !important; }
+      .active-node-actions { display: grid !important; grid-template-columns: 1fr 1fr !important; width: 100%; gap: 8px !important; }
+      .active-node-actions button { width: 100% !important; min-height: 40px !important; justify-content: center; font-size: 12px !important; }
+      .detail-header-top { flex-direction: column !important; align-items: stretch !important; }
+      .detail-action-row { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 8px !important; width: 100%; margin-top: 6px; }
+      .detail-action-row .btn-insitu-hero { grid-column: span 2; min-height: 44px !important; }
+      #node-switcher-container { flex-wrap: nowrap !important; overflow-x: auto !important; padding-bottom: 4px; width: 100%; }
+      #node-switcher-container button { flex-shrink: 0; }
+      .dual-toggle-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
+      .users-form-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
+      .node-detail-layout { grid-template-columns: 1fr !important; gap: 16px !important; }
       .client-grid, .projects-grid, .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
       .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
       .modal-overlay { align-items: flex-end !important; }
-      .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
-      .apple-switch { width: 56px !important; height: 32px !important; }
-      .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
+      .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 88dvh !important; overflow-y: auto !important; padding: 18px 16px calc(22px + env(safe-area-inset-bottom, 0px)) 16px !important; }
+      #modal-insitu-webui .modal-card { height: 92dvh !important; max-height: 92dvh !important; display: flex !important; flex-direction: column !important; padding: 12px 12px calc(14px + env(safe-area-inset-bottom, 0px)) 12px !important; overflow: hidden !important; }
+      .insitu-iframe-wrap { flex: 1 !important; height: auto !important; min-height: 0 !important; }
+      .apple-switch { width: 54px !important; height: 30px !important; }
+      .apple-switch .slider:before { height: 24px !important; width: 24px !important; left: 3px !important; bottom: 3px !important; }
       .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
-      .btn-main, .btn-secondary { min-height: 44px !important; font-size: 13px !important; }
-      .form-input { min-height: 46px !important; font-size: 15px !important; }
+      .btn-main, .btn-secondary { min-height: 40px !important; font-size: 12.5px !important; }
+      .form-input { min-height: 44px !important; font-size: 15px !important; }
     }
 
     body.mode-phone-touch .sidebar { display: none !important; }
     body.mode-phone-touch .mobile-bottom-nav { display: grid !important; }
-    body.mode-phone-touch .content-area { padding: 14px 16px 84px 16px !important; }
-    body.mode-phone-touch .topbar { padding: 0 16px !important; height: 60px !important; }
+    body.mode-phone-touch .content-area { padding: 14px 14px calc(86px + env(safe-area-inset-bottom, 0px)) 14px !important; }
+    body.mode-phone-touch .topbar { padding: 0 12px !important; height: 56px !important; gap: 8px !important; }
+    body.mode-phone-touch .mobile-brand-chip { display: inline-flex !important; align-items: center; gap: 7px; flex-shrink: 0; }
+    body.mode-phone-touch .breadcrumb-row { font-size: 12px !important; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; }
+    body.mode-phone-touch .topbar-actions { gap: 6px !important; flex-shrink: 0; }
+    body.mode-phone-touch .topbar-btn-label { display: none !important; }
+    body.mode-phone-touch .topbar-user-group { border-left: none !important; padding-left: 0 !important; margin-left: 0 !important; gap: 6px !important; }
+    body.mode-phone-touch .user-pill-btn { padding: 6px 9px !important; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    body.mode-phone-touch .theme-toggle-btn, body.mode-phone-touch .topbar-icon-btn { padding: 0 10px !important; min-height: 36px !important; height: 36px !important; border-radius: 10px !important; }
     body.mode-phone-touch .search-box { display: none !important; }
     body.mode-phone-touch #mdns-link, body.mode-phone-touch #public-tunnel-link { display: none !important; }
-    body.mode-phone-touch .kpi-grid { grid-template-columns: 1fr !important; gap: 12px !important; margin-bottom: 18px !important; }
-    body.mode-phone-touch .node-detail-layout { grid-template-columns: 1fr !important; gap: 18px !important; }
+    body.mode-phone-touch .kpi-grid { display: flex !important; overflow-x: auto !important; scroll-snap-type: x mandatory; gap: 10px !important; margin-bottom: 16px !important; padding-bottom: 2px; scrollbar-width: none; }
+    body.mode-phone-touch .kpi-grid::-webkit-scrollbar { display: none; }
+    body.mode-phone-touch .kpi-card { flex: 0 0 80%; min-width: 224px; scroll-snap-align: start; padding: 14px 16px !important; border-radius: 14px !important; }
+    body.mode-phone-touch .active-node-row { flex-direction: column !important; align-items: stretch !important; gap: 10px !important; padding: 12px !important; }
+    body.mode-phone-touch .active-node-actions { display: grid !important; grid-template-columns: 1fr 1fr !important; width: 100%; gap: 8px !important; }
+    body.mode-phone-touch .active-node-actions button { width: 100% !important; min-height: 40px !important; justify-content: center; font-size: 12px !important; }
+    body.mode-phone-touch .detail-header-top { flex-direction: column !important; align-items: stretch !important; }
+    body.mode-phone-touch .detail-action-row { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 8px !important; width: 100%; margin-top: 6px; }
+    body.mode-phone-touch .detail-action-row .btn-insitu-hero { grid-column: span 2; min-height: 44px !important; }
+    body.mode-phone-touch #node-switcher-container { flex-wrap: nowrap !important; overflow-x: auto !important; padding-bottom: 4px; width: 100%; }
+    body.mode-phone-touch #node-switcher-container button { flex-shrink: 0; }
+    body.mode-phone-touch .dual-toggle-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
+    body.mode-phone-touch .users-form-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
+    body.mode-phone-touch .node-detail-layout { grid-template-columns: 1fr !important; gap: 16px !important; }
     body.mode-phone-touch .client-grid, body.mode-phone-touch .projects-grid, body.mode-phone-touch .nodes-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
     body.mode-phone-touch .btn-action-row { grid-template-columns: 1fr !important; gap: 10px !important; }
     body.mode-phone-touch .modal-overlay { align-items: flex-end !important; }
-    body.mode-phone-touch .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 85vh !important; overflow-y: auto !important; padding: 22px 18px 32px 18px !important; }
-    body.mode-phone-touch .apple-switch { width: 56px !important; height: 32px !important; }
-    body.mode-phone-touch .apple-switch .slider:before { height: 26px !important; width: 26px !important; left: 3px !important; bottom: 3px !important; }
+    body.mode-phone-touch .modal-card { width: 100% !important; max-width: 100% !important; border-radius: 20px 20px 0 0 !important; max-height: 88dvh !important; overflow-y: auto !important; padding: 18px 16px calc(22px + env(safe-area-inset-bottom, 0px)) 16px !important; }
+    body.mode-phone-touch #modal-insitu-webui .modal-card { height: 92dvh !important; max-height: 92dvh !important; display: flex !important; flex-direction: column !important; padding: 12px 12px calc(14px + env(safe-area-inset-bottom, 0px)) 12px !important; overflow: hidden !important; }
+    body.mode-phone-touch .insitu-iframe-wrap { flex: 1 !important; height: auto !important; min-height: 0 !important; }
+    body.mode-phone-touch .apple-switch { width: 54px !important; height: 30px !important; }
+    body.mode-phone-touch .apple-switch .slider:before { height: 24px !important; width: 24px !important; left: 3px !important; bottom: 3px !important; }
     body.mode-phone-touch .apple-switch input:checked + .slider:before { transform: translateX(24px) !important; }
-    body.mode-phone-touch .btn-main, body.mode-phone-touch .btn-secondary { min-height: 44px !important; font-size: 13px !important; }
-    body.mode-phone-touch .form-input { min-height: 46px !important; font-size: 15px !important; }
+    body.mode-phone-touch .btn-main, body.mode-phone-touch .btn-secondary { min-height: 40px !important; font-size: 12.5px !important; }
+    body.mode-phone-touch .form-input { min-height: 44px !important; font-size: 15px !important; }
 
     body.mode-desktop-pc .sidebar { display: flex !important; }
     body.mode-desktop-pc .mobile-bottom-nav { display: none !important; }
@@ -5389,6 +5787,11 @@ def render_fleet_html(current_user="admin", token=""):
     
     <!-- Topbar -->
     <header class="topbar">
+      <div class="mobile-brand-chip" onclick="navigateTo('dashboard')" title="Anashwar Edge Fleet">
+        <div class="brand-logo" style="width: 30px; height: 30px; border-radius: 8px; padding: 3px;">
+          <img src="/static/logo.png" alt="Anashwar">
+        </div>
+      </div>
       <div class="breadcrumb-row" id="breadcrumb-container">
         <span class="breadcrumb-active">Live Fleet</span>
       </div>
@@ -5401,20 +5804,20 @@ def render_fleet_html(current_user="admin", token=""):
         </div>
         <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch Light / Dark Theme">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-          <span>Dark</span>
+          <span class="topbar-btn-label">Dark</span>
         </button>
-        <div style="display:flex; align-items:center; gap:8px; border-left:1px solid var(--card-border); padding-left:10px; margin-left:2px;">
+        <div class="topbar-user-group">
           <div class="user-pill-btn" onclick="openUserModal()" title="Current Logged In User">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
             <span id="topbar-user-name" style="font-weight:700; font-size:12px;">__CURRENT_USER__</span>
           </div>
-          <button class="btn-secondary" style="padding:5px 10px; font-size:11px;" onclick="openUserModal()" title="Manage Users">
+          <button class="btn-secondary topbar-icon-btn" style="padding:5px 10px; font-size:11px;" onclick="openUserModal()" title="Manage Users">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-            <span>Users</span>
+            <span class="topbar-btn-label">Users</span>
           </button>
-          <button class="btn-secondary" style="padding:5px 10px; font-size:11px; border-color:rgba(239,68,68,0.4); color:#F87171;" onclick="handleLogout()" title="Sign Out">
+          <button class="btn-secondary topbar-icon-btn" style="padding:5px 10px; font-size:11px; border-color:rgba(239,68,68,0.4); color:#F87171;" onclick="handleLogout()" title="Sign Out">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-            <span>Logout</span>
+            <span class="topbar-btn-label">Logout</span>
           </button>
         </div>
       </div>
@@ -5677,14 +6080,16 @@ def render_fleet_html(current_user="admin", token=""):
       <!-- VIEW 4: NODE DETAIL & CONTROL CENTER -->
       <div id="view-node-detail" style="display: none;">
         <div class="glass-card" style="margin-bottom: 24px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
-            <div>
+          <div class="detail-header-top" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div style="flex: 1; min-width: 0;">
               <button class="btn-secondary" style="margin-bottom: 12px;" onclick="backToProject()">&larr; Back to Project</button>
-              <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-                <h2 id="detail-node-name" style="font-size: 26px; font-weight: 800; color: var(--text-strong);">Node Console</h2>
+              <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;">
+                <h2 id="detail-node-name" style="font-size: 24px; font-weight: 800; color: var(--text-strong);">Node Console</h2>
                 <span id="detail-node-status-pill" class="status-pill pill-green"><span class="pulsing-dot"></span> ONLINE</span>
                 <span class="status-pill pill-cyan">SHA-256 VERIFIED</span>
-                <button class="btn-main btn-cyan" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">
+              </div>
+              <div class="detail-action-row">
+                <button class="btn-main btn-cyan btn-insitu-hero" style="font-size: 12px; padding: 6px 12px;" onclick="openInsituModal()">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
                   <span>On-Board Web UI</span>
                 </button>
@@ -5717,7 +6122,7 @@ def render_fleet_html(current_user="admin", token=""):
           <!-- Left Column: Controls & Visualizer -->
           <div>
             <!-- Side-by-Side Dual Feature Toggles (Master Service & Serve While Offline) -->
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px;">
+            <div class="dual-toggle-grid">
               <!-- Master Service Toggle Box -->
               <div class="service-switch-box" style="margin: 0;">
                 <div class="service-info">
@@ -5860,7 +6265,7 @@ def render_fleet_html(current_user="admin", token=""):
               <div class="node-spec-row"><span class="node-spec-lbl">USB Port (Backdoor)</span><span class="node-spec-val" id="spec-port">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Wi-Fi Signal (RSSI)</span><span class="node-spec-val" id="spec-rssi">-</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Free Heap RAM</span><span class="node-spec-val" id="spec-heap">-</span></div>
-              <div class="node-spec-row"><span class="node-spec-lbl">Geographic Location</span><span class="node-spec-val" id="spec-geo" style="color:#0EA5E9;">Pune, Maharashtra, India</span></div>
+              <div class="node-spec-row"><span class="node-spec-lbl">Geographic Location</span><span class="node-spec-val" id="spec-geo" style="color:#0EA5E9;">Resolving location...</span></div>
               <div class="node-spec-row"><span class="node-spec-lbl">Public WAN IP & Carrier</span><span class="node-spec-val" id="spec-public-ip">-</span></div>
               <div class="node-spec-row" style="border:none;"><span class="node-spec-lbl">SHA-256 Fingerprint</span><span class="node-spec-val" id="spec-hash" style="color:#10B981; font-size:11px; word-break:break-all;">-</span></div>
             </div>
@@ -6038,6 +6443,20 @@ def render_fleet_html(current_user="admin", token=""):
       </div>
       <p>Manage authenticated administrators, operators, and review connected device sessions.</p>
       
+      <div id="users-db-status-bar" style="background: var(--surface-2); border: 1px solid var(--card-border); border-radius: 12px; padding: 10px 12px; margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <div style="font-size: 12px; font-weight: 700; color: var(--text-strong);" id="db-backend-label">Checking Persistence Database...</div>
+          <span class="status-pill pill-cyan" id="db-backend-pill" style="font-size: 10px;">Checking</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;" id="db-backend-hint">Set DATABASE_URL (PostgreSQL) or UPSTASH_REDIS_REST_URL or ANASHWAR_SEED_USERS_JSON in Render so accounts survive every deploy.</div>
+        <div id="users-backup-actions" style="display: none; gap: 8px; flex-wrap: wrap; margin-top: 10px;">
+          <button type="button" class="btn-secondary" style="padding: 5px 10px; font-size: 11px;" onclick="downloadUsersBackup()">Export Users JSON</button>
+          <button type="button" class="btn-secondary" style="padding: 5px 10px; font-size: 11px; border-color: rgba(14,165,233,0.4); color: #0EA5E9;" onclick="copyRenderSeedEnv()">Copy Render Seed Env</button>
+          <button type="button" class="btn-secondary" style="padding: 5px 10px; font-size: 11px; border-color: rgba(16,185,129,0.4); color: #10B981;" onclick="triggerRestoreBackup()">Restore Backup JSON</button>
+          <input type="file" id="restore-users-file-input" accept=".json" style="display: none;" onchange="handleRestoreFile(this.files)">
+        </div>
+      </div>
+
       <div style="margin-bottom: 20px;">
         <div style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 8px;">Existing Accounts</div>
         <div id="users-list-container" style="max-height: 180px; overflow-y: auto;">
@@ -6059,7 +6478,7 @@ def render_fleet_html(current_user="admin", token=""):
 
       <div style="border-top: 1px solid var(--card-border); padding-top: 16px;">
         <div style="font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 10px;">Register New User Account</div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+        <div class="users-form-grid">
           <div>
             <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Username</label>
             <input type="text" class="form-input" id="new-user-username" placeholder="e.g. Vedang" autocomplete="off">
@@ -6073,7 +6492,7 @@ def render_fleet_html(current_user="admin", token=""):
             </select>
           </div>
         </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;">
+        <div class="users-form-grid" style="margin-bottom: 12px;">
           <div>
             <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Password</label>
             <input type="password" class="form-input" id="new-user-password" placeholder="Enter password" autocomplete="new-password">
@@ -6083,7 +6502,7 @@ def render_fleet_html(current_user="admin", token=""):
             <input type="password" class="form-input" id="new-user-confirm-password" placeholder="Confirm password" autocomplete="new-password">
           </div>
         </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div class="users-form-grid" style="margin-bottom: 0;">
           <button id="btn-add-user" class="btn-main btn-crimson" onclick="submitNewUser(false)" style="padding: 10px 14px; font-size: 12px;">
             Save User Account
           </button>
@@ -6123,7 +6542,7 @@ def render_fleet_html(current_user="admin", token=""):
 
   <!-- Modal: In-Situ Web UI Viewer -->
   <div class="modal-overlay" id="modal-insitu-webui">
-    <div class="modal-card" style="max-width: 1120px; width: 96vw; padding: 14px 16px;">
+    <div class="modal-card modal-card-insitu">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid var(--card-border); padding-bottom: 10px; flex-wrap: wrap; gap: 8px;">
         <div>
           <h3 style="margin: 0; font-size: 16px;" id="insitu-modal-title">In-Situ On-Board Web UI</h3>
@@ -6139,7 +6558,7 @@ def render_fleet_html(current_user="admin", token=""):
           <button class="btn-secondary" style="padding: 6px 10px; font-size: 12px;" onclick="closeModal('modal-insitu-webui')">&times; Close</button>
         </div>
       </div>
-      <div style="width: 100%; height: 72vh; min-height: 520px; border-radius: 12px; overflow: hidden; background: var(--log-bg); border: 1px solid var(--card-border);">
+      <div class="insitu-iframe-wrap">
         <iframe id="insitu-iframe" style="width: 100%; height: 100%; border: none;" src="about:blank"></iframe>
       </div>
     </div>
@@ -6590,6 +7009,24 @@ def render_fleet_html(current_user="admin", token=""):
           return;
         }
         const data = await res.json();
+        const dbLabelEl = document.getElementById("db-backend-label");
+        const dbPillEl = document.getElementById("db-backend-pill");
+        const dbHintEl = document.getElementById("db-backend-hint");
+        const backupBarEl = document.getElementById("users-backup-actions");
+        if (data.db_status && dbLabelEl && dbPillEl) {
+          const st = data.db_status;
+          dbLabelEl.innerText = st.backend || st.label || "Storage Backend";
+          dbPillEl.innerText = st.persistent ? "PERSISTENT" : "EPHEMERAL";
+          dbPillEl.className = "status-pill " + (st.persistent ? "pill-green" : "pill-orange");
+          if (dbHintEl) {
+            dbHintEl.innerText = st.persistent
+              ? "Accounts, biometrics, sessions, and fleet registry are backed by durable storage across deploys."
+              : "Running on ephemeral container storage. Set DATABASE_URL (PostgreSQL), UPSTASH_REDIS_REST_URL, or ANASHWAR_SEED_USERS_JSON in Render so new accounts survive redeployments.";
+          }
+        }
+        if (backupBarEl) {
+          backupBarEl.style.display = (data.caller_role === "Super Admin") ? "flex" : "none";
+        }
         if (!listContainer || !data.users) return;
         let html = "";
         for (const u of data.users) {
@@ -6642,7 +7079,7 @@ def render_fleet_html(current_user="admin", token=""):
                   <span>&bull;</span>
                   <span><strong>IP:</strong> ${s.ip || "127.0.0.1"}</span>
                   <span>&bull;</span>
-                  <span><strong>Location:</strong> ${s.location || "Pune, Maharashtra, India"}</span>
+                  <span><strong>Location:</strong> ${escHtml(s.location || "Client Network")}</span>
                   <span>&bull;</span>
                   <span><strong>Carrier:</strong> ${s.carrier || "Network"}</span>
                   ${s.screen_res ? `<span>&bull;</span><span><strong>Display:</strong> ${s.screen_res}</span>` : ""}
@@ -6763,6 +7200,71 @@ def render_fleet_html(current_user="admin", token=""):
         }
       } catch(e) {
         alert("Error deleting user: " + e);
+      }
+    }
+
+    async function downloadUsersBackup() {
+      try {
+        const res = await authedFetch("/api/users/backup");
+        if (!res.ok) return alert("Failed to export backup (Super Admin required).");
+        const data = await res.json();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `anashwar_users_backup_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert("Backup export error: " + e);
+      }
+    }
+
+    async function copyRenderSeedEnv() {
+      try {
+        const res = await authedFetch("/api/users/backup");
+        if (!res.ok) return alert("Failed to fetch users seed (Super Admin required).");
+        const data = await res.json();
+        const seedJson = JSON.stringify(data.users || {});
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(seedJson);
+          alert("Copied ANASHWAR_SEED_USERS_JSON value to clipboard.\\nPaste it in Render -> Environment -> ANASHWAR_SEED_USERS_JSON so these accounts survive redeployments.");
+        } else {
+          window.prompt("Copy this JSON into Render Environment variable ANASHWAR_SEED_USERS_JSON:", seedJson);
+        }
+      } catch (e) {
+        alert("Seed copy error: " + e);
+      }
+    }
+
+    function triggerRestoreBackup() {
+      const inp = document.getElementById("restore-users-file-input");
+      if (inp) {
+        inp.value = "";
+        inp.click();
+      }
+    }
+
+    async function handleRestoreFile(files) {
+      if (!files || !files.length) return;
+      try {
+        const text = await files[0].text();
+        const res = await authedFetch("/api/users/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: text
+        });
+        const data = await res.json();
+        if (data.success) {
+          await loadUsersList();
+          alert(`Restored ${data.restored_users} account(s) successfully.`);
+        } else {
+          alert(data.error || "Failed to restore backup JSON.");
+        }
+      } catch (e) {
+        alert("Invalid backup JSON: " + e);
       }
     }
 
@@ -7480,7 +7982,7 @@ def render_fleet_html(current_user="admin", token=""):
                   </div>
                 </div>
               </div>
-              <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+              <div class="active-node-actions">
                 <button class="btn-main btn-cyan" style="padding:7px 11px; font-size:11px; border-radius:9px;" onclick="event.stopPropagation(); openInsituNode('${escJs(n.name)}')" title="Open On-Board Web UI">
                   ${ICONS.globe}
                   <span>Web UI</span>
@@ -7942,8 +8444,8 @@ def render_fleet_html(current_user="admin", token=""):
       if (document.getElementById("spec-port")) document.getElementById("spec-port").innerText = node.port || "-";
       if (document.getElementById("spec-rssi")) document.getElementById("spec-rssi").innerText = (node.rssi || 0) + " dBm";
       if (document.getElementById("spec-heap")) document.getElementById("spec-heap").innerText = Math.round((node.heap || 0) / 1024) + " KB";
-      if (document.getElementById("spec-geo")) document.getElementById("spec-geo").innerText = node.geo_location || "Pune, Maharashtra, India";
-      if (document.getElementById("spec-public-ip")) document.getElementById("spec-public-ip").innerText = `${node.public_ip || "WAN IP"} (${node.carrier_isp || "Carrier"})`;
+      if (document.getElementById("spec-geo")) document.getElementById("spec-geo").innerText = node.geo_location || (node.ip ? `STA LAN (${node.ip})` : "Resolving location...");
+      if (document.getElementById("spec-public-ip")) document.getElementById("spec-public-ip").innerText = `${node.public_ip || node.ip || "WAN IP"} (${node.carrier_isp || "NAT Network"})`;
       if (document.getElementById("spec-hash")) document.getElementById("spec-hash").innerText = (node.sec_hash || "").substring(0, 24) + "...";
 
       // Microcontroller Hardware Profile & Wireless Bands
@@ -8187,11 +8689,13 @@ def render_fleet_html(current_user="admin", token=""):
       requestAnimationFrame(tick);
     }
 
-    // Automatic Responsive Display Engine (Touch Screen Phone vs Non-Touch PC/Mac Desktop)
+    // Automatic Responsive Display Engine (Viewport Phone vs PC/Mac Desktop)
     function getDisplayFormMode() {
-      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
-      const isNarrow = window.innerWidth <= 860;
-      return (isNarrow || isTouch) ? "phone" : "desktop";
+      const w = window.innerWidth || document.documentElement.clientWidth || 1024;
+      const isCoarse = Boolean(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+      if (w <= 860) return "phone";
+      if (isCoarse && w <= 960) return "phone";
+      return "desktop";
     }
 
     function applyDisplayFormMode() {

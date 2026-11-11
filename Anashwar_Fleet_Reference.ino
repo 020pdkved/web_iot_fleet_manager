@@ -146,6 +146,9 @@ String   fleetMac            = "";
 String   fleetChipId         = "";
 String   fleetSecHash        = "";
 String   fleetProxyReqTopic  = "";
+String   fleetPublicIp       = "";
+String   fleetGeoLoc         = "";
+String   fleetIsp            = "";
 bool     fleetServiceOn      = true;
 bool     fleetIdentityCustom = false;
 uint32_t fleetResetSeq       = 0;
@@ -293,13 +296,71 @@ String fleetJsonGetStr(const String& json, const char* key) {
   return res;
 }
 
+static String jsonEscapeMin(const String& s) {
+  String out;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out;
+}
+
+// One-time lightweight WAN geolocation fetch after Wi-Fi connect so the cloud
+// portal resolves the node's real ISP/city rather than Render's Oregon server IP.
+void fetchFleetPublicGeo() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClient geoClient;
+  if (!geoClient.connect("ip-api.com", 80)) return;
+  geoClient.print(
+    "GET /json/?fields=status,country,regionName,city,isp,query HTTP/1.0\r\n"
+    "Host: ip-api.com\r\n"
+    "User-Agent: AnashwarFleetNode/4.3\r\n"
+    "Connection: close\r\n\r\n"
+  );
+  unsigned long dl = millis() + 1800;
+  String resp;
+  while ((long)(dl - millis()) > 0 && (geoClient.connected() || geoClient.available())) {
+    while (geoClient.available()) {
+      resp += (char)geoClient.read();
+    }
+    fleetPumpWebServer();
+    delay(2);
+  }
+  geoClient.stop();
+
+  int bodyIdx = resp.indexOf("\r\n\r\n");
+  if (bodyIdx < 0) return;
+  String j = resp.substring(bodyIdx + 4);
+  if (fleetJsonGetStr(j, "status") != "success") return;
+
+  fleetPublicIp = fleetJsonGetStr(j, "query");
+  fleetIsp      = fleetJsonGetStr(j, "isp");
+  String city   = fleetJsonGetStr(j, "city");
+  String reg    = fleetJsonGetStr(j, "regionName");
+  String ctry   = fleetJsonGetStr(j, "country");
+
+  fleetGeoLoc = "";
+  if (city.length()) fleetGeoLoc += city;
+  if (reg.length() && reg != city) {
+    if (fleetGeoLoc.length()) fleetGeoLoc += ", ";
+    fleetGeoLoc += reg;
+  }
+  if (ctry.length()) {
+    if (fleetGeoLoc.length()) fleetGeoLoc += ", ";
+    fleetGeoLoc += ctry;
+  }
+  Serial.printf("[GEO] Hardware WAN: %s | %s (%s)\n",
+                fleetPublicIp.c_str(), fleetGeoLoc.c_str(), fleetIsp.c_str());
+}
+
 // =============================================================================
 // STEP 2: FLEET TELEMETRY PUBLISHER
 // =============================================================================
 void publishFleetTelemetry() {
   if (!fleetMqtt.connected()) return;
 
-  char buf[1024];
+  char buf[1280];
 #if defined(ESP32)
   unsigned int freeHeap = (unsigned int)ESP.getFreeHeap();
   float flashMb = (float)ESP.getFlashChipSize() / (1024.0f * 1024.0f);
@@ -322,16 +383,18 @@ void publishFleetTelemetry() {
     "{\"name\":\"%s\",\"id\":\"Anashwar-%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
     "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\",\"mode\":1,"
     "\"service\":%s,\"offline\":false,\"state\":\"%s\",\"ip\":\"%s\","
+    "\"pub_ip\":\"%s\",\"geo\":\"%s\",\"isp\":\"%s\","
     "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"delay\":0.0,\"btn\":0,\"led\":%d,"
     "\"identity_custom\":%s,\"reset_seq\":%lu,"
     "\"mcu\":\"%s\",\"arch\":\"%s\",\"flash\":%.1f,"
     "\"ram\":%d,\"antenna\":\"2.4 GHz WiFi\"}",
-    fleetNodeName.c_str(), fleetChipId.c_str(), fleetMac.c_str(), fleetChipId.c_str(),
-    fleetClientName.c_str(), fleetProjectName.c_str(), fleetSecHash.c_str(),
+    jsonEscapeMin(fleetNodeName).c_str(), fleetChipId.c_str(), fleetMac.c_str(), fleetChipId.c_str(),
+    jsonEscapeMin(fleetClientName).c_str(), jsonEscapeMin(fleetProjectName).c_str(), fleetSecHash.c_str(),
     fleetServiceOn ? "true" : "false",
     fleetServiceOn ? "online" : "standby",
-    WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
-    freeHeap, (unsigned long)(millis() / 1000),
+    WiFi.localIP().toString().c_str(),
+    fleetPublicIp.c_str(), jsonEscapeMin(fleetGeoLoc).c_str(), jsonEscapeMin(fleetIsp).c_str(),
+    (int)WiFi.RSSI(), freeHeap, (unsigned long)(millis() / 1000),
     fleetServiceOn ? 1 : 0,
     fleetIdentityCustom ? "true" : "false",
     (unsigned long)fleetResetSeq,
@@ -502,16 +565,6 @@ struct FleetHttpProxyJob {
   String ct;
   String b64Body;
 } fleetProxyJob = {false, "", "GET", "/", "", ""};
-
-static String jsonEscapeMin(const String& s) {
-  String out;
-  for (unsigned int i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') out += '\\';
-    out += c;
-  }
-  return out;
-}
 
 void pumpFleetHttpProxy() {
   if (!fleetProxyJob.pending) return;
@@ -820,6 +873,7 @@ void initFleetManager() {
   Serial.printf("\n[WiFi] Connected! IP: %s | Chip ID: %s\n",
                 WiFi.localIP().toString().c_str(), fleetChipId.c_str());
 
+  fetchFleetPublicGeo(); // Resolve hardware WAN IP + city/ISP once at boot for cloud portal
   fleetMqtt.setServer(FLEET_MQTT_BROKER, FLEET_MQTT_PORT);
   fleetMqtt.setCallback(onFleetDirective);
   fleetMqtt.setBufferSize(4096); // Required for chunked Web UI HTTP-Proxy payloads!
@@ -966,6 +1020,18 @@ def load_id():
 identity = load_id()
 service_on = True
 
+def resolve_wan_geo():
+    try:
+        r = requests.get("http://ip-api.com/json/?fields=status,country,regionName,city,isp,query", timeout=3).json()
+        if r.get("status") == "success":
+            parts = [p for p in [r.get("city", ""), r.get("regionName", ""), r.get("country", "")] if p]
+            return {"pub_ip": r.get("query", ""), "geo": ", ".join(parts), "isp": r.get("isp", "")}
+    except Exception:
+        pass
+    return {"pub_ip": "", "geo": "", "isp": ""}
+
+WAN_GEO = resolve_wan_geo()
+
 def save_id():
     with open(STATE_FILE, "w") as f:
         json.dump(identity, f)
@@ -981,8 +1047,9 @@ def publish_telemetry(client):
         "name": identity["node"], "id": f"Anashwar-{CHIP_ID}", "mac": MAC, "chip_id": CHIP_ID,
         "client": identity["client"], "project": identity["project"], "sec_hash": SEC_HASH,
         "mode": 1, "service": service_on, "offline": False,
-        "state": "online" if service_on else "standby", "ip": ip, "rssi": -42,
-        "heap": 512000, "uptime": int(time.monotonic()), "mcu": "RaspberryPi",
+        "state": "online" if service_on else "standby", "ip": ip,
+        "pub_ip": WAN_GEO["pub_ip"], "geo": WAN_GEO["geo"], "isp": WAN_GEO["isp"],
+        "rssi": -42, "heap": 512000, "uptime": int(time.monotonic()), "mcu": "RaspberryPi",
         "arch": "ARMv8 Cortex-A72 Linux", "flash": 32.0, "ram": 4096,
         "identity_custom": identity["custom"], "reset_seq": identity["rst"]
     }
@@ -1047,3 +1114,4 @@ while True:
 #endif
 ===============================================================================
 */
+
