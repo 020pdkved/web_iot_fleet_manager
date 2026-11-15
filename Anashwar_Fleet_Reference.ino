@@ -1,51 +1,81 @@
 /*
   =============================================================================
-  ANASHWAR TECHNOLOGIES - UNIVERSAL MULTI-PLATFORM FLEET REFERENCE (v4.2)
+  ANASHWAR TECHNOLOGIES - UNIVERSAL MULTI-PLATFORM FLEET REFERENCE (v4.3)
   Portal URL : https://manage.anashwartech.com
   MQTT Broker: broker.hivemq.com | Port: 1883
   =============================================================================
 
-  ONE SINGLE AUTHORITATIVE REFERENCE FOR ALL PROJECT WORKSPACES & PLATFORMS:
-    1. ESP32 Family          (ESP32-WROOM-32, ESP32-S3, ESP32-C3, ESP32-C6)
-    2. ESP8266 Family        (NodeMCU, Wemos D1 Mini, ESP-12F)
-    3. Raspberry Pi Pico W   (RP2040 / Pico 2 W RP2350 - Arduino & MicroPython)
-    4. Realtek Ameba BW16    (RTL8720DN Dual-Band 2.4GHz / 5GHz)
-    5. Raspberry Pi 3 / 4B / Zero 2 W / Linux SBCs (Python 3 Daemon at bottom)
+  =============================================================================
+  HOW TO INTEGRATE THIS INTO ANY EXISTING NODE CODEBASE (ARDUINO / PLATFORMIO):
+  =============================================================================
+  You do NOT need to rewrite your project!
+  Your existing hardware drivers, stepper motors, audio (DFPlayer), relays,
+  and multi-page Web UIs (swipes, dials, haptics, settings) stay 100% untouched.
+
+  Follow these 4 simple steps:
+    1. LIBRARIES & DEPENDENCIES:
+       - Arduino IDE: Install "PubSubClient" via Library Manager.
+       - PlatformIO:  Add `knolleary/PubSubClient` to `lib_deps` in platformio.ini.
+       (WiFi, WebServer, Preferences/EEPROM, mbedtls/SHA-256 are built-in).
+
+    2. COPY FLEET ENGINE (Steps 1 to 4 below):
+       Copy the Fleet variables, crypto, NVS identity handlers, and
+       pumpFleetHttpProxy() into your sketch or an `AnashwarFleet.h` header.
+
+    3. HOOK INTO setup() AND loop():
+       - At bottom of setup(): call `initFleetManager();`
+       - In loop(): call `serviceFleetManager();`
+
+    4. HOOK YOUR WEBSERVER (For Global On-Board Web UI Tunneling):
+       - Point `myExistingWebServer` to your WebServer instance:
+         `WebServer myExistingWebServer(80);`
+       - If using ESPAsyncWebServer, define `FLEET_USES_ASYNC_WEBSERVER`.
+
+  =============================================================================
+  SERVICE ON / OFF (MASTER REMOTE SHUTDOWN & RESUME):
+  =============================================================================
+  The Web Portal has a "Master Service Switch" for every node.
+  When toggled on the portal (or via CMD:[Node]:SERVICE:OFF or SERVICE:ON):
+    - `fleetServiceOn` is set to false (STANDBY) or true (ACTIVE).
+    - In your hardware loop, check `if (!fleetServiceOn) { ... pause steppers, mute audio, open relays ... return; }`
+    - In your web UI, you can also add a toggle or button to call `/api/service?state=0` or `1`.
+    - Telemetry automatically reflects state ("online" vs "standby") so the portal knows!
+
+  =============================================================================
+  SETTINGS PAGE: LED BRIGHTNESS, SERVICE TOGGLE & IDENTITY RESET SNIPPET:
+  =============================================================================
+  In your existing HTML /settings route, paste:
+  - Master Service Switch (Remote ON/OFF):
+    `<button onclick="fetch('/api/service?state=' + (serviceActive ? '0':'1')).then(()=>location.reload())">Toggle Master Service</button>`
+  - LED Brightness Slider:
+    `<input type="range" min="0" max="255" value="128" oninput="fetch('/api/led?b='+this.value)">`
+  - Reset to Defaults Button:
+    `<button onclick="fetch('/api/reset_identity',{method:'POST'}).then(()=>location.reload())">Reset Defaults</button>`
+  - Route handlers:
+    `server.on("/api/service", HTTP_GET, []() { fleetServiceOn = (server.arg("state") == "1"); publishFleetTelemetry(); server.send(200,"application/json","{\"service\":" + String(fleetServiceOn ? "true":"false") + "}"); });`
+    `server.on("/api/led", HTTP_GET, []() { ledcWrite(0, server.arg("b").toInt()); server.send(200,"text/plain","OK"); });`
+    `server.on("/api/reset_identity", HTTP_POST, []() { resetFleetIdentityToDefaults(); server.send(200,"application/json","{\"status\":\"reset\"}"); });`
 
   =============================================================================
   HOW THE "Web UI" BUTTON WORKS GLOBALLY (THROUGH FIREWALLS / HOTSPOT NAT):
   =============================================================================
   When your hardware sits behind a phone hotspot or local Wi-Fi (e.g. 10.73.198.1),
-  a cloud server (https://manage.anashwartech.com) CANNOT reach port 80 directly.
-  "Direct LAN" works ONLY when your browser is on the same Wi-Fi SSID as the MCU.
+  the cloud portal (https://manage.anashwartech.com) cannot reach port 80 directly.
+  "Direct LAN" works only when the browser is on the same local Wi-Fi network.
 
-  To stream your EXISTING multi-page web UI (steppers, DFPlayer, relays, dials,
-  swipes, vibration, /settings, /motors, /audio, etc.) on the Portal "Web UI"
-  button from ANYWHERE in the world:
-    -> The portal sends HTTP requests over MQTT topic:
-         anashwar/proxy/req/<chip_id>
-    -> Your firmware forwards that request to localhost:80 (your existing web UI),
-       captures the HTML/CSS/JS/JSON response, chunks it as Base64, and publishes
-       back on:
-         anashwar/proxy/res
-    -> The portal rewrites links/fetch/XHR inside an iframe and renders YOUR EXACT
-       onboard multi-page web interface globally!
+  To stream your real onboard multi-page web UI from ANYWHERE globally:
+    1. The portal sends HTTP requests over MQTT: `anashwar/proxy/req/<chip_id>`
+    2. `pumpFleetHttpProxy()` forwards the request to localhost:80, captures the
+       raw response, Base64-encodes and chunks it into `anashwar/proxy/res`.
+    3. The portal dynamically rewrites links/fetch/forms and renders your exact
+       on-board web UI inside the portal console!
 
-  IF AN EXISTING NODE (e.g. Tree 1) SHOWS ONLY THE FALLBACK STANDBY/REBOOT CARD
-  WHEN CLICKING "Web UI":
-    Add Step 1B ("FLEET_PROXY_REQ_TOPIC"), Step 2C ("pumpFleetHttpProxy()"),
-    and subscribe to "anashwar/proxy/req/" + fleetChipId in reconnectFleetMQTT()!
-
-  =============================================================================
-  NVS / PERSISTENT IDENTITY & PORTAL BIDIRECTIONAL RENAME SYNC:
-  =============================================================================
-  - Your coded defaults (DEFAULT_NODE_NAME, DEFAULT_CLIENT_NAME, DEFAULT_PROJECT_NAME)
-    are stored permanently in NVS ("def_node", "def_client", "def_proj").
-  - Renaming Client, Project, or Node in https://manage.anashwartech.com pushes
-    CMD:[<chip>]:RENAME / SETCLIENT / SETPROJECT and updates NVS ("act_*").
-  - Hitting "Reset to Coded Defaults" in your device UI (/settings or POST
-    /api/reset_identity) restores "def_*" -> "act_*", increments reset_seq, and
-    immediately publishes updated telemetry so the Web Portal reverts automatically!
+  SUPPORTED PLATFORMS:
+    1. ESP32 Family        (ESP32-WROOM-32, S2, S3, C3, C6)
+    2. ESP8266 Family      (NodeMCU, Wemos D1 Mini, ESP-12F)
+    3. Raspberry Pi Pico W (RP2040 / Pico 2 W RP2350)
+    4. Realtek Ameba BW16  (RTL8720DN Dual-Band 2.4/5GHz)
+    5. Raspberry Pi 3/4/Zero Linux SBCs (Python daemon at bottom of this file)
   =============================================================================
 */
 
@@ -149,7 +179,8 @@ String   fleetProxyReqTopic  = "";
 String   fleetPublicIp       = "";
 String   fleetGeoLoc         = "";
 String   fleetIsp            = "";
-bool     fleetServiceOn      = true;
+bool     fleetServiceOn      = true;  // Master Service: true = ACTIVE, false = STANDBY
+bool     fleetOfflineMode    = true;  // Serve While Offline: true = run standalone when offline, false = halt if offline
 bool     fleetIdentityCustom = false;
 uint32_t fleetResetSeq       = 0;
 
@@ -382,7 +413,7 @@ void publishFleetTelemetry() {
   snprintf(buf, sizeof(buf),
     "{\"name\":\"%s\",\"id\":\"Anashwar-%s\",\"mac\":\"%s\",\"chip_id\":\"%s\","
     "\"client\":\"%s\",\"project\":\"%s\",\"sec_hash\":\"%s\",\"mode\":1,"
-    "\"service\":%s,\"offline\":false,\"state\":\"%s\",\"ip\":\"%s\","
+    "\"service\":%s,\"offline\":%s,\"state\":\"%s\",\"ip\":\"%s\","
     "\"pub_ip\":\"%s\",\"geo\":\"%s\",\"isp\":\"%s\","
     "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"delay\":0.0,\"btn\":0,\"led\":%d,"
     "\"identity_custom\":%s,\"reset_seq\":%lu,"
@@ -391,6 +422,7 @@ void publishFleetTelemetry() {
     jsonEscapeMin(fleetNodeName).c_str(), fleetChipId.c_str(), fleetMac.c_str(), fleetChipId.c_str(),
     jsonEscapeMin(fleetClientName).c_str(), jsonEscapeMin(fleetProjectName).c_str(), fleetSecHash.c_str(),
     fleetServiceOn ? "true" : "false",
+    fleetOfflineMode ? "true" : "false",
     fleetServiceOn ? "online" : "standby",
     WiFi.localIP().toString().c_str(),
     fleetPublicIp.c_str(), jsonEscapeMin(fleetGeoLoc).c_str(), jsonEscapeMin(fleetIsp).c_str(),
@@ -447,6 +479,8 @@ void loadFleetIdentityFromNVS() {
   fleetProjectName    = prefs.getString("act_proj",   DEFAULT_PROJECT_NAME);
   fleetIdentityCustom = prefs.getBool("custom_set",   false);
   fleetResetSeq       = prefs.getUInt("rst_seq",      0);
+  fleetServiceOn      = prefs.getBool("service_on",   true);
+  fleetOfflineMode    = prefs.getBool("offline_mode", true);
   prefs.end();
 #elif defined(FLEET_HAS_EEPROM)
   EEPROM.begin(sizeof(FleetEepromId) + 16);
@@ -522,9 +556,15 @@ void resetFleetIdentityToDefaults() {
   prefs.putString("act_proj",   defP);
   prefs.putBool("custom_set",   false);
   prefs.putUInt("rst_seq",      nextSeq);
+  prefs.putBool("service_on",   true);
+  prefs.putBool("offline_mode", true);
   prefs.end();
-  fleetNodeName = defN; fleetClientName = defC; fleetProjectName = defP;
-  fleetResetSeq = nextSeq;
+  fleetNodeName       = defN;
+  fleetClientName     = defC;
+  fleetProjectName    = defP;
+  fleetResetSeq       = nextSeq;
+  fleetServiceOn      = true;
+  fleetOfflineMode    = true;
 #elif defined(FLEET_HAS_EEPROM)
   FleetEepromId data;
   EEPROM.get(0, data);
@@ -767,13 +807,35 @@ void onFleetDirective(char* topic, byte* payload, unsigned int length) {
   }
   if (body.indexOf("SERVICE:OFF") >= 0) {
     fleetServiceOn = false;
-    // HOOK: Pause steppers / silence DFPlayer / open safety relay here
+#if defined(FLEET_HAS_NVS)
+    Preferences prefs; prefs.begin(FLEET_NVS_NS, false);
+    prefs.putBool("service_on", false); prefs.end();
+#endif
+    Serial.println("[FLEET] Master Service set to STANDBY (OFF)");
     publishFleetTelemetry();
     return;
   }
   if (body.indexOf("SERVICE:ON") >= 0) {
     fleetServiceOn = true;
-    // HOOK: Resume normal project hardware operation here
+#if defined(FLEET_HAS_NVS)
+    Preferences prefs; prefs.begin(FLEET_NVS_NS, false);
+    prefs.putBool("service_on", true); prefs.end();
+#endif
+    Serial.println("[FLEET] Master Service set to ACTIVE (ON)");
+    publishFleetTelemetry();
+    return;
+  }
+
+  // Serve While Offline (Autonomous Mode) Toggle:
+  // ON:  Node runs local hardware autonomously when disconnected.
+  // OFF: Node pauses hardware if network drops until connection returns.
+  if (body.startsWith("OFFLINE:")) {
+    fleetOfflineMode = (body.indexOf(":ON") >= 0 || body.indexOf(":ENABLE") >= 0 || body.indexOf(":1") >= 0);
+#if defined(FLEET_HAS_NVS)
+    Preferences prefs; prefs.begin(FLEET_NVS_NS, false);
+    prefs.putBool("offline_mode", fleetOfflineMode); prefs.end();
+#endif
+    Serial.printf("[FLEET] Serve While Offline set to: %s\n", fleetOfflineMode ? "ENABLED (Autonomous)" : "DISABLED (Network Gated)");
     publishFleetTelemetry();
     return;
   }
@@ -854,38 +916,67 @@ void initFleetManager() {
   fleetProxyReqTopic = String(FLEET_PROXY_REQ_PREF) + fleetChipId;
 
 #if defined(FLEET_IS_BW16)
-  Serial.println("[WiFi] BW16 trying VED-FI then AnashwarTech2...");
-  if (WiFi.begin((char*)WIFI_SSID_1, (char*)WIFI_PASS_1) != WL_CONNECTED) {
-    delay(1500);
-    WiFi.begin((char*)WIFI_SSID_2, (char*)WIFI_PASS_2);
-  }
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println("[WiFi] BW16 starting network check...");
+  WiFi.begin((char*)WIFI_SSID_1, (char*)WIFI_PASS_1);
 #else
   WiFi.mode(WIFI_STA);
   fleetWiFiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
   fleetWiFiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
-  Serial.println("[WiFi] Scanning (VED-FI / AnashwarTech2)...");
-  while (fleetWiFiMulti.run() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println("[WiFi] Searching for network (non-blocking 1.5s max)...");
+  unsigned long bootDl = millis() + 1500;
+  while (fleetWiFiMulti.run() != WL_CONNECTED && millis() < bootDl) {
+    delay(40);
+  }
 #endif
 
   fleetMac = WiFi.macAddress();
   fleetSecHash = computeFleetSecHash(fleetMac + fleetChipId + String(FLEET_SECURITY_SALT));
-  Serial.printf("\n[WiFi] Connected! IP: %s | Chip ID: %s\n",
-                WiFi.localIP().toString().c_str(), fleetChipId.c_str());
 
-  fetchFleetPublicGeo(); // Resolve hardware WAN IP + city/ISP once at boot for cloud portal
   fleetMqtt.setServer(FLEET_MQTT_BROKER, FLEET_MQTT_PORT);
   fleetMqtt.setCallback(onFleetDirective);
   fleetMqtt.setBufferSize(4096); // Required for chunked Web UI HTTP-Proxy payloads!
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected! IP: %s | Chip ID: %s\n",
+                  WiFi.localIP().toString().c_str(), fleetChipId.c_str());
+    fetchFleetPublicGeo();
+  } else {
+    Serial.println("[WiFi] No network found at boot. Proceeding in STANDALONE mode immediately!");
+    Serial.printf("[STANDALONE] Hardware & local Web UI active. Node Chip ID: %s\n", fleetChipId.c_str());
+  }
+}
+
+// Check whether local project operations (steppers, audio, relays) should run:
+// - Returns false if portal remotely sent SERVICE:OFF (Standby).
+// - Returns true if online and connected.
+// - If offline/no internet: returns true if fleetOfflineMode is true (Serve While Offline),
+//   or false if offline serving is disabled.
+bool isFleetServiceActive() {
+  if (!fleetServiceOn) return false;
+  if (WiFi.status() == WL_CONNECTED && fleetMqtt.connected()) return true;
+  return fleetOfflineMode;
 }
 
 void serviceFleetManager() {
-#if !defined(FLEET_IS_BW16)
-  if (fleetWiFiMulti.run() != WL_CONNECTED) return;
-#else
-  if (WiFi.status() != WL_CONNECTED) return;
-#endif
+  static unsigned long lastWifiTry = 0;
 
+  // Background non-blocking Wi-Fi management
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiTry >= 4000) {
+      lastWifiTry = millis();
+#if !defined(FLEET_IS_BW16)
+      if (fleetWiFiMulti.run() == WL_CONNECTED) {
+        Serial.printf("[WiFi] Network reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
+        fetchFleetPublicGeo();
+      }
+#else
+      WiFi.begin((char*)WIFI_SSID_1, (char*)WIFI_PASS_1);
+#endif
+    }
+    return; // Standalone: local loop & web server continue unhindered!
+  }
+
+  // Connected to Wi-Fi: service cloud MQTT mesh
   if (!fleetMqtt.connected()) {
     reconnectFleetMQTT();
   } else {
@@ -968,6 +1059,18 @@ void loop() {
 #if !defined(FLEET_IS_BW16) && !defined(FLEET_USES_ASYNC_WEBSERVER)
   myExistingWebServer.handleClient();
 #endif
+
+  // Standalone & Remote Managed Hardware Gate:
+  // - Runs 100% standalone if no internet (offline: true).
+  // - If turned OFF remotely from Portal (SERVICE:OFF), safely pauses hardware into STANDBY.
+  // - If offline: false and network is lost, halts hardware until connection restored.
+  if (!isFleetServiceActive()) {
+    delay(10);
+    return;
+  }
+
+  // YOUR NORMAL PROJECT HARDWARE LOOP RUNS HERE WHEN ACTIVE:
+  // (e.g. stepper.run(), dfplayer.loop(), sensor reads, relay checks)
   delay(2);
 }
 
@@ -1012,7 +1115,7 @@ def load_id():
     if os.path.isfile(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    st = {"node": DEFAULT_NODE, "client": DEFAULT_CLIENT, "project": DEFAULT_PROJECT, "custom": False, "rst": 0}
+    st = {"node": DEFAULT_NODE, "client": DEFAULT_CLIENT, "project": DEFAULT_PROJECT, "custom": False, "rst": 0, "offline": True}
     with open(STATE_FILE, "w") as f:
         json.dump(st, f)
     return st
@@ -1046,7 +1149,7 @@ def publish_telemetry(client):
     payload = {
         "name": identity["node"], "id": f"Anashwar-{CHIP_ID}", "mac": MAC, "chip_id": CHIP_ID,
         "client": identity["client"], "project": identity["project"], "sec_hash": SEC_HASH,
-        "mode": 1, "service": service_on, "offline": False,
+        "mode": 1, "service": service_on, "offline": identity.get("offline", True),
         "state": "online" if service_on else "standby", "ip": ip,
         "pub_ip": WAN_GEO["pub_ip"], "geo": WAN_GEO["geo"], "isp": WAN_GEO["isp"],
         "rssi": -42, "heap": 512000, "uptime": int(time.monotonic()), "mcu": "RaspberryPi",
@@ -1082,6 +1185,7 @@ def on_connect(c, u, fl, rc):
     publish_telemetry(c)
 
 def on_message(c, u, msg):
+    global service_on
     if msg.topic == PROXY_REQ:
         threading.Thread(target=handle_proxy, args=(c, json.loads(msg.payload)), daemon=True).start()
         return
@@ -1097,9 +1201,15 @@ def on_message(c, u, msg):
         identity["client"] = body[10:].strip(); identity["custom"] = True; save_id(); publish_telemetry(c)
     elif body.startswith("SETPROJECT:"):
         identity["project"] = body[11:].strip(); identity["custom"] = True; save_id(); publish_telemetry(c)
-    elif body in ("RESET_NAMES", "RESET_IDENTITY"):
-        identity.update({"node": DEFAULT_NODE, "client": DEFAULT_CLIENT, "project": DEFAULT_PROJECT, "custom": False, "rst": identity["rst"] + 1})
+    elif body.startswith("SERVICE:"):
+        service_on = (body.endswith(":ON") or body.endswith(":1"))
+        publish_telemetry(c)
+    elif body.startswith("OFFLINE:"):
+        identity["offline"] = (body.endswith(":ON") or body.endswith(":1") or body.endswith(":ENABLE"))
         save_id(); publish_telemetry(c)
+    elif body in ("RESET_NAMES", "RESET_IDENTITY"):
+        identity.update({"node": DEFAULT_NODE, "client": DEFAULT_CLIENT, "project": DEFAULT_PROJECT, "custom": False, "rst": identity["rst"] + 1, "offline": True})
+        service_on = True; save_id(); publish_telemetry(c)
     elif "REBOOT" in body:
         subprocess.Popen(["sudo", "reboot"])
 

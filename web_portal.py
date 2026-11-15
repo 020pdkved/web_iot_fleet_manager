@@ -813,7 +813,11 @@ def record_history_online(node_name, client_name, project_name, tdata):
     p_k = f"{c_k}::{norm_key(p_clean)}"
     mac_raw = (tdata.get("mac") or "").strip().upper()
     chip_raw = (tdata.get("chip_id") or "").strip().upper()
-    n_k = mac_raw or chip_raw or norm_key(n_clean)
+    if mac_raw in ("00:00:00:00:00:00", "NONE") and chip_raw:
+        c_clean = ''.join(c for c in chip_raw if c.isalnum()).upper()
+        if len(c_clean) >= 12:
+            mac_raw = ':'.join(c_clean[-12:][i:i+2] for i in range(0, 12, 2))
+    n_k = chip_raw or mac_raw or norm_key(n_clean)
 
     now_ts = time.time()
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1265,6 +1269,8 @@ def resolve_target_node(val):
     if not val:
         return None
     val_clean = norm_name(val)
+    if not val_clean or val_clean.lower() in ("none", "unassigned"):
+        return None
     if val_clean in nodes_telemetry:
         return val_clean
 
@@ -1285,6 +1291,58 @@ def resolve_target_node(val):
     if ("node: b" in v or v in ("node b", "b", "beta", "node beta")) and "Node: B" in nodes_telemetry:
         return "Node: B"
     return None
+
+def find_telemetry_node(raw_mac, raw_chip):
+    """
+    Strictly locate an existing node by immutable silicon hardware identifier (Chip ID or MAC).
+    Guarantees that two physical nodes with different hardware identifiers will NEVER be merged.
+    """
+    mac_u = (raw_mac or "").strip().upper()
+    chip_u = (raw_chip or "").strip().upper()
+
+    # Reject bogus zero or missing MACs
+    if mac_u in ("00:00:00:00:00:00", "00-00-00-00-00-00", "FF:FF:FF:FF:FF:FF", "NONE"):
+        mac_u = ""
+
+    # 1. Prioritize unique silicon Chip ID first!
+    if chip_u:
+        for k, n in nodes_telemetry.items():
+            if (n.get("chip_id") or "").strip().upper() == chip_u:
+                return k
+        for k, r in fleet_registry.get("registered_nodes", {}).items():
+            if (r.get("chip_id") or "").strip().upper() == chip_u:
+                return k
+
+    # 2. Check valid MAC
+    if mac_u:
+        for k, n in nodes_telemetry.items():
+            n_mac = (n.get("mac") or "").strip().upper()
+            if n_mac and n_mac not in ("00:00:00:00:00:00", "NONE") and n_mac == mac_u:
+                return k
+        for k, r in fleet_registry.get("registered_nodes", {}).items():
+            r_mac = (r.get("mac") or "").strip().upper()
+            if r_mac and r_mac not in ("00:00:00:00:00:00", "NONE") and r_mac == mac_u:
+                return k
+
+    return None
+
+def get_next_available_tree_name(prefix="Tree "):
+    existing = set()
+    for n in fleet_registry.get("registered_nodes", {}).values():
+        name = n.get("name", "")
+        if name.startswith(prefix):
+            suffix = name[len(prefix):].strip()
+            if suffix.isdigit():
+                existing.add(int(suffix))
+    for n in nodes_telemetry.keys():
+        if n.startswith(prefix):
+            suffix = n[len(prefix):].strip()
+            if suffix.isdigit():
+                existing.add(int(suffix))
+    num = 1
+    while num in existing:
+        num += 1
+    return f"{prefix}{num}"
 
 def match_or_create_client_project(client_name, project_name):
     c_clean = norm_name(client_name) or "Enterprise Client"
@@ -1334,6 +1392,16 @@ def match_or_create_client_project(client_name, project_name):
 def sync_node_identity_from_device(old_key, new_node_name, new_client_name, new_project_name, tdata):
     """Apply node-initiated identity revert (e.g. NVS reset on ESP32 UI) back onto Portal registry."""
     new_node_clean = norm_name(new_node_name) or old_key
+    if not new_node_clean or new_node_clean.lower() in ("none", "unassigned"):
+        return old_key
+
+    raw_mac = (tdata.get("mac") or "").strip().upper()
+    if old_key != new_node_clean and new_node_clean in fleet_registry.get("registered_nodes", {}):
+        existing_mac = (fleet_registry["registered_nodes"][new_node_clean].get("mac") or "").strip().upper()
+        if existing_mac and raw_mac and existing_mac != raw_mac:
+            # Another physical device already owns this name. Do not hijack it.
+            return old_key
+
     cid, c_clean, pid, p_clean = match_or_create_client_project(new_client_name, new_project_name)
 
     reg_node = fleet_registry["registered_nodes"].pop(old_key, None) or {
@@ -1522,24 +1590,37 @@ def start_mqtt_client():
                             tdata = json.loads(msg)
                             raw_id = tdata.get("id", "")
                             raw_name = norm_name(tdata.get("name", ""))
-                            raw_mac = tdata.get("mac", "").strip()
-                            raw_chip = tdata.get("chip_id", "").strip()
+                            raw_mac = (tdata.get("mac") or "").strip().upper()
+                            raw_chip = (tdata.get("chip_id") or "").strip().upper()
                             raw_client = norm_name(tdata.get("client", ""))
                             raw_project = norm_name(tdata.get("project", ""))
 
-                            # Prioritize immutable silicon MAC / Chip ID first so renames/resets resolve accurately
-                            target_key = (
-                                resolve_target_node(raw_mac)
-                                or resolve_target_node(raw_chip)
-                                or resolve_target_node(raw_name)
-                                or resolve_target_node(raw_id)
-                            )
+                            # If reported MAC is bogus zeroes or missing, reconstruct valid hardware MAC from unique Chip ID
+                            if raw_mac in ("00:00:00:00:00:00", "00-00-00-00-00-00", "FF:FF:FF:FF:FF:FF", "", "NONE") and raw_chip:
+                                c_clean = ''.join(c for c in raw_chip if c.isalnum()).upper()
+                                if len(c_clean) >= 12:
+                                    raw_mac = ':'.join(c_clean[-12:][i:i+2] for i in range(0, 12, 2))
+
+                            # Strict Hardware Partitioning: Match existing node ONLY by immutable silicon ID (Chip ID or MAC)
+                            target_key = find_telemetry_node(raw_mac, raw_chip)
 
                             if not target_key:
-                                # ZERO-TOUCH FLEET AUTO-ONBOARDING (Deduplicated & Normalized)
-                                target_name = raw_name or f"Node-{raw_mac[-5:].replace(':','').upper() if len(raw_mac)>=5 else str(int(time.time()))[-4:]}"
-                                c_in = raw_client or "Enterprise Client"
-                                p_in = raw_project or "Connected Edge Fleet"
+                                # BRAND NEW PHYSICAL HARDWARE NODE: Assign a guaranteed unique box & name
+                                if not raw_name or raw_name.lower() in ("none", "unassigned"):
+                                    target_name = get_next_available_tree_name("Tree ")
+                                else:
+                                    target_name = raw_name
+                                    # If this name is already taken by a DIFFERENT physical MAC, assign next tree name
+                                    is_name_taken = False
+                                    if target_name in nodes_telemetry and (nodes_telemetry[target_name].get("mac") or "").upper() != raw_mac:
+                                        is_name_taken = True
+                                    if target_name in fleet_registry.get("registered_nodes", {}) and (fleet_registry["registered_nodes"][target_name].get("mac") or "").upper() != raw_mac:
+                                        is_name_taken = True
+                                    if is_name_taken:
+                                        target_name = get_next_available_tree_name("Tree ")
+
+                                c_in = raw_client or "Cadbury & Hamley's"
+                                p_in = raw_project or "X'mas Trees"
                                 client_id, client_name, project_id, project_name = match_or_create_client_project(c_in, p_in)
 
                                 if target_name not in fleet_registry["projects"][project_id]["nodes"]:
@@ -1556,6 +1637,13 @@ def start_mqtt_client():
                                     "last_reset_seq": int(tdata.get("reset_seq", 0))
                                 }
                                 save_fleet_registry()
+
+                                # PUSH UNIQUE NAME TO THE ESP32 NODE OVER MQTT SO IT SAVES IT IN NVS!
+                                if raw_chip:
+                                    publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_name}")
+                                if raw_mac:
+                                    publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_name}")
+                                log_event(f"AUTO-ONBOARD: Physical Node [{raw_mac or raw_chip}] assigned distinct box '{target_name}' (STA IP: {tdata.get('ip', '0.0.0.0')})")
 
                                 nodes_telemetry[target_name] = {
                                     "name": target_name,
@@ -1603,8 +1691,36 @@ def start_mqtt_client():
                                     "error_message": ""
                                 }
                                 target_key = target_name
-                                log_event(f"AUTO-DISCOVERY: Node '{target_name}' onboarded into Client '{client_name}' & Project '{project_name}'")
                             else:
+                                # Ensure node is loaded in nodes_telemetry if it was in registered_nodes only
+                                if target_key not in nodes_telemetry:
+                                    sync_telemetry_with_registry()
+                                if target_key not in nodes_telemetry:
+                                    target_name = target_key
+                                    r_node = fleet_registry.get("registered_nodes", {}).get(target_name, {})
+                                    c_id = r_node.get("client_id", "")
+                                    p_id = r_node.get("project_id", "")
+                                    c_name = fleet_registry.get("clients", {}).get(c_id, {}).get("name", "Cadbury & Hamley's")
+                                    p_name = fleet_registry.get("projects", {}).get(p_id, {}).get("name", "X'mas Trees")
+                                    nodes_telemetry[target_name] = {
+                                        "name": target_name,
+                                        "mac": raw_mac,
+                                        "chip_id": raw_chip,
+                                        "port": "WiFi Wireless",
+                                        "client": c_name,
+                                        "project": p_name,
+                                        "ip": tdata.get("ip", "0.0.0.0"),
+                                        "online": True,
+                                        "last_seen": time.time()
+                                    }
+
+                                # If node reports "none", re-push its assigned name to lock into NVS
+                                if raw_name.lower() in ("none", "unassigned", "") and target_key != "none":
+                                    if raw_chip:
+                                        publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_key}")
+                                    if raw_mac:
+                                        publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_key}")
+
                                 # Detect if the ESP32 executed a local NVS Reset to coded defaults
                                 cur_node = nodes_telemetry[target_key]
                                 reg_entry = fleet_registry["registered_nodes"].get(target_key, {})
@@ -1612,37 +1728,25 @@ def start_mqtt_client():
                                 prev_rst_seq = int(reg_entry.get("last_reset_seq", 0))
                                 id_custom = tdata.get("identity_custom", None)
 
-                                names_differ = (
-                                    (raw_name and norm_key(raw_name) != norm_key(target_key))
-                                    or (raw_client and norm_key(raw_client) != norm_key(cur_node.get("client", "")))
-                                    or (raw_project and norm_key(raw_project) != norm_key(cur_node.get("project", "")))
-                                )
-
-                                if rep_rst_seq > prev_rst_seq:
+                                if rep_rst_seq > prev_rst_seq and raw_name and raw_name.lower() not in ("none", "unassigned"):
                                     target_key = sync_node_identity_from_device(
-                                        target_key, raw_name or target_key,
+                                        target_key, raw_name,
                                         raw_client or cur_node.get("client", ""),
                                         raw_project or cur_node.get("project", ""),
                                         tdata
                                     )
-                                elif cur_node.get("pending_portal_sync"):
-                                    # Wait for ESP32 echo matching new portal names or 8s grace period
-                                    if not names_differ:
-                                        cur_node["pending_portal_sync"] = False
-                                    elif time.time() - cur_node.get("portal_rename_ts", 0) > 8.0 and id_custom is False and names_differ:
+                                elif id_custom is True and raw_name and raw_name.lower() not in ("none", "unassigned") and raw_name != target_key:
+                                    # User explicitly entered a custom name in the local on-board web UI
+                                    is_taken = False
+                                    if raw_name in nodes_telemetry and (nodes_telemetry[raw_name].get("mac") or "").upper() != raw_mac:
+                                        is_taken = True
+                                    if not is_taken:
                                         target_key = sync_node_identity_from_device(
-                                            target_key, raw_name or target_key,
+                                            target_key, raw_name,
                                             raw_client or cur_node.get("client", ""),
                                             raw_project or cur_node.get("project", ""),
                                             tdata
                                         )
-                                elif id_custom is False and names_differ:
-                                    target_key = sync_node_identity_from_device(
-                                        target_key, raw_name or target_key,
-                                        raw_client or cur_node.get("client", ""),
-                                        raw_project or cur_node.get("project", ""),
-                                        tdata
-                                    )
 
                             node = nodes_telemetry[target_key]
                             if not node.get("pending_portal_sync"):
@@ -7865,12 +7969,19 @@ def render_fleet_html(current_user="admin", token=""):
     // Render Helpers
     function findLiveNodeByNameOrId(name, mac, chipId) {
       const nodesObj = telemetryData.nodes || {};
-      if (name && nodesObj[name]) return { key: name, data: nodesObj[name] };
       const mU = (mac || "").toUpperCase();
       const cU = (chipId || "").toUpperCase();
-      for (const [k, v] of Object.entries(nodesObj)) {
-        if (mU && (v.mac || "").toUpperCase() === mU) return { key: k, data: v };
-        if (cU && (v.chip_id || "").toUpperCase() === cU) return { key: k, data: v };
+      // Prioritize hardware MAC / Chip ID strictly first
+      if (mU || cU) {
+        for (const [k, v] of Object.entries(nodesObj)) {
+          if (mU && (v.mac || "").toUpperCase() === mU) return { key: k, data: v };
+          if (cU && (v.chip_id || "").toUpperCase() === cU) return { key: k, data: v };
+        }
+      }
+      if (name && nodesObj[name]) {
+        const v = nodesObj[name];
+        const vMac = (v.mac || "").toUpperCase();
+        if (!mU || !vMac || mU === vMac) return { key: name, data: v };
       }
       return null;
     }
@@ -8338,8 +8449,27 @@ def render_fleet_html(current_user="admin", token=""):
       const proj = fleetData.projects[selectedProjectId];
       const nodeNames = proj ? (proj.nodes || []) : [];
 
+      // Aggregate all distinct nodes for this project from both registry and active telemetry
+      const allNodes = new Set(nodeNames);
+      if (telemetryData.nodes) {
+        for (const [nKey, nObj] of Object.entries(telemetryData.nodes)) {
+          if (nKey.toLowerCase() === "none" || nKey.toLowerCase() === "unassigned") continue;
+          if (proj && nObj.project && normKey(nObj.project) === normKey(proj.name)) {
+            allNodes.add(nKey);
+          }
+        }
+      }
+
+      // Numerical sort: Tree 1, Tree 2, Tree 3, ..., Tree 25
+      const sortedNodes = Array.from(allNodes).sort((a, b) => {
+        const numA = parseInt(a.replace(/[^0-9]/g, "")) || 0;
+        const numB = parseInt(b.replace(/[^0-9]/g, "")) || 0;
+        if (numA && numB && numA !== numB) return numA - numB;
+        return a.localeCompare(b);
+      });
+
       let html = "";
-      for (const n_name of nodeNames) {
+      for (const n_name of sortedNodes) {
         const node = telemetryData.nodes ? telemetryData.nodes[n_name] : null;
         if (!node) continue;
         if (globalSearchQuery && !`${n_name} ${node.mac} ${node.ip} ${node.chip_id}`.toLowerCase().includes(globalSearchQuery)) continue;
