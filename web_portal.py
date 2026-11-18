@@ -2245,6 +2245,35 @@ button {{
   font-size: 10px;
   font-weight: 700;
 }}
+.btn-grid {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}}
+.btn-act {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.18s ease;
+  color: #fff;
+  margin-top: 0;
+}}
+.btn-act:active {{ transform: scale(0.98); }}
+.btn-vend {{ background: linear-gradient(135deg, #10B981, #059669); box-shadow: 0 4px 12px rgba(16,185,129,0.3); }}
+.btn-restock {{ background: linear-gradient(135deg, #8B5CF6, #6D28D9); box-shadow: 0 4px 12px rgba(139,92,246,0.3); }}
+.btn-body {{ background: linear-gradient(135deg, #F59E0B, #D97706); box-shadow: 0 4px 12px rgba(245,158,11,0.3); }}
+.btn-strip {{ background: linear-gradient(135deg, #38BDF8, #0284C7); box-shadow: 0 4px 12px rgba(56,189,248,0.3); }}
+.btn-relay {{ background: linear-gradient(135deg, #6366F1, #4338CA); box-shadow: 0 4px 12px rgba(99,102,241,0.3); }}
+.btn-reboot-card {{ background: rgba(239,68,68,0.12); color: #EF4444; border: 1px solid rgba(239,68,68,0.35); }}
+.btn-reboot-card:hover {{ background: rgba(239,68,68,0.22); }}
 </style>
 </head>
 <body>
@@ -2274,14 +2303,43 @@ button {{
     <div class="row"><span class="lbl">Free Heap RAM</span><span class="val" id="heap-val">{heap} KB</span></div>
     <div class="row"><span class="lbl">Security Attestation</span><span class="val" style="color:#34D399; font-size:11px;">{hash_str}</span></div>
 
+    <!-- Interactive Hardware Control Grid -->
+    <div style="margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.08);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px;">
+        <span style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em;">Interactive Directives</span>
+        <span class="cloud-pill" style="font-size: 9px;">Cloud MQTT</span>
+      </div>
+      <div class="btn-grid">
+        <button type="button" class="btn-act btn-vend" onclick="sendAction('{target_node}', 'DISPENSE')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+          Vend (Dispense)
+        </button>
+        <button type="button" class="btn-act btn-restock" onclick="sendAction('{target_node}', 'RESTOCK')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          Restock (45)
+        </button>
+        <button type="button" class="btn-act btn-body" onclick="sendAction('{target_node}', 'BODY_LED')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          Body LED (Action)
+        </button>
+        <button type="button" class="btn-act btn-strip" onclick="sendAction('{target_node}', 'STRIP_LEDS')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>
+          Strip LEDs (Action)
+        </button>
+        <button type="button" class="btn-act btn-relay" onclick="sendAction('{target_node}', 'RELAY')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          Relay (Pulse A/B)
+        </button>
+        <button type="button" class="btn-act btn-reboot-card" onclick="rebootNode('{target_node}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Reboot Hardware
+        </button>
+      </div>
+    </div>
+
     <!-- Master Service Toggle Button -->
     <button type="button" class="{btn_class}" id="btn-toggle-service" onclick="toggleService('{target_node}', '{target_action}')">
       {btn_text}
-    </button>
-
-    <!-- Remote Reboot Button -->
-    <button type="button" class="btn-reboot" onclick="rebootNode('{target_node}')">
-      Reboot Hardware
     </button>
 
     <!-- Direct LAN link when on same Wi-Fi -->
@@ -2292,6 +2350,30 @@ button {{
 </div>
 
 <script>
+function sendAction(node, action) {{
+  const btn = event.currentTarget;
+  const origHtml = btn.innerHTML;
+  btn.innerText = "Dispatching...";
+  btn.disabled = true;
+  fetch("/api/command", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
+    body: "target=" + encodeURIComponent(node) + "&action=" + encodeURIComponent(action)
+  }}).then(r => r.json()).then(d => {{
+    btn.innerText = "Dispatched!";
+    setTimeout(() => {{
+      btn.innerHTML = origHtml;
+      btn.disabled = false;
+    }}, 1200);
+  }}).catch(() => {{
+    btn.innerText = "Dispatched!";
+    setTimeout(() => {{
+      btn.innerHTML = origHtml;
+      btn.disabled = false;
+    }}, 1200);
+  }});
+}}
+
 function toggleService(node, state) {{
   const btn = document.getElementById("btn-toggle-service");
   btn.innerText = "Dispatching Directive...";
@@ -2467,17 +2549,32 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(out_html)
             return
 
-        if method == "POST" and any(k in forward_path for k in ("service", "toggle", "reboot")):
+        if method == "POST" and any(k in forward_path.lower() for k in ("service", "toggle", "reboot", "restock", "dispense", "vend", "body_led", "strip_led", "relay")):
             caller_user = user or "portal_admin"
             caller_role = users_db.get(caller_user, {}).get("role", "Admin")
-            if "service" in forward_path or "toggle" in forward_path:
+            if "service" in forward_path.lower() or "toggle" in forward_path.lower():
                 new_state = "OFF" if node_info.get("service", True) else "ON"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:SERVICE:{new_state}")
                 node_info["service"] = (new_state == "ON")
                 log_event(f"SERVICE: [{target_node}] switched to {new_state} via In-Situ Console", actor=caller_user, actor_role=caller_role)
-            elif "reboot" in forward_path:
+            elif "reboot" in forward_path.lower():
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:REBOOT")
                 log_event(f"COMMAND: [{target_node}] reboot dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "restock" in forward_path.lower():
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:RESTOCK")
+                log_event(f"COMMAND: [{target_node}] restock dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "dispense" in forward_path.lower() or "vend" in forward_path.lower():
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:DISPENSE")
+                log_event(f"COMMAND: [{target_node}] vend/dispense dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "body_led" in forward_path.lower():
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:BODY_LED")
+                log_event(f"COMMAND: [{target_node}] body LED dispense action dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "strip_led" in forward_path.lower():
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:STRIP_LEDS")
+                log_event(f"COMMAND: [{target_node}] strip LEDs dispense action dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
+            elif "relay" in forward_path.lower():
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_node}]:RELAY")
+                log_event(f"COMMAND: [{target_node}] relay pulse dispatched via In-Situ Console", actor=caller_user, actor_role=caller_role)
             self.send_response(303)
             self.send_header("Location", f"/proxy/node/{urllib.parse.quote(target_node, safe='')}/")
             self.end_headers()
@@ -3088,6 +3185,31 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
                 cmd = f"CMD:[{target_node}]:REBOOT"
                 publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
                 log_event(f"COMMAND: [{target_node}] software reboot dispatched", actor=user, actor_role=caller_role)
+
+            elif action in ("VEND", "DISPENSE"):
+                cmd = f"CMD:[{target_node}]:DISPENSE"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] vend/dispense dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "RESTOCK":
+                cmd = f"CMD:[{target_node}]:RESTOCK"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] restock dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "BODY_LED":
+                cmd = f"CMD:[{target_node}]:BODY_LED"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] body LED dispense action dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "STRIP_LEDS":
+                cmd = f"CMD:[{target_node}]:STRIP_LEDS"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] strip LEDs dispense action dispatched", actor=user, actor_role=caller_role)
+
+            elif action == "RELAY":
+                cmd = f"CMD:[{target_node}]:RELAY"
+                publish_mqtt_command(DEFAULT_MQTT_TOPIC_COMMANDS, cmd)
+                log_event(f"COMMAND: [{target_node}] relay pulse dispatched", actor=user, actor_role=caller_role)
 
             elif action == "PING":
                 cmd = f"CMD:[{target_node}]:PING"
@@ -6269,10 +6391,15 @@ def render_fleet_html(current_user="admin", token=""):
 
               <div style="display: flex; gap: 6px; flex-wrap: wrap;">
                 <span style="font-size: 11px; color: var(--text-dim); align-self: center; margin-right: 4px;">Quick Actions:</span>
+                <span class="preset-pill" style="border-color: rgba(16,185,129,0.4); color: #10B981;" onclick="sendQuickDirective(selectedNodeName, 'DISPENSE')">Vend (Dispense)</span>
+                <span class="preset-pill" style="border-color: rgba(139,92,246,0.4); color: #A78BFA;" onclick="sendQuickDirective(selectedNodeName, 'RESTOCK')">Restock (45)</span>
+                <span class="preset-pill" style="border-color: rgba(245,158,11,0.4); color: #FBBF24;" onclick="sendQuickDirective(selectedNodeName, 'BODY_LED')">Body LED</span>
+                <span class="preset-pill" style="border-color: rgba(56,189,248,0.4); color: #38BDF8;" onclick="sendQuickDirective(selectedNodeName, 'STRIP_LEDS')">Strip LEDs</span>
+                <span class="preset-pill" style="border-color: rgba(99,102,241,0.4); color: #818CF8;" onclick="sendQuickDirective(selectedNodeName, 'RELAY')">Relay (Pulse)</span>
                 <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'PING')">PING</span>
                 <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:ON')">Service ON</span>
                 <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'SERVICE:OFF')">Service OFF</span>
-                <span class="preset-pill" onclick="sendQuickDirective(selectedNodeName, 'REBOOT')">REBOOT</span>
+                <span class="preset-pill" style="border-color: rgba(239,68,68,0.4); color: #F87171;" onclick="sendQuickDirective(selectedNodeName, 'REBOOT')">REBOOT</span>
               </div>
             </div>
 
