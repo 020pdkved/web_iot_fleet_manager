@@ -1641,7 +1641,7 @@ def start_mqtt_client():
                                 # PUSH UNIQUE NAME TO THE ESP32 NODE OVER MQTT SO IT SAVES IT IN NVS!
                                 if raw_chip:
                                     publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_name}")
-                                if raw_mac:
+                                if raw_mac and raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE"):
                                     publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_name}")
                                 log_event(f"AUTO-ONBOARD: Physical Node [{raw_mac or raw_chip}] assigned distinct box '{target_name}' (STA IP: {tdata.get('ip', '0.0.0.0')})")
 
@@ -1718,7 +1718,7 @@ def start_mqtt_client():
                                 if raw_name.lower() in ("none", "unassigned", "") and target_key != "none":
                                     if raw_chip:
                                         publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_key}")
-                                    if raw_mac:
+                                    if raw_mac and raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE"):
                                         publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_key}")
 
                                 # Detect if the ESP32 executed a local NVS Reset to coded defaults
@@ -2566,10 +2566,10 @@ class FleetDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
 
-            # Active Operator Presence Ping: Broadcast PING silently on backend
+            # Active Operator Presence Ping: Broadcast PING silently on backend (rate-limited to 12s)
             global last_presence_ping_time
             now = time.time()
-            if now - last_presence_ping_time >= 3.0:
+            if now - last_presence_ping_time >= 12.0:
                 last_presence_ping_time = now
                 threading.Thread(target=publish_mqtt_command, args=(DEFAULT_MQTT_TOPIC_COMMANDS, "CMD:[*]:PING", DEFAULT_MQTT_BROKER, DEFAULT_MQTT_PORT, True), daemon=True).start()
 
