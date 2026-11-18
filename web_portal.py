@@ -1639,10 +1639,9 @@ def start_mqtt_client():
                                 save_fleet_registry()
 
                                 # PUSH UNIQUE NAME TO THE ESP32 NODE OVER MQTT SO IT SAVES IT IN NVS!
-                                if raw_chip:
-                                    publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_name}")
-                                if raw_mac and raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE"):
-                                    publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_name}")
+                                target_cmd_id = raw_chip or (raw_mac if raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE") else "")
+                                if target_cmd_id:
+                                    publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_cmd_id}]:RENAME:{target_name}")
                                 log_event(f"AUTO-ONBOARD: Physical Node [{raw_mac or raw_chip}] assigned distinct box '{target_name}' (STA IP: {tdata.get('ip', '0.0.0.0')})")
 
                                 nodes_telemetry[target_name] = {
@@ -1714,12 +1713,15 @@ def start_mqtt_client():
                                         "last_seen": time.time()
                                     }
 
-                                # If node reports "none", re-push its assigned name to lock into NVS
+                                # If node reports "none", re-push its assigned name to lock into NVS (rate limited to once every 15s)
+                                cur_node = nodes_telemetry.get(target_key, {})
                                 if raw_name.lower() in ("none", "unassigned", "") and target_key != "none":
-                                    if raw_chip:
-                                        publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_chip}]:RENAME:{target_key}")
-                                    if raw_mac and raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE"):
-                                        publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{raw_mac}]:RENAME:{target_key}")
+                                    last_r_push = cur_node.get("last_auto_rename_push", 0)
+                                    if time.time() - last_r_push > 15.0:
+                                        cur_node["last_auto_rename_push"] = time.time()
+                                        target_cmd_id = raw_chip or (raw_mac if raw_mac not in ("00:00:00:00:00:00", "00-00-00-00-00-00", "NONE") else "")
+                                        if target_cmd_id:
+                                            publish_fast_mqtt(DEFAULT_MQTT_TOPIC_COMMANDS, f"CMD:[{target_cmd_id}]:RENAME:{target_key}")
 
                                 # Detect if the ESP32 executed a local NVS Reset to coded defaults
                                 cur_node = nodes_telemetry[target_key]
